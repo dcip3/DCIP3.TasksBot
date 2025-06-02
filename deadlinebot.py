@@ -12,6 +12,11 @@ import OpenEXR
 import PyOpenColorIO as ocio
 import Imath
 
+import requests
+import base64
+import time
+import io
+
 from aiogram import Bot, Dispatcher, Router, types
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
@@ -25,8 +30,48 @@ BASE_API_URL = "https://renderfarm.local:4434/api"
 
 CREDENTIALS_FILE = Path("credentials.json")
 
-# Dropbox access token (создайте приложение в Dropbox и получите токен доступа)
-DROPBOX_ACCESS_TOKEN = "REDACTED_DROPBOX_ACCESS_TOKEN"
+# === Dropbox OAuth2 constants ===
+DROPBOX_APP_KEY = "REDACTED_DROPBOX_APP_KEY"
+DROPBOX_APP_SECRET = "REDACTED_DROPBOX_APP_SECRET"
+DROPBOX_REFRESH_TOKEN = "REDACTED_DROPBOX_REFRESH_TOKEN"
+
+# Переменные для кеширования access_token
+_dropbox_access_token = None
+_dropbox_access_token_expires_at = 0
+
+def get_fresh_access_token():
+    """
+    Возвращает действующий Dropbox access_token.
+    Если текущий ещё не истёк, возвращает кешированный.
+    Иначе делает запрос по refresh_token для получения нового.
+    """
+    global _dropbox_access_token, _dropbox_access_token_expires_at
+    now = int(time.time())
+    if _dropbox_access_token and now < _dropbox_access_token_expires_at - 30:
+        return _dropbox_access_token
+
+    url = "https://api.dropboxapi.com/oauth2/token"
+    creds = f"{DROPBOX_APP_KEY}:{DROPBOX_APP_SECRET}".encode("ascii")
+    b64_creds = base64.b64encode(creds).decode("ascii")
+    headers = {
+        "Authorization": f"Basic {b64_creds}",
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": DROPBOX_REFRESH_TOKEN
+    }
+    resp = requests.post(url, headers=headers, data=data)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Не удалось обновить access_token: {resp.status_code} – {resp.text}")
+    token_info = resp.json()
+    access_token = token_info.get("access_token")
+    expires_in = token_info.get("expires_in", 0)
+    if not access_token:
+        raise RuntimeError("В ответе нет поля access_token")
+    _dropbox_access_token = access_token
+    _dropbox_access_token_expires_at = now + expires_in
+    return _dropbox_access_token
 # Для доступа к Team Space необходимы team_member_id и root_namespace_id
 TEAM_MEMBER_ID = "REDACTED_DROPBOX_TEAM_MEMBER_ID"
 ROOT_NAMESPACE_ID = "REDACTED_DROPBOX_ROOT_NAMESPACE_ID"
@@ -136,7 +181,7 @@ async def upload_video_to_dropbox(video_path: Path, metadata: dict):
 
     upload_url = "https://content.dropboxapi.com/2/files/upload"
     headers_upload = {
-        "Authorization": f"Bearer {DROPBOX_ACCESS_TOKEN}",
+        "Authorization": f"Bearer {get_fresh_access_token()}",
         "Dropbox-API-Select-User": TEAM_MEMBER_ID,
         "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": ROOT_NAMESPACE_ID}),
         "Dropbox-API-Arg": json.dumps({"path": dropbox_upload_path, "mode": "overwrite"}),
@@ -856,7 +901,7 @@ async def download_exr_folder(session_dbx, download_url, headers_dbx, path, loca
         if entry[".tag"] == "file" and name.lower().endswith(".exr"):
             local_file = local_folder / name
             dl_headers = {
-                "Authorization": f"Bearer {DROPBOX_ACCESS_TOKEN}",
+                "Authorization": f"Bearer {get_fresh_access_token()}",
                 "Dropbox-API-Select-User": TEAM_MEMBER_ID,
                 "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": ROOT_NAMESPACE_ID}),
                 "Dropbox-API-Arg": json.dumps({"path": entry["path_display"]})
@@ -915,16 +960,18 @@ async def preview_job_callback(callback_query: types.CallbackQuery):
                     await callback_query.answer("Поле OutDir отсутствует.", show_alert=True)
                     return
                 fullpath = outdirs[0]
-                if len(fullpath) > 1 and fullpath[1] == ":":
-                    trimmed = fullpath[2:]
+                # Обрезаем до "Team Folder", если такая часть есть
+                marker = "Team Folder"
+                idx = fullpath.find(marker)
+                if idx != -1:
+                    trimmed = fullpath[idx:]
                 else:
-                    trimmed = fullpath
-                if not trimmed.startswith("\\"):
-                    trimmed = "\\" + trimmed
-                dropbox_path = trimmed.replace("\\", "/")
+                    await callback_query.message.answer(f"Нет доступа к файлу. Путь: {fullpath}")
+                    return
+                dropbox_path = "/" + trimmed.replace("\\", "/").lstrip("/")
                 temp_dir = ensure_temp_dir()
                 headers_dbx = {
-                    "Authorization": f"Bearer {DROPBOX_ACCESS_TOKEN}",
+                    "Authorization": f"Bearer {get_fresh_access_token()}",
                     "Dropbox-API-Select-User": TEAM_MEMBER_ID,
                     "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": ROOT_NAMESPACE_ID}),
                     "Content-Type": "application/json"
@@ -936,6 +983,35 @@ async def preview_job_callback(callback_query: types.CallbackQuery):
                     except Exception as e:
                         await callback_query.message.answer(str(e))
                         return
+
+                    # Проверяем, существует ли видео уже на Dropbox
+                    exr_parent = str(PurePosixPath(metadata["path_display"]).parent)
+                    video_filename = f"{metadata['name']}.mp4"
+                    video_dropbox_path = f"{exr_parent}/{video_filename}"
+                    try:
+                        # Если файл найден, fetch_dropbox_metadata не бросит ошибку
+                        await fetch_dropbox_metadata(session_dbx, video_dropbox_path, headers_dbx)
+                        # Формируем клавиатуру для выбора действия
+                        send_button = InlineKeyboardButton(
+                            text="Отправить с Dropbox",
+                            callback_data=f"send_dbx_video:{job_id}"
+                        )
+                        recreate_button = InlineKeyboardButton(
+                            text="Создать заново",
+                            callback_data=f"create_new_video:{job_id}"
+                        )
+                        keyboard = InlineKeyboardMarkup(
+                            inline_keyboard=[[send_button, recreate_button]]
+                        )
+                        await callback_query.message.answer(
+                            f"Видео '{video_filename}' уже существует на Dropbox.",
+                            reply_markup=keyboard
+                        )
+                        await callback_query.answer()
+                        return
+                    except Exception:
+                        # Файл не найден – продолжаем создавать заново
+                        pass
 
                     exr_folder_name = metadata["name"]
                     local_root = temp_dir / exr_folder_name
@@ -1013,6 +1089,179 @@ async def preview_job_callback(callback_query: types.CallbackQuery):
                     download_states.pop(job_id, None)
         except Exception as e:
             await callback_query.answer(f"Ошибка при обработке Preview: {e}", show_alert=True)
+
+# Handler for send_dbx_video
+@dp_router.callback_query(lambda c: c.data and c.data.startswith("send_dbx_video:"))
+async def send_dbx_video(callback_query: types.CallbackQuery):
+    job_id = callback_query.data.split(":", 1)[1]
+    # Повторяем получение метаданных папки
+    async with aiohttp.ClientSession() as session:
+        headers_auth = aiohttp.BasicAuth(*get_auth_credentials(callback_query.from_user.id)[:2])
+        async with session.get(f"{BASE_API_URL}/jobs", auth=headers_auth, ssl=False) as resp:
+            jobs = await resp.json() if resp.status == 200 else []
+        matching = [j for j in jobs if j.get("_id") == job_id]
+        if not matching:
+            await callback_query.message.answer("Задача не найдена.")
+            return
+        outdirs = matching[0].get("OutDir", [])
+        if not outdirs:
+            await callback_query.message.answer("OutDir отсутствует.")
+            return
+        fullpath = outdirs[0]
+        marker = "Team Folder"
+        idx = fullpath.find(marker)
+        if idx != -1:
+            trimmed = fullpath[idx:]
+        else:
+            await callback_query.message.answer(f"Нет доступа к файлу. Путь: {fullpath}")
+            return
+        dropbox_path = "/" + trimmed.replace("\\", "/").lstrip("/")
+        metadata = await fetch_dropbox_metadata(session, dropbox_path, {
+            "Authorization": f"Bearer {get_fresh_access_token()}",
+            "Dropbox-API-Select-User": TEAM_MEMBER_ID,
+            "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": ROOT_NAMESPACE_ID}),
+            "Content-Type": "application/json"
+        })
+    exr_parent = str(PurePosixPath(metadata["path_display"]).parent)
+    video_filename = f"{metadata['name']}.mp4"
+    video_dropbox_path = f"{exr_parent}/{video_filename}"
+    download_url = "https://content.dropboxapi.com/2/files/download"
+    dl_headers = {
+        "Authorization": f"Bearer {get_fresh_access_token()}",
+        "Dropbox-API-Select-User": TEAM_MEMBER_ID,
+        "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": ROOT_NAMESPACE_ID}),
+        "Dropbox-API-Arg": json.dumps({"path": video_dropbox_path})
+    }
+    async with aiohttp.ClientSession() as session_dbx:
+        async with session_dbx.post(download_url, headers=dl_headers) as f_resp:
+            if f_resp.status != 200:
+                text = await f_resp.text()
+                await callback_query.message.answer(f"Ошибка при загрузке видео: {text}")
+                return
+            data = await f_resp.read()
+    # Сохраняем видео во временный файл
+    temp_path = ensure_temp_dir() / video_filename
+    with open(temp_path, "wb") as f:
+        f.write(data)
+    # Отправляем файл из локальной временной директории
+    await callback_query.message.answer_document(document=types.FSInputFile(str(temp_path)), filename=video_filename)
+    # Опционально: удалить временный файл после отправки
+    try:
+        temp_path.unlink()
+    except Exception:
+        pass
+
+    await callback_query.answer()
+
+# Handler for create_new_video
+@dp_router.callback_query(lambda c: c.data and c.data.startswith("create_new_video:"))
+async def create_new_video(callback_query: types.CallbackQuery):
+    # Просто повторяем логику из preview_job_callback без проверки существования
+    job_id = callback_query.data.split(":", 1)[1]
+    stop_event = asyncio.Event()
+    stop_downloads[job_id] = stop_event
+    await callback_query.answer()
+    async with aiohttp.ClientSession() as session:
+        headers = aiohttp.BasicAuth(*get_auth_credentials(callback_query.from_user.id)[:2])
+        async with session.get(f"{BASE_API_URL}/jobs", auth=headers, ssl=False) as resp:
+            if resp.status != 200:
+                await callback_query.answer(f"Ошибка при запросе: {resp.status}", show_alert=True)
+                return
+            jobs = await resp.json()
+        matching_jobs = [j for j in jobs if j.get("_id") == job_id]
+        if not matching_jobs:
+            await callback_query.answer("Задача не найдена.", show_alert=True)
+            return
+        job_obj = matching_jobs[0]
+        outdirs = job_obj.get("OutDir", [])
+        if not outdirs:
+            await callback_query.answer("Поле OutDir отсутствует.", show_alert=True)
+            return
+        fullpath = outdirs[0]
+        marker = "Team Folder"
+        idx = fullpath.find(marker)
+        if idx != -1:
+            trimmed = fullpath[idx:]
+        else:
+            await callback_query.message.answer(f"Нет доступа к файлу. Путь: {fullpath}")
+            return
+        dropbox_path = "/" + trimmed.replace("\\", "/").lstrip("/")
+        temp_dir = ensure_temp_dir()
+        headers_dbx = {
+            "Authorization": f"Bearer {get_fresh_access_token()}",
+            "Dropbox-API-Select-User": TEAM_MEMBER_ID,
+            "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": ROOT_NAMESPACE_ID}),
+            "Content-Type": "application/json"
+        }
+        async with aiohttp.ClientSession() as session_dbx:
+            try:
+                metadata = await fetch_dropbox_metadata(session_dbx, dropbox_path, headers_dbx)
+            except Exception as e:
+                await callback_query.message.answer(str(e))
+                return
+            exr_folder_name = metadata["name"]
+            local_root = temp_dir / exr_folder_name
+            conv_root = Path("conv") / exr_folder_name
+            video_path = conv_root / f"{exr_folder_name}.mp4"
+            exr_files_exist = lambda folder: folder.exists() and any(str(f).endswith(".exr") for f in folder.glob("*.exr"))
+            if exr_files_exist(local_root):
+                await callback_query.message.answer("Этап 1: Файлы уже скачаны, пропускаем скачивание.")
+            else:
+                try:
+                    if metadata.get(".tag") == "file":
+                        await callback_query.message.answer("Загрузка файла не поддерживается для предпросмотра.")
+                        return
+                    elif metadata.get(".tag") == "folder":
+                        await callback_query.message.answer("Этап 1: Начинаем скачивание файлов...")
+                        download_url = "https://content.dropboxapi.com/2/files/download"
+                        total_files = await count_exr_files(session_dbx, metadata["path_display"], headers_dbx)
+                        downloaded_count = 0
+                        stop_button = InlineKeyboardButton(text="Stop", callback_data=f"stop_download:{job_id}")
+                        stop_kb = InlineKeyboardMarkup(inline_keyboard=[[stop_button]])
+                        progress_msg = await callback_query.message.answer(f"Скачивание 0%", reply_markup=stop_kb)
+                        download_states[job_id] = {
+                            "total_files": total_files,
+                            "downloaded_count": downloaded_count,
+                            "progress_msg": progress_msg,
+                            "stop_kb": stop_kb
+                        }
+                        local_root.mkdir(exist_ok=True)
+                        await download_exr_folder(session_dbx, download_url, headers_dbx, metadata["path_display"], local_root, job_id)
+                        if stop_downloads.get(job_id) and stop_downloads[job_id].is_set():
+                            stop_downloads.pop(job_id, None)
+                            await callback_query.message.answer("Скачивание остановлено пользователем.")
+                            return
+                        stop_downloads.pop(job_id, None)
+                        await progress_msg.edit_text("Скачивание 100%")
+                    else:
+                        await callback_query.message.answer("Неподдерживаемый тип метаданных.")
+                        return
+                except Exception as e:
+                    if stop_downloads.get(job_id) and stop_downloads[job_id].is_set():
+                        return
+                    await callback_query.message.answer(f"Ошибка при скачивании: {e}")
+                    return
+            try:
+                await callback_query.message.answer("Этап 2: Конвертация кадров из ACES в sRGB...")
+                convert_exr_folder_to_srgb(local_root, conv_root, "config.ocio")
+            except Exception as e:
+                await callback_query.message.answer(f"Ошибка при конвертации: {e}")
+                return
+            try:
+                await callback_query.message.answer("Этап 3: Сборка видео из кадров...")
+                video_path = assemble_video_from_exr(conv_root, exr_folder_name)
+                await callback_query.message.answer_document(document=types.FSInputFile(str(video_path)))
+            except Exception as e:
+                await callback_query.message.answer(f"Ошибка при сборке видео: {e}")
+                return
+            try:
+                dropbox_path2 = await upload_video_to_dropbox(video_path, metadata)
+                await callback_query.message.answer("Видео загружено на Dropbox")
+            except Exception as e:
+                await callback_query.message.answer(str(e))
+                return
+            cleanup_temp_and_conv()
+            download_states.pop(job_id, None)
 
 # Обрабатывает удаление задачи (Delete).
 
