@@ -1,6 +1,8 @@
 import asyncio
 import json
 import os
+from dotenv import load_dotenv
+load_dotenv()
 import shutil
 import subprocess
 from datetime import datetime, timezone, timedelta
@@ -24,26 +26,55 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
+# --- Logging setup ---
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # Токен API и базовый URL API
-API_TOKEN = "REDACTED_TELEGRAM_BOT_TOKEN"
+API_TOKEN = os.getenv("TG_API_TOKEN")
 BASE_API_URL = "https://renderfarm.local:4434/api"
 
 CREDENTIALS_FILE = Path("credentials.json")
 
 # === Dropbox OAuth2 constants ===
-DROPBOX_APP_KEY = "REDACTED_DROPBOX_APP_KEY"
-DROPBOX_APP_SECRET = "REDACTED_DROPBOX_APP_SECRET"
-DROPBOX_REFRESH_TOKEN = "REDACTED_DROPBOX_REFRESH_TOKEN"
+DROPBOX_APP_KEY = os.getenv("DROPBOX_APP_KEY")
+DROPBOX_APP_SECRET = os.getenv("DROPBOX_APP_SECRET")
+DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN")
 
 # Переменные для кеширования access_token
 _dropbox_access_token = None
 _dropbox_access_token_expires_at = 0
 
+ # Mapping для статуса воркера
+WORKER_STATUS_MAP = {
+    0: "Unknown",
+    1: "Rendering",
+    2: "Idle",
+    3: "Offline",
+    4: "Stalled",
+    8: "StartingJob"
+}
+
+# Mapping для статуса задачи (Stat)
+JOB_STATUS_MAP = {
+    0: "Unknown",
+    1: "Active",
+    2: "Suspended",
+    3: "Completed",
+    4: "Failed",
+    6: "Pending"
+}
+
 def get_fresh_access_token():
     """
-    Возвращает действующий Dropbox access_token.
-    Если текущий ещё не истёк, возвращает кешированный.
-    Иначе делает запрос по refresh_token для получения нового.
+    Возвращает действующий Dropbox access_token. Если текущий ещё не истёк, возвращает кешированный. Иначе обновляет по refresh_token.
+
+    Returns:
+        str: действующий access token.
+
+    Raises:
+        RuntimeError: если не удалось получить или обновить токен.
     """
     global _dropbox_access_token, _dropbox_access_token_expires_at
     now = int(time.time())
@@ -72,9 +103,12 @@ def get_fresh_access_token():
     _dropbox_access_token = access_token
     _dropbox_access_token_expires_at = now + expires_in
     return _dropbox_access_token
+
 # Для доступа к Team Space необходимы team_member_id и root_namespace_id
-TEAM_MEMBER_ID = "REDACTED_DROPBOX_TEAM_MEMBER_ID"
-ROOT_NAMESPACE_ID = "REDACTED_DROPBOX_ROOT_NAMESPACE_ID"
+TEAM_MEMBER_ID = os.getenv("DROPBOX_TEAM_MEMBER_ID")
+ROOT_NAMESPACE_ID = os.getenv("DROPBOX_ROOT_NAMESPACE_ID")
+# Root marker folder name in Dropbox paths (to identify the team's root directory)
+DROPBOX_ROOT_MARKER = os.getenv("DROPBOX_ROOT_MARKER", "Team Folder")
 
 bot = Bot(token=API_TOKEN)
 dp_router = Router()
@@ -91,16 +125,68 @@ notified_jobs = set()
 # Активные задачи в режиме реального времени
 active_realtime_tasks = {}
 
-# Очистка папки
+# Ограничения по параллельным загрузкам
+MAX_CONCURRENT_DOWNLOADS = 2
+current_downloads = 0
+
+# Семафор для ограничениия числа параллельных конвертация/сборок видео
+conversion_semaphore = asyncio.Semaphore(1)
+
+def has_enough_space(path: str, min_free_bytes: int) -> bool:
+    """
+    Проверяет, что на том разделе, где находится path, доступно не менее min_free_bytes байт.
+
+    Args:
+        path (str): путь к папке или файлу на диске.
+        min_free_bytes (int): минимально требуемое свободное место в байтах.
+
+    Returns:
+        bool: True, если доступного места >= min_free_bytes, иначе False.
+    """
+    total, used, free = shutil.disk_usage(path)
+    return free >= min_free_bytes
+
 def clear_folder(folder_path):
-    if os.path.exists(folder_path):
-        shutil.rmtree(folder_path, ignore_errors=True)
-    os.makedirs(folder_path, exist_ok=True)
+    """
+    Очищает содержимое папки, но не удаляет саму папку. Если папки не существует, создаёт её.
+
+    Args:
+        folder_path (str or Path): путь к папке для очистки.
+
+    Returns:
+        None
+    """
+    folder = Path(folder_path)
+    if folder.exists():
+        for item in folder.iterdir():
+            try:
+                if item.is_dir():
+                    shutil.rmtree(item, ignore_errors=True)
+                else:
+                    item.unlink()
+            except Exception:
+                pass
+    else:
+        folder.mkdir(parents=True, exist_ok=True)
 
 
 # --- Новые функции для preview_job_callback ---
 
 async def fetch_dropbox_metadata(session_dbx, dropbox_path: str, headers_dbx: dict) -> dict:
+    """
+    Получает метаданные объекта в Dropbox по указанному пути.
+
+    Args:
+        session_dbx (aiohttp.ClientSession): активная сессия для запросов к Dropbox API.
+        dropbox_path (str): путь к объекту в Dropbox.
+        headers_dbx (dict): заголовки для авторизации в Dropbox API.
+
+    Returns:
+        dict: JSON-ответ с метаданными объекта.
+
+    Raises:
+        RuntimeError: если API вернул ошибку или некорректный статус.
+    """
     meta_url = "https://api.dropboxapi.com/2/files/get_metadata"
     async with session_dbx.post(meta_url, headers=headers_dbx, json={"path": dropbox_path}) as resp:
         if resp.status != 200:
@@ -109,6 +195,20 @@ async def fetch_dropbox_metadata(session_dbx, dropbox_path: str, headers_dbx: di
         return await resp.json()
 
 def convert_exr_folder_to_srgb(local_root: Path, conv_root: Path, ocio_config_path: str):
+    """
+    Конвертирует все EXR-файлы из ACEScg в sRGB с помощью OCIO.
+
+    Args:
+        local_root (Path): папка с исходными EXR-файлами.
+        conv_root (Path): папка для сохранения конвертированных EXR-файлов.
+        ocio_config_path (str): путь к файлу конфига OCIO.
+
+    Returns:
+        None
+
+    Raises:
+        RuntimeError: если не найдено EXR-файлов или отсутствует конфиг OCIO.
+    """
     conv_root.mkdir(parents=True, exist_ok=True)
     exr_files = sorted([f for f in local_root.glob("*.exr") if "cryptomatte" not in f.name.lower()])
     if not exr_files:
@@ -158,6 +258,19 @@ def convert_exr_folder_to_srgb(local_root: Path, conv_root: Path, ocio_config_pa
         out_exr.close()
 
 def assemble_video_from_exr(conv_root: Path, exr_folder_name: str) -> Path:
+    """
+    Собирает видео из конвертированных EXR-файлов с помощью ffmpeg.
+
+    Args:
+        conv_root (Path): папка с конвертированными EXR-файлами.
+        exr_folder_name (str): имя папки (используется для имени выходного видео).
+
+    Returns:
+        Path: путь к сгенерированному видео-файлу MP4.
+
+    Raises:
+        RuntimeError: если в папке conv_root нет EXR-файлов или при ошибке ffmpeg.
+    """
     video_path = conv_root / f"{exr_folder_name}.mp4"
     exr_pattern = str(conv_root / "*.exr")
     if not any(conv_root.glob("*.exr")):
@@ -175,6 +288,19 @@ def assemble_video_from_exr(conv_root: Path, exr_folder_name: str) -> Path:
     return video_path
 
 async def upload_video_to_dropbox(video_path: Path, metadata: dict):
+    """
+    Загружает видео-файл на Dropbox в ту же директорию, что и исходные EXR.
+
+    Args:
+        video_path (Path): локальный путь к видео-файлу.
+        metadata (dict): метаданные исходной папки EXR из Dropbox.
+
+    Returns:
+        str: путь в Dropbox, куда было загружено видео.
+
+    Raises:
+        RuntimeError: если загрузка вернула ошибку.
+    """
     filename = video_path.name
     exr_parent = str(PurePosixPath(metadata["path_display"]).parent)
     dropbox_upload_path = f"{exr_parent}/{filename}"
@@ -196,8 +322,14 @@ async def upload_video_to_dropbox(video_path: Path, metadata: dict):
     return dropbox_upload_path
 
 def cleanup_temp_and_conv():
-    clear_folder("temp")
-    clear_folder("conv")
+    """
+    Очищает содержимое папок 'temp' и 'conv', но не удаляет сами папки.
+
+    Returns:
+        None
+    """
+    clear_folder(Path("temp"))
+    clear_folder(Path("conv"))
 
 # --- Credential and helper functions ---
 
@@ -269,6 +401,10 @@ async def job_progress_watcher():
                                 job_id = job.get("JobId") or job.get("_id") or job.get("Props", {}).get("JobId")
                                 if not job_id:
                                     continue
+                                # Remove job_id from notified_jobs if status is no longer Completed (Stat != 3)
+                                stat_num = job.get("Stat", 0)
+                                if job_id in notified_jobs and stat_num != 3:
+                                    notified_jobs.remove(job_id)
                                 total_tasks = job.get("Props", {}).get("Tasks", 0)
                                 completed_chunks = job.get("CompletedChunks", 0)
                                 progress = 0
@@ -291,9 +427,9 @@ async def job_progress_watcher():
                                     await bot.send_message(int(user_id), message_text)
                                     notified_jobs.add(job_id)
                         else:
-                            print(f"Watcher: Ошибка при запросе jobs для user {user_id}: {resp.status}")
+                            logger.error(f"Watcher: Ошибка при запросе jobs для user {user_id}: {resp.status}")
             except Exception as e:
-                print(f"Watcher: Ошибка при мониторинге задач для user {user_id}: {e}")
+                logger.error(f"Watcher: Ошибка при мониторинге задач для user {user_id}: {e}", exc_info=True)
 
 
 # --- Handlers ---
@@ -327,11 +463,28 @@ async def process_password(message: types.Message, state: FSMContext):
     data = await state.get_data()
     login = data["login"]
     password = message.text
-    user_credentials[str(message.from_user.id)] = [login, password]
+    user_id = str(message.from_user.id)
+
+    # Валидация введённых учётных данных через запрос к API
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = aiohttp.BasicAuth(login, password)
+            async with session.get(f"{BASE_API_URL}/jobs", auth=headers, ssl=False) as resp:
+                if resp.status != 200:
+                    # Неверные учётные данные
+                    await message.answer("Неверный логин или пароль. Попробуйте ещё раз.\nВведите логин:")
+                    await state.clear()
+                    await state.set_state(AuthStates.waiting_for_login)
+                    return
+    except Exception:
+        await message.answer("Ошибка при проверке учётных данных. Попробуйте ещё раз.\nВведите логин:")
+        await state.clear()
+        await state.set_state(AuthStates.waiting_for_login)
+        return
+
+    # Если проверка успешна, сохраняем данные
+    user_credentials[user_id] = [login, password, False]
     save_credentials(user_credentials)
-    if len(user_credentials[str(message.from_user.id)]) == 2:
-        user_credentials[str(message.from_user.id)].append(False)
-        save_credentials(user_credentials)
     await state.clear()
 
     keyboard = get_main_keyboard()
@@ -380,20 +533,46 @@ async def handle_jobs(message: types.Message, page: int = 0):
                         batch = job.get("Props", {}).get("Batch", "Без имени")
                         grouped_jobs[batch].append(job)
 
+                    from datetime import datetime
                     combined_jobs = []
                     for batch, jobs in grouped_jobs.items():
                         total_tasks = sum(j.get("Props", {}).get("Tasks", 0) for j in jobs)
                         completed_chunks = sum(j.get("CompletedChunks", 0) for j in jobs)
-                        stat = max(j.get("Stat", 0) for j in jobs)
+                        # Determine batch-level status with priority: Active > Pending > Suspended > Failed > Completed > Unknown
+                        status_list = [j.get("Stat", 0) for j in jobs]
+                        if 1 in status_list:
+                            batch_stat = 1      # Active
+                        elif 6 in status_list:
+                            batch_stat = 6      # Pending
+                        elif 2 in status_list:
+                            batch_stat = 2      # Suspended
+                        elif 4 in status_list:
+                            batch_stat = 4      # Failed
+                        elif all(s == 3 for s in status_list):
+                            batch_stat = 3      # Completed
+                        else:
+                            batch_stat = 0      # Unknown
+                        # Determine the most recent Date among jobs in this batch
+                        dates = []
+                        for j in jobs:
+                            date_str = j.get("Date")
+                            if date_str:
+                                try:
+                                    dates.append(datetime.fromisoformat(date_str))
+                                except Exception:
+                                    pass
+                        max_date = max(dates) if dates else datetime.min
                         combined_jobs.append({
                             "_id": jobs[0].get("_id"),
                             "Props": {"Batch": batch, "Tasks": total_tasks},
                             "CompletedChunks": completed_chunks,
-                            "Stat": stat
+                            "Stat": batch_stat,
+                            "DateParsed": max_date
                         })
-
+                    # Sort by DateParsed descending (newest first)
+                    combined_jobs.sort(key=lambda j: j["DateParsed"], reverse=True)
                     json_data = combined_jobs
-                    json_data.sort(key=lambda j: j.get("Stat", 0) == 2)
+                    # json_data already sorted by DateParsed
                     jobs_slice = json_data[page*4 : page*4+4]
                     normal_jobs = [job for job in jobs_slice if job.get("Stat", 0) != 2]
                     suspended_jobs = [job for job in jobs_slice if job.get("Stat", 0) == 2]
@@ -405,7 +584,12 @@ async def handle_jobs(message: types.Message, page: int = 0):
                         total_tasks = props.get("Tasks", 0)
                         completed_chunks = job.get("CompletedChunks", 0)
                         progress_str = format_progress(completed_chunks, total_tasks)
-                        messages.append(f"{batch:<24} {progress_str:^16}\n{'-'*40}")
+                        stat = job.get("Stat", 0)
+                        if stat == 3:
+                            icon = "✅"
+                        else:
+                            icon = "▶️"
+                        messages.append(f"{icon} {batch:<22} {progress_str:^16}\n{'-'*40}")
                     if suspended_jobs:
                         messages.append("")
                         title = " suspended "
@@ -419,18 +603,26 @@ async def handle_jobs(message: types.Message, page: int = 0):
                             total_tasks = props.get("Tasks", 0)
                             completed_chunks = job.get("CompletedChunks", 0)
                             progress_str = format_progress(completed_chunks, total_tasks)
-                            messages.append(f"{batch:<24} {progress_str:^16}\n{'-'*40}")
-                    for job in jobs_slice:
+                            messages.append(f"⏸️ {batch:<22} {progress_str:^16}\n{'-'*40}")
+                    # Add buttons in the order that matches the display: active batches first, then suspended.
+                    for job in normal_jobs:
                         props = job.get("Props", {})
                         batch = props.get("Batch", "Без имени")
                         job_id = job.get("_id")
                         if job_id:
                             buttons.append(InlineKeyboardButton(text=batch, callback_data=f"job_info:{job_id}"))
+                    if suspended_jobs:
+                        for job in suspended_jobs:
+                            props = job.get("Props", {})
+                            batch = props.get("Batch", "Без имени")
+                            job_id = job.get("_id")
+                            if job_id:
+                                buttons.append(InlineKeyboardButton(text=batch, callback_data=f"job_info:{job_id}"))
                     header = f"{'Batch':<24} {'Progress':^16}"
                     header += f"\n{'-'*40}"
                     batch_text = "\n".join(messages) if messages else "Нет данных"
                     text = f"<pre>{header}\n{batch_text}</pre>"
-                    if buttons and len(buttons) > 0:
+                    if buttons:
                         inline_keyboard = []
                         row = []
                         for i, button in enumerate(buttons, 1):
@@ -440,11 +632,21 @@ async def handle_jobs(message: types.Message, page: int = 0):
                                 row = []
                         if row:
                             inline_keyboard.append(row)
-                        if (page + 1)*4 < len(json_data):
-                            inline_keyboard.append([InlineKeyboardButton(text="➡ Вперёд", callback_data=f"jobs_page:{page+1}")])
+                        # Навигация
+                        total_items = len(json_data)
+                        total_pages = (total_items + 3) // 4
+                        # Кнопки навигации
+                        nav_buttons = []
+                        if page > 0:
+                            nav_buttons.append(InlineKeyboardButton(text="⬅ Назад", callback_data=f"jobs_page:{page-1}"))
+                        if (page + 1) < total_pages:
+                            nav_buttons.append(InlineKeyboardButton(text="Вперёд ➡", callback_data=f"jobs_page:{page+1}"))
+                        if nav_buttons:
+                            inline_keyboard.append(nav_buttons)
                         keyboard = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
+                        page_info = f"Страница {page+1} из {total_pages}"
                         await msg.edit_text(
-                            f"<pre>{header}\n{batch_text}</pre>\n\nВыберите задачу для подробной информации:",
+                            f"<pre>{header}\n{batch_text}\n{page_info}</pre>\n\nВыберите задачу для подробной информации:",
                             parse_mode="HTML",
                             reply_markup=keyboard
                         )
@@ -489,29 +691,33 @@ async def job_info_callback(callback_query: types.CallbackQuery):
                         date_comp = props.get("DateComp", "Неизвестно")
                         full_name = props.get("Name", "Без имени")
                         name = full_name.split("/")[-1] if "/" in full_name else full_name
+                        stat_num = job.get("Stat", 0)
+                        stat = JOB_STATUS_MAP.get(stat_num, f"Unknown ({stat_num})")
                         message_text = (
                             f"Информация о подзадаче:\n"
                             f"Name: {name}\n"
                             f"Batch: {batch}\n"
                             f"Прогресс: {progress_str}\n"
                             f"Пользователь: {user}\n"
+                            f"Статус: {stat}\n"
                         )
                         await callback_query.message.answer(message_text)
 
-                        stat = job.get("Stat", 0)
                         job_id_btn = job.get("_id")
                         requeue_button = InlineKeyboardButton(text="🔄 Requeue", callback_data=f"requeue_job:{job_id_btn}")
                         delete_button = InlineKeyboardButton(text="🗑️ Delete", callback_data=f"delete_job:{job_id_btn}")
-                        preview_button = InlineKeyboardButton(text="Preview", callback_data=f"preview_job:{job_id_btn}")
-                        if stat == 3:
+                        preview_button = InlineKeyboardButton(text="🔍 Preview", callback_data=f"preview_job:{job_id_btn}")
+                        if stat_num == 3:
+                            # Completed: two rows, max 2 columns per row
                             keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                                [requeue_button, delete_button, preview_button]
+                                [requeue_button, delete_button],
+                                [preview_button]
                             ])
                         else:
-                            if stat == 2:
-                                action_button = InlineKeyboardButton(text="✅ Resume", callback_data=f"resume_job:{job_id_btn}")
+                            if stat_num == 2:
+                                action_button = InlineKeyboardButton(text="▶️ Resume", callback_data=f"resume_job:{job_id_btn}")
                             else:
-                                action_button = InlineKeyboardButton(text="❌ Suspend", callback_data=f"suspend_job:{job_id_btn}")
+                                action_button = InlineKeyboardButton(text="⏸️ Suspend", callback_data=f"suspend_job:{job_id_btn}")
                             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                                 [action_button, requeue_button],
                                 [delete_button, preview_button]
@@ -549,20 +755,7 @@ async def handle_workers(message: types.Message):
                         info = worker.get("Info", {})
                         name = info.get("Name", "Unknown")
                         stat_num = info.get("Stat", 0)
-                        if stat_num == 0:
-                            stat = "Unknown"
-                        elif stat_num == 1:
-                            stat = "Rendering"
-                        elif stat_num == 2:
-                            stat = "Idle"
-                        elif stat_num == 3:
-                            stat = "Offline"
-                        elif stat_num == 4:
-                            stat = "Stalled"
-                        elif stat_num == 8:
-                            stat = "StartingJob"
-                        else:
-                            stat = f"Unknown ({stat_num})"
+                        stat = WORKER_STATUS_MAP.get(stat_num, f"Unknown ({stat_num})")
                         messages.append(f"{name:<24} {stat}")
                     header = f"{'Name':<24} Status"
                     header += f"\n{'-'*40}"
@@ -623,19 +816,44 @@ async def jobs_page_callback(callback_query: types.CallbackQuery):
                         batch = job.get("Props", {}).get("Batch", "Без имени")
                         grouped_jobs[batch].append(job)
 
+                    from datetime import datetime
                     combined_jobs = []
                     for batch, jobs in grouped_jobs.items():
                         total_tasks = sum(j.get("Props", {}).get("Tasks", 0) for j in jobs)
                         completed_chunks = sum(j.get("CompletedChunks", 0) for j in jobs)
-                        stat = max(j.get("Stat", 0) for j in jobs)
+                        # Determine batch-level status with priority: Active > Pending > Suspended > Failed > Completed > Unknown
+                        status_list = [j.get("Stat", 0) for j in jobs]
+                        if 1 in status_list:
+                            batch_stat = 1      # Active
+                        elif 6 in status_list:
+                            batch_stat = 6      # Pending
+                        elif 2 in status_list:
+                            batch_stat = 2      # Suspended
+                        elif 4 in status_list:
+                            batch_stat = 4      # Failed
+                        elif all(s == 3 for s in status_list):
+                            batch_stat = 3      # Completed
+                        else:
+                            batch_stat = 0      # Unknown
+                        # Determine the most recent Date among jobs in this batch
+                        dates = []
+                        for j in jobs:
+                            date_str = j.get("Date")
+                            if date_str:
+                                try:
+                                    dates.append(datetime.fromisoformat(date_str))
+                                except Exception:
+                                    pass
+                        max_date = max(dates) if dates else datetime.min
                         combined_jobs.append({
                             "_id": jobs[0].get("_id"),
                             "Props": {"Batch": batch, "Tasks": total_tasks},
                             "CompletedChunks": completed_chunks,
-                            "Stat": stat
+                            "Stat": batch_stat,
+                            "DateParsed": max_date
                         })
-
-                    combined_jobs.sort(key=lambda j: j.get("Stat", 0) == 2)
+                    # Sort by DateParsed descending (newest first)
+                    combined_jobs.sort(key=lambda j: j["DateParsed"], reverse=True)
                     jobs_slice = combined_jobs[page*4 : page*4+4]
                     normal_jobs = [job for job in jobs_slice if job.get("Stat", 0) != 2]
                     suspended_jobs = [job for job in jobs_slice if job.get("Stat", 0) == 2]
@@ -647,7 +865,9 @@ async def jobs_page_callback(callback_query: types.CallbackQuery):
                         total_tasks = props.get("Tasks", 0)
                         completed_chunks = job.get("CompletedChunks", 0)
                         progress_str = format_progress(completed_chunks, total_tasks)
-                        messages.append(f"{batch:<24} {progress_str:^16}\n{'-'*40}")
+                        stat = job.get("Stat", 0)
+                        icon = "✅" if stat == 3 else "▶️"
+                        messages.append(f"{icon} {batch:<22} {progress_str:^16}\n{'-'*40}")
                     if suspended_jobs:
                         messages.append("")
                         title = " suspended "
@@ -661,7 +881,8 @@ async def jobs_page_callback(callback_query: types.CallbackQuery):
                             total_tasks = props.get("Tasks", 0)
                             completed_chunks = job.get("CompletedChunks", 0)
                             progress_str = format_progress(completed_chunks, total_tasks)
-                            messages.append(f"{batch:<24} {progress_str:^16}\n{'-'*40}")
+                            icon = "⏸️"
+                            messages.append(f"{icon} {batch:<22} {progress_str:^16}\n{'-'*40}")
                     for job in jobs_slice:
                         props = job.get("Props", {})
                         batch = props.get("Batch", "Без имени")
@@ -671,7 +892,6 @@ async def jobs_page_callback(callback_query: types.CallbackQuery):
                     header = f"{'Batch':<24} {'Progress':^16}"
                     header += f"\n{'-'*40}"
                     batch_text = "\n".join(messages) if messages else "Нет данных"
-                    text = f"<pre>{header}\n{batch_text}</pre>\n\nВыберите задачу для подробной информации:"
                     inline_keyboard = []
                     row = []
                     for i, button in enumerate(buttons, 1):
@@ -681,16 +901,23 @@ async def jobs_page_callback(callback_query: types.CallbackQuery):
                             row = []
                     if row:
                         inline_keyboard.append(row)
-                    # Кнопки навигации: Назад и Вперёд ➡
+                    # Навигация
+                    total_items = len(combined_jobs)
+                    total_pages = (total_items + 3) // 4
                     nav_buttons = []
                     if page > 0:
                         nav_buttons.append(InlineKeyboardButton(text="⬅ Назад", callback_data=f"jobs_page:{page-1}"))
-                    if (page + 1)*4 < len(combined_jobs):
+                    if (page + 1) < total_pages:
                         nav_buttons.append(InlineKeyboardButton(text="Вперёд ➡", callback_data=f"jobs_page:{page+1}"))
                     if nav_buttons:
                         inline_keyboard.append(nav_buttons)
                     keyboard = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
-                    await callback_query.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+                    page_info = f"Страница {page+1} из {total_pages}"
+                    await callback_query.message.edit_text(
+                        f"<pre>{header}\n{batch_text}\n{page_info}</pre>\n\nВыберите задачу для подробной информации:",
+                        parse_mode="HTML",
+                        reply_markup=keyboard
+                    )
                 else:
                     await callback_query.message.edit_text(f"Ошибка: {resp.status}")
         except Exception as e:
@@ -793,7 +1020,7 @@ async def resume_job_callback(callback_query: types.CallbackQuery):
                             [requeue_button, delete_button]
                         ])
                     else:
-                        action_button = InlineKeyboardButton(text="❌ Suspend", callback_data=f"suspend_job:{job_id}")
+                        action_button = InlineKeyboardButton(text="⏸️ Suspend", callback_data=f"suspend_job:{job_id}")
                         new_keyboard = InlineKeyboardMarkup(inline_keyboard=[
                             [action_button, requeue_button],
                             [delete_button]
@@ -848,7 +1075,7 @@ async def suspend_job_callback(callback_query: types.CallbackQuery):
                             [requeue_button, delete_button]
                         ])
                     else:
-                        action_button = InlineKeyboardButton(text="✅ Resume", callback_data=f"resume_job:{job_id}")
+                        action_button = InlineKeyboardButton(text="▶️ Resume", callback_data=f"resume_job:{job_id}")
                         new_keyboard = InlineKeyboardMarkup(inline_keyboard=[
                             [action_button, requeue_button],
                             [delete_button]
@@ -885,8 +1112,21 @@ async def count_exr_files(session_dbx, path, headers_dbx):
             count += await count_exr_files(session_dbx, entry["path_display"], headers_dbx)
     return count
 
-# Рекурсивно скачивает EXR-файлы из папки Dropbox в локальную директорию
 async def download_exr_folder(session_dbx, download_url, headers_dbx, path, local_folder, job_id):
+    """
+    Рекурсивно скачивает EXR-файлы из папки Dropbox в локальную директорию.
+
+    Args:
+        session_dbx (aiohttp.ClientSession): сессия для запросов к Dropbox API.
+        download_url (str): URL для загрузки файлов.
+        headers_dbx (dict): заголовки для авторизации Dropbox API.
+        path (str): путь к папке в Dropbox.
+        local_folder (Path): локальная директория для сохранения EXR-файлов.
+        job_id (str): идентификатор задачи (для обновления прогресса).
+
+    Returns:
+        None
+    """
     state = download_states.get(job_id)
     downloaded_count = state["downloaded_count"]
     list_url = "https://api.dropboxapi.com/2/files/list_folder"
@@ -906,12 +1146,21 @@ async def download_exr_folder(session_dbx, download_url, headers_dbx, path, loca
                 "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": ROOT_NAMESPACE_ID}),
                 "Dropbox-API-Arg": json.dumps({"path": entry["path_display"]})
             }
-            async with session_dbx.post(download_url, headers=dl_headers) as f_resp:
-                if f_resp.status != 200:
-                    continue
-                data = await f_resp.read()
-                with open(local_file, "wb") as f:
-                    f.write(data)
+            try:
+                async with session_dbx.post(download_url, headers=dl_headers) as f_resp:
+                    if f_resp.status != 200:
+                        continue
+                    local_file.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        with open(local_file, "wb") as f:
+                            data = await f_resp.read()
+                            f.write(data)
+                    except FileNotFoundError:
+                        # Файл недоступен, пропускаем
+                        continue
+            except Exception:
+                # Ошибка сети или других проблем при загрузке, пропускаем файл
+                continue
             if stop_downloads.get(job_id) and stop_downloads[job_id].is_set():
                 return
             downloaded_count += 1
@@ -934,12 +1183,21 @@ async def download_exr_folder(session_dbx, download_url, headers_dbx, path, loca
 
 @dp_router.callback_query(lambda c: c.data and c.data.startswith("preview_job:"))
 async def preview_job_callback(callback_query: types.CallbackQuery):
+    global current_downloads
     user_id = callback_query.from_user.id
     login, password, _ = get_auth_credentials(user_id)
     if not login or not password:
         await callback_query.answer("Сначала введите логин и пароль с помощью /start.", show_alert=True)
         return
     job_id = callback_query.data.split(":", 1)[1]
+    # Проверяем лимит параллельных загрузок
+    if current_downloads >= MAX_CONCURRENT_DOWNLOADS:
+        await callback_query.message.answer(
+            "Сейчас выполняются максимальное количество скачиваний. "
+            "Пожалуйста, подождите завершения текущих задач."
+        )
+        return
+    current_downloads += 1
     stop_event = asyncio.Event()
     stop_downloads[job_id] = stop_event
     async with aiohttp.ClientSession() as session:
@@ -960,9 +1218,8 @@ async def preview_job_callback(callback_query: types.CallbackQuery):
                     await callback_query.answer("Поле OutDir отсутствует.", show_alert=True)
                     return
                 fullpath = outdirs[0]
-                # Обрезаем до "Team Folder", если такая часть есть
-                marker = "Team Folder"
-                idx = fullpath.find(marker)
+                # Обрезаем до корневой папки, указанной в DROPBOX_ROOT_MARKER
+                idx = fullpath.find(DROPBOX_ROOT_MARKER)
                 if idx != -1:
                     trimmed = fullpath[idx:]
                 else:
@@ -977,8 +1234,8 @@ async def preview_job_callback(callback_query: types.CallbackQuery):
                     "Content-Type": "application/json"
                 }
                 async with aiohttp.ClientSession() as session_dbx:
-                    # --- Получение метаданных через новую функцию ---
                     try:
+                        # --- Получение метаданных через новую функцию ---
                         metadata = await fetch_dropbox_metadata(session_dbx, dropbox_path, headers_dbx)
                     except Exception as e:
                         await callback_query.message.answer(str(e))
@@ -1059,25 +1316,29 @@ async def preview_job_callback(callback_query: types.CallbackQuery):
                             await callback_query.message.answer(f"Ошибка при скачивании: {e}")
                             return
 
-                    # --- Блок конвертации кадров ---
                     try:
+                        # --- Блок конвертации кадров ---
                         await callback_query.message.answer("Этап 2: Конвертация кадров из ACES в sRGB...")
-                        convert_exr_folder_to_srgb(local_root, conv_root, "config.ocio")
+                        async with conversion_semaphore:
+                            loop = asyncio.get_event_loop()
+                            await loop.run_in_executor(None, convert_exr_folder_to_srgb, local_root, conv_root, "config.ocio")
                     except Exception as e:
                         await callback_query.message.answer(f"Ошибка при конвертации: {e}")
                         return
 
-                    # --- Блок сборки видео ---
                     try:
+                        # --- Блок сборки видео ---
                         await callback_query.message.answer("Этап 3: Сборка видео из кадров...")
-                        video_path = assemble_video_from_exr(conv_root, exr_folder_name)
-                        await callback_query.message.answer_document(document=types.FSInputFile(str(video_path)))
+                        async with conversion_semaphore:
+                            loop = asyncio.get_event_loop()
+                            video_path = await loop.run_in_executor(None, assemble_video_from_exr, conv_root, exr_folder_name)
+                            await callback_query.message.answer_document(document=types.FSInputFile(str(video_path)))
                     except Exception as e:
                         await callback_query.message.answer(f"Ошибка при сборке видео: {e}")
                         return
 
-                    # --- Dropbox upload after Telegram send ---
                     try:
+                        # --- Dropbox upload after Telegram send ---
                         dropbox_path = await upload_video_to_dropbox(video_path, metadata)
                         await callback_query.message.answer("Видео загружено на Dropbox")
                     except Exception as e:
@@ -1089,6 +1350,8 @@ async def preview_job_callback(callback_query: types.CallbackQuery):
                     download_states.pop(job_id, None)
         except Exception as e:
             await callback_query.answer(f"Ошибка при обработке Preview: {e}", show_alert=True)
+        finally:
+            current_downloads -= 1
 
 # Handler for send_dbx_video
 @dp_router.callback_query(lambda c: c.data and c.data.startswith("send_dbx_video:"))
@@ -1108,8 +1371,8 @@ async def send_dbx_video(callback_query: types.CallbackQuery):
             await callback_query.message.answer("OutDir отсутствует.")
             return
         fullpath = outdirs[0]
-        marker = "Team Folder"
-        idx = fullpath.find(marker)
+        # Ищем индекс первого вхождения корневой папки, указанной в DROPBOX_ROOT_MARKER
+        idx = fullpath.find(DROPBOX_ROOT_MARKER)
         if idx != -1:
             trimmed = fullpath[idx:]
         else:
@@ -1138,11 +1401,11 @@ async def send_dbx_video(callback_query: types.CallbackQuery):
                 text = await f_resp.text()
                 await callback_query.message.answer(f"Ошибка при загрузке видео: {text}")
                 return
-            data = await f_resp.read()
-    # Сохраняем видео во временный файл
-    temp_path = ensure_temp_dir() / video_filename
-    with open(temp_path, "wb") as f:
-        f.write(data)
+            temp_path = ensure_temp_dir() / video_filename
+            temp_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(temp_path, "wb") as f:
+                data = await f_resp.read()
+                f.write(data)
     # Отправляем файл из локальной временной директории
     await callback_query.message.answer_document(document=types.FSInputFile(str(temp_path)), filename=video_filename)
     # Опционально: удалить временный файл после отправки
@@ -1156,112 +1419,128 @@ async def send_dbx_video(callback_query: types.CallbackQuery):
 # Handler for create_new_video
 @dp_router.callback_query(lambda c: c.data and c.data.startswith("create_new_video:"))
 async def create_new_video(callback_query: types.CallbackQuery):
+    global current_downloads
     # Просто повторяем логику из preview_job_callback без проверки существования
     job_id = callback_query.data.split(":", 1)[1]
+    # Проверяем лимит параллельных загрузок
+    if current_downloads >= MAX_CONCURRENT_DOWNLOADS:
+        await callback_query.message.answer(
+            "Сейчас выполняются максимальное количество скачиваний. "
+            "Пожалуйста, подождите завершения текущих задач."
+        )
+        return
+    current_downloads += 1
     stop_event = asyncio.Event()
     stop_downloads[job_id] = stop_event
     await callback_query.answer()
     async with aiohttp.ClientSession() as session:
-        headers = aiohttp.BasicAuth(*get_auth_credentials(callback_query.from_user.id)[:2])
-        async with session.get(f"{BASE_API_URL}/jobs", auth=headers, ssl=False) as resp:
-            if resp.status != 200:
-                await callback_query.answer(f"Ошибка при запросе: {resp.status}", show_alert=True)
-                return
-            jobs = await resp.json()
-        matching_jobs = [j for j in jobs if j.get("_id") == job_id]
-        if not matching_jobs:
-            await callback_query.answer("Задача не найдена.", show_alert=True)
-            return
-        job_obj = matching_jobs[0]
-        outdirs = job_obj.get("OutDir", [])
-        if not outdirs:
-            await callback_query.answer("Поле OutDir отсутствует.", show_alert=True)
-            return
-        fullpath = outdirs[0]
-        marker = "Team Folder"
-        idx = fullpath.find(marker)
-        if idx != -1:
-            trimmed = fullpath[idx:]
-        else:
-            await callback_query.message.answer(f"Нет доступа к файлу. Путь: {fullpath}")
-            return
-        dropbox_path = "/" + trimmed.replace("\\", "/").lstrip("/")
-        temp_dir = ensure_temp_dir()
-        headers_dbx = {
-            "Authorization": f"Bearer {get_fresh_access_token()}",
-            "Dropbox-API-Select-User": TEAM_MEMBER_ID,
-            "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": ROOT_NAMESPACE_ID}),
-            "Content-Type": "application/json"
-        }
-        async with aiohttp.ClientSession() as session_dbx:
-            try:
-                metadata = await fetch_dropbox_metadata(session_dbx, dropbox_path, headers_dbx)
-            except Exception as e:
-                await callback_query.message.answer(str(e))
-                return
-            exr_folder_name = metadata["name"]
-            local_root = temp_dir / exr_folder_name
-            conv_root = Path("conv") / exr_folder_name
-            video_path = conv_root / f"{exr_folder_name}.mp4"
-            exr_files_exist = lambda folder: folder.exists() and any(str(f).endswith(".exr") for f in folder.glob("*.exr"))
-            if exr_files_exist(local_root):
-                await callback_query.message.answer("Этап 1: Файлы уже скачаны, пропускаем скачивание.")
-            else:
-                try:
-                    if metadata.get(".tag") == "file":
-                        await callback_query.message.answer("Загрузка файла не поддерживается для предпросмотра.")
-                        return
-                    elif metadata.get(".tag") == "folder":
-                        await callback_query.message.answer("Этап 1: Начинаем скачивание файлов...")
-                        download_url = "https://content.dropboxapi.com/2/files/download"
-                        total_files = await count_exr_files(session_dbx, metadata["path_display"], headers_dbx)
-                        downloaded_count = 0
-                        stop_button = InlineKeyboardButton(text="Stop", callback_data=f"stop_download:{job_id}")
-                        stop_kb = InlineKeyboardMarkup(inline_keyboard=[[stop_button]])
-                        progress_msg = await callback_query.message.answer(f"Скачивание 0%", reply_markup=stop_kb)
-                        download_states[job_id] = {
-                            "total_files": total_files,
-                            "downloaded_count": downloaded_count,
-                            "progress_msg": progress_msg,
-                            "stop_kb": stop_kb
-                        }
-                        local_root.mkdir(exist_ok=True)
-                        await download_exr_folder(session_dbx, download_url, headers_dbx, metadata["path_display"], local_root, job_id)
-                        if stop_downloads.get(job_id) and stop_downloads[job_id].is_set():
-                            stop_downloads.pop(job_id, None)
-                            await callback_query.message.answer("Скачивание остановлено пользователем.")
-                            return
-                        stop_downloads.pop(job_id, None)
-                        await progress_msg.edit_text("Скачивание 100%")
-                    else:
-                        await callback_query.message.answer("Неподдерживаемый тип метаданных.")
-                        return
-                except Exception as e:
-                    if stop_downloads.get(job_id) and stop_downloads[job_id].is_set():
-                        return
-                    await callback_query.message.answer(f"Ошибка при скачивании: {e}")
+        try:
+            headers = aiohttp.BasicAuth(*get_auth_credentials(callback_query.from_user.id)[:2])
+            async with session.get(f"{BASE_API_URL}/jobs", auth=headers, ssl=False) as resp:
+                if resp.status != 200:
+                    await callback_query.answer(f"Ошибка при запросе: {resp.status}", show_alert=True)
                     return
-            try:
-                await callback_query.message.answer("Этап 2: Конвертация кадров из ACES в sRGB...")
-                convert_exr_folder_to_srgb(local_root, conv_root, "config.ocio")
-            except Exception as e:
-                await callback_query.message.answer(f"Ошибка при конвертации: {e}")
+                jobs = await resp.json()
+            matching_jobs = [j for j in jobs if j.get("_id") == job_id]
+            if not matching_jobs:
+                await callback_query.answer("Задача не найдена.", show_alert=True)
                 return
-            try:
-                await callback_query.message.answer("Этап 3: Сборка видео из кадров...")
-                video_path = assemble_video_from_exr(conv_root, exr_folder_name)
-                await callback_query.message.answer_document(document=types.FSInputFile(str(video_path)))
-            except Exception as e:
-                await callback_query.message.answer(f"Ошибка при сборке видео: {e}")
+            job_obj = matching_jobs[0]
+            outdirs = job_obj.get("OutDir", [])
+            if not outdirs:
+                await callback_query.answer("Поле OutDir отсутствует.", show_alert=True)
                 return
-            try:
-                dropbox_path2 = await upload_video_to_dropbox(video_path, metadata)
-                await callback_query.message.answer("Видео загружено на Dropbox")
-            except Exception as e:
-                await callback_query.message.answer(str(e))
+            fullpath = outdirs[0]
+            # Ищем индекс вхождения корневой папки в DROPBOX_ROOT_MARKER
+            idx = fullpath.find(DROPBOX_ROOT_MARKER)
+            if idx != -1:
+                trimmed = fullpath[idx:]
+            else:
+                await callback_query.message.answer(f"Нет доступа к файлу. Путь: {fullpath}")
                 return
-            cleanup_temp_and_conv()
-            download_states.pop(job_id, None)
+            dropbox_path = "/" + trimmed.replace("\\", "/").lstrip("/")
+            temp_dir = ensure_temp_dir()
+            headers_dbx = {
+                "Authorization": f"Bearer {get_fresh_access_token()}",
+                "Dropbox-API-Select-User": TEAM_MEMBER_ID,
+                "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": ROOT_NAMESPACE_ID}),
+                "Content-Type": "application/json"
+            }
+            async with aiohttp.ClientSession() as session_dbx:
+                try:
+                    metadata = await fetch_dropbox_metadata(session_dbx, dropbox_path, headers_dbx)
+                except Exception as e:
+                    await callback_query.message.answer(str(e))
+                    return
+                exr_folder_name = metadata["name"]
+                local_root = temp_dir / exr_folder_name
+                conv_root = Path("conv") / exr_folder_name
+                video_path = conv_root / f"{exr_folder_name}.mp4"
+                exr_files_exist = lambda folder: folder.exists() and any(str(f).endswith(".exr") for f in folder.glob("*.exr"))
+                if exr_files_exist(local_root):
+                    await callback_query.message.answer("Этап 1: Файлы уже скачаны, пропускаем скачивание.")
+                else:
+                    try:
+                        if metadata.get(".tag") == "file":
+                            await callback_query.message.answer("Загрузка файла не поддерживается для предпросмотра.")
+                            return
+                        elif metadata.get(".tag") == "folder":
+                            await callback_query.message.answer("Этап 1: Начинаем скачивание файлов...")
+                            download_url = "https://content.dropboxapi.com/2/files/download"
+                            total_files = await count_exr_files(session_dbx, metadata["path_display"], headers_dbx)
+                            downloaded_count = 0
+                            stop_button = InlineKeyboardButton(text="Stop", callback_data=f"stop_download:{job_id}")
+                            stop_kb = InlineKeyboardMarkup(inline_keyboard=[[stop_button]])
+                            progress_msg = await callback_query.message.answer(f"Скачивание 0%", reply_markup=stop_kb)
+                            download_states[job_id] = {
+                                "total_files": total_files,
+                                "downloaded_count": downloaded_count,
+                                "progress_msg": progress_msg,
+                                "stop_kb": stop_kb
+                            }
+                            local_root.mkdir(exist_ok=True)
+                            await download_exr_folder(session_dbx, download_url, headers_dbx, metadata["path_display"], local_root, job_id)
+                            if stop_downloads.get(job_id) and stop_downloads[job_id].is_set():
+                                stop_downloads.pop(job_id, None)
+                                await callback_query.message.answer("Скачивание остановлено пользователем.")
+                                return
+                            stop_downloads.pop(job_id, None)
+                            await progress_msg.edit_text("Скачивание 100%")
+                        else:
+                            await callback_query.message.answer("Неподдерживаемый тип метаданных.")
+                            return
+                    except Exception as e:
+                        if stop_downloads.get(job_id) and stop_downloads[job_id].is_set():
+                            return
+                        await callback_query.message.answer(f"Ошибка при скачивании: {e}")
+                        return
+                try:
+                    await callback_query.message.answer("Этап 2: Конвертация кадров из ACES в sRGB...")
+                    async with conversion_semaphore:
+                        loop = asyncio.get_event_loop()
+                        await loop.run_in_executor(None, convert_exr_folder_to_srgb, local_root, conv_root, "config.ocio")
+                except Exception as e:
+                    await callback_query.message.answer(f"Ошибка при конвертации: {e}")
+                    return
+                try:
+                    await callback_query.message.answer("Этап 3: Сборка видео из кадров...")
+                    async with conversion_semaphore:
+                        loop = asyncio.get_event_loop()
+                        video_path = await loop.run_in_executor(None, assemble_video_from_exr, conv_root, exr_folder_name)
+                        await callback_query.message.answer_document(document=types.FSInputFile(str(video_path)))
+                except Exception as e:
+                    await callback_query.message.answer(f"Ошибка при сборке видео: {e}")
+                    return
+                try:
+                    dropbox_path2 = await upload_video_to_dropbox(video_path, metadata)
+                    await callback_query.message.answer("Видео загружено на Dropbox")
+                except Exception as e:
+                    await callback_query.message.answer(str(e))
+                    return
+                cleanup_temp_and_conv()
+                download_states.pop(job_id, None)
+        finally:
+            current_downloads -= 1
 
 # Обрабатывает удаление задачи (Delete).
 
@@ -1343,18 +1622,43 @@ async def handle_realtime(message: types.Message):
                             batch = job.get("Props", {}).get("Batch", "Без имени")
                             grouped_jobs[batch].append(job)
 
+                        from datetime import datetime
                         combined_jobs = []
                         for batch, jobs in grouped_jobs.items():
                             total_tasks = sum(j.get("Props", {}).get("Tasks", 0) for j in jobs)
                             completed_chunks = sum(j.get("CompletedChunks", 0) for j in jobs)
-                            stat = max(j.get("Stat", 0) for j in jobs)
+                            # Determine batch-level status with priority: Active > Pending > Suspended > Failed > Completed > Unknown
+                            status_list = [j.get("Stat", 0) for j in jobs]
+                            if 1 in status_list:
+                                batch_stat = 1
+                            elif 6 in status_list:
+                                batch_stat = 6
+                            elif 2 in status_list:
+                                batch_stat = 2
+                            elif 4 in status_list:
+                                batch_stat = 4
+                            elif all(s == 3 for s in status_list):
+                                batch_stat = 3
+                            else:
+                                batch_stat = 0
+                            # Determine the most recent Date among jobs in this batch
+                            dates = []
+                            for j in jobs:
+                                date_str = j.get("Date")
+                                if date_str:
+                                    try:
+                                        dates.append(datetime.fromisoformat(date_str))
+                                    except Exception:
+                                        pass
+                            max_date = max(dates) if dates else datetime.min
                             combined_jobs.append({
                                 "Props": {"Batch": batch, "Tasks": total_tasks},
                                 "CompletedChunks": completed_chunks,
-                                "Stat": stat
+                                "Stat": batch_stat,
+                                "DateParsed": max_date
                             })
-
-                        combined_jobs.sort(key=lambda j: j.get("Stat", 0) == 2)
+                        # Sort by DateParsed descending (newest first)
+                        combined_jobs.sort(key=lambda j: j["DateParsed"], reverse=True)
 
                         normal_jobs = [job for job in combined_jobs if job.get("Stat", 0) != 2]
                         suspended_jobs = [job for job in combined_jobs if job.get("Stat", 0) == 2]
@@ -1366,7 +1670,12 @@ async def handle_realtime(message: types.Message):
                             total_tasks = props.get("Tasks", 0)
                             completed_chunks = job.get("CompletedChunks", 0)
                             progress_str = format_progress(completed_chunks, total_tasks)
-                            messages.append(f"{batch:<24} {progress_str:^16}\n{'-'*40}")
+                            stat = job.get("Stat", 0)
+                            if stat == 3:
+                                icon = "✅"
+                            else:
+                                icon = "▶️"
+                            messages.append(f"{icon} {batch:<22} {progress_str:^16}\n{'-'*40}")
 
                         if suspended_jobs:
                             messages.append("")
@@ -1381,7 +1690,7 @@ async def handle_realtime(message: types.Message):
                                 total_tasks = props.get("Tasks", 0)
                                 completed_chunks = job.get("CompletedChunks", 0)
                                 progress_str = format_progress(completed_chunks, total_tasks)
-                                messages.append(f"{batch:<24} {progress_str:^16}\n{'-'*40}")
+                                messages.append(f"⏸️ {batch:<22} {progress_str:^16}\n{'-'*40}")
 
                         header = f"{'Batch':<24} {'Progress':^16}"
                         header += f"\n{'-'*40}"
