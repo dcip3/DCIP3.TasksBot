@@ -1,23 +1,15 @@
 import asyncio
-import json
-import os
-from dotenv import load_dotenv
-load_dotenv()
 import shutil
 import subprocess
 from datetime import datetime, timezone, timedelta
 from pathlib import Path, PurePosixPath
 
 import aiohttp
+import json
 import numpy as np
 import OpenEXR
 import PyOpenColorIO as ocio
 import Imath
-
-import requests
-import base64
-import time
-import io
 
 from aiogram import Bot, Dispatcher, Router, types
 from aiogram.exceptions import TelegramBadRequest
@@ -26,92 +18,49 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
+from config import (
+    TG_API_TOKEN,
+    BASE_API_URL,
+    DROPBOX_APP_KEY,
+    DROPBOX_APP_SECRET,
+    DROPBOX_REFRESH_TOKEN,
+    TEAM_MEMBER_ID,
+    ROOT_NAMESPACE_ID,
+    DROPBOX_ROOT_MARKER,
+    WORKER_STATUS_MAP,
+    JOB_STATUS_MAP,
+    user_credentials,
+    load_credentials,
+    save_credentials,
+    get_auth_credentials,
+    get_main_keyboard
+)
+
+from dropbox_helpers import (
+    get_fresh_access_token,
+    fetch_dropbox_metadata,
+    count_exr_files,
+    download_exr_folder,
+    upload_video_to_dropbox
+)
+
+from video_helpers import (
+    convert_exr_folder_to_srgb, 
+    assemble_video_from_exr
+)
+
+
+
 # --- Logging setup ---
 import logging
+
+# Initialize bot and router using TG_API_TOKEN
+bot = Bot(token=TG_API_TOKEN)
+dp_router = Router()
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Токен API и базовый URL API
-API_TOKEN = os.getenv("TG_API_TOKEN")
-BASE_API_URL = "https://renderfarm.local:4434/api"
-
-CREDENTIALS_FILE = Path("credentials.json")
-
-# === Dropbox OAuth2 constants ===
-DROPBOX_APP_KEY = os.getenv("DROPBOX_APP_KEY")
-DROPBOX_APP_SECRET = os.getenv("DROPBOX_APP_SECRET")
-DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN")
-
-# Переменные для кеширования access_token
-_dropbox_access_token = None
-_dropbox_access_token_expires_at = 0
-
- # Mapping для статуса воркера
-WORKER_STATUS_MAP = {
-    0: "Unknown",
-    1: "Rendering",
-    2: "Idle",
-    3: "Offline",
-    4: "Stalled",
-    8: "StartingJob"
-}
-
-# Mapping для статуса задачи (Stat)
-JOB_STATUS_MAP = {
-    0: "Unknown",
-    1: "Active",
-    2: "Suspended",
-    3: "Completed",
-    4: "Failed",
-    6: "Pending"
-}
-
-def get_fresh_access_token():
-    """
-    Возвращает действующий Dropbox access_token. Если текущий ещё не истёк, возвращает кешированный. Иначе обновляет по refresh_token.
-
-    Returns:
-        str: действующий access token.
-
-    Raises:
-        RuntimeError: если не удалось получить или обновить токен.
-    """
-    global _dropbox_access_token, _dropbox_access_token_expires_at
-    now = int(time.time())
-    if _dropbox_access_token and now < _dropbox_access_token_expires_at - 30:
-        return _dropbox_access_token
-
-    url = "https://api.dropboxapi.com/oauth2/token"
-    creds = f"{DROPBOX_APP_KEY}:{DROPBOX_APP_SECRET}".encode("ascii")
-    b64_creds = base64.b64encode(creds).decode("ascii")
-    headers = {
-        "Authorization": f"Basic {b64_creds}",
-        "Content-Type": "application/x-www-form-urlencoded"
-    }
-    data = {
-        "grant_type": "refresh_token",
-        "refresh_token": DROPBOX_REFRESH_TOKEN
-    }
-    resp = requests.post(url, headers=headers, data=data)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Не удалось обновить access_token: {resp.status_code} – {resp.text}")
-    token_info = resp.json()
-    access_token = token_info.get("access_token")
-    expires_in = token_info.get("expires_in", 0)
-    if not access_token:
-        raise RuntimeError("В ответе нет поля access_token")
-    _dropbox_access_token = access_token
-    _dropbox_access_token_expires_at = now + expires_in
-    return _dropbox_access_token
-
-# Для доступа к Team Space необходимы team_member_id и root_namespace_id
-TEAM_MEMBER_ID = os.getenv("DROPBOX_TEAM_MEMBER_ID")
-ROOT_NAMESPACE_ID = os.getenv("DROPBOX_ROOT_NAMESPACE_ID")
-# Root marker folder name in Dropbox paths (to identify the team's root directory)
-DROPBOX_ROOT_MARKER = os.getenv("DROPBOX_ROOT_MARKER", "Team Folder")
-
-bot = Bot(token=API_TOKEN)
-dp_router = Router()
 
 # Переменная для хранения состояния загрузки (для возобновления)
 download_states = {}
@@ -170,156 +119,6 @@ def clear_folder(folder_path):
         folder.mkdir(parents=True, exist_ok=True)
 
 
-# --- Новые функции для preview_job_callback ---
-
-async def fetch_dropbox_metadata(session_dbx, dropbox_path: str, headers_dbx: dict) -> dict:
-    """
-    Получает метаданные объекта в Dropbox по указанному пути.
-
-    Args:
-        session_dbx (aiohttp.ClientSession): активная сессия для запросов к Dropbox API.
-        dropbox_path (str): путь к объекту в Dropbox.
-        headers_dbx (dict): заголовки для авторизации в Dropbox API.
-
-    Returns:
-        dict: JSON-ответ с метаданными объекта.
-
-    Raises:
-        RuntimeError: если API вернул ошибку или некорректный статус.
-    """
-    meta_url = "https://api.dropboxapi.com/2/files/get_metadata"
-    async with session_dbx.post(meta_url, headers=headers_dbx, json={"path": dropbox_path}) as resp:
-        if resp.status != 200:
-            text = await resp.text()
-            raise RuntimeError(f"Ошибка при получении метаданных: {text}")
-        return await resp.json()
-
-def convert_exr_folder_to_srgb(local_root: Path, conv_root: Path, ocio_config_path: str):
-    """
-    Конвертирует все EXR-файлы из ACEScg в sRGB с помощью OCIO.
-
-    Args:
-        local_root (Path): папка с исходными EXR-файлами.
-        conv_root (Path): папка для сохранения конвертированных EXR-файлов.
-        ocio_config_path (str): путь к файлу конфига OCIO.
-
-    Returns:
-        None
-
-    Raises:
-        RuntimeError: если не найдено EXR-файлов или отсутствует конфиг OCIO.
-    """
-    conv_root.mkdir(parents=True, exist_ok=True)
-    exr_files = sorted([f for f in local_root.glob("*.exr") if "cryptomatte" not in f.name.lower()])
-    if not exr_files:
-        raise RuntimeError("Не найдено EXR-кадров для конвертации.")
-
-    if not Path(ocio_config_path).exists():
-        raise RuntimeError(f"OCIO config не найден: {ocio_config_path}")
-    config = ocio.Config.CreateFromFile(str(ocio_config_path))
-    transform = ocio.DisplayViewTransform()
-    transform.setSrc("ACEScg")
-    transform.setDisplay("sRGB")
-    transform.setView("ACES 1.0 SDR-video")
-    transform.setDirection(ocio.TRANSFORM_DIR_FORWARD)
-    processor = config.getProcessor(transform)
-    cpu_processor = processor.getDefaultCPUProcessor()
-
-    first_exr = exr_files[0]
-    exr_file = OpenEXR.InputFile(str(first_exr))
-    header = exr_file.header()
-    dw = header["dataWindow"]
-    width = dw.max.x - dw.min.x + 1
-    height = dw.max.y - dw.min.y + 1
-
-    FLOAT = Imath.PixelType(Imath.PixelType.FLOAT)
-    for exr_path in exr_files:
-        exr = OpenEXR.InputFile(str(exr_path))
-        channels = exr.channels(["R", "G", "B"], FLOAT)
-        r = np.frombuffer(channels[0], dtype=np.float32).reshape((height, width))
-        g = np.frombuffer(channels[1], dtype=np.float32).reshape((height, width))
-        b = np.frombuffer(channels[2], dtype=np.float32).reshape((height, width))
-        rgb = np.stack([r, g, b], axis=-1)
-        flat_image = rgb.reshape(-1, 3).astype(np.float32)
-
-        img_desc = ocio.PackedImageDesc(flat_image, width, height, 3)
-        cpu_processor.apply(img_desc)
-        img = flat_image.reshape(height, width, 3)
-
-        out_exr_path = conv_root / exr_path.name
-        header_out = OpenEXR.Header(width, height)
-        half_chan = Imath.Channel(Imath.PixelType(Imath.PixelType.HALF))
-        header_out["channels"] = {"R": half_chan, "G": half_chan, "B": half_chan}
-        out_exr = OpenEXR.OutputFile(str(out_exr_path), header_out)
-        r_half = (img[:, :, 0].astype(np.float16)).tobytes()
-        g_half = (img[:, :, 1].astype(np.float16)).tobytes()
-        b_half = (img[:, :, 2].astype(np.float16)).tobytes()
-        out_exr.writePixels({"R": r_half, "G": g_half, "B": b_half})
-        out_exr.close()
-
-def assemble_video_from_exr(conv_root: Path, exr_folder_name: str) -> Path:
-    """
-    Собирает видео из конвертированных EXR-файлов с помощью ffmpeg.
-
-    Args:
-        conv_root (Path): папка с конвертированными EXR-файлами.
-        exr_folder_name (str): имя папки (используется для имени выходного видео).
-
-    Returns:
-        Path: путь к сгенерированному видео-файлу MP4.
-
-    Raises:
-        RuntimeError: если в папке conv_root нет EXR-файлов или при ошибке ffmpeg.
-    """
-    video_path = conv_root / f"{exr_folder_name}.mp4"
-    exr_pattern = str(conv_root / "*.exr")
-    if not any(conv_root.glob("*.exr")):
-        raise RuntimeError("Нет кадров для сборки видео.")
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-pattern_type", "glob",
-        "-i", exr_pattern,
-        "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
-        str(video_path)
-    ]
-    subprocess.run(cmd, check=True)
-    return video_path
-
-async def upload_video_to_dropbox(video_path: Path, metadata: dict):
-    """
-    Загружает видео-файл на Dropbox в ту же директорию, что и исходные EXR.
-
-    Args:
-        video_path (Path): локальный путь к видео-файлу.
-        metadata (dict): метаданные исходной папки EXR из Dropbox.
-
-    Returns:
-        str: путь в Dropbox, куда было загружено видео.
-
-    Raises:
-        RuntimeError: если загрузка вернула ошибку.
-    """
-    filename = video_path.name
-    exr_parent = str(PurePosixPath(metadata["path_display"]).parent)
-    dropbox_upload_path = f"{exr_parent}/{filename}"
-
-    upload_url = "https://content.dropboxapi.com/2/files/upload"
-    headers_upload = {
-        "Authorization": f"Bearer {get_fresh_access_token()}",
-        "Dropbox-API-Select-User": TEAM_MEMBER_ID,
-        "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": ROOT_NAMESPACE_ID}),
-        "Dropbox-API-Arg": json.dumps({"path": dropbox_upload_path, "mode": "overwrite"}),
-        "Content-Type": "application/octet-stream"
-    }
-    data = video_path.read_bytes()
-    async with aiohttp.ClientSession() as session_upload:
-        async with session_upload.post(upload_url, headers=headers_upload, data=data) as resp_up:
-            if resp_up.status != 200:
-                text = await resp_up.text()
-                raise RuntimeError(f"Ошибка при загрузке видео на Dropbox: {text}")
-    return dropbox_upload_path
 
 def cleanup_temp_and_conv():
     """
@@ -337,37 +136,6 @@ class AuthStates(StatesGroup):
     waiting_for_login = State()
     waiting_for_password = State()
 
-def load_credentials():
-    if CREDENTIALS_FILE.exists():
-        with CREDENTIALS_FILE.open("r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
-# Initialize user_credentials after definition of load_credentials
-user_credentials = load_credentials()
-
-# Сохраняет учётные данные пользователей в файл.
-def save_credentials(data):
-    with CREDENTIALS_FILE.open("w", encoding="utf-8") as f:
-        json.dump(data, f)
-
-# Получает логин, пароль и статус уведомлений для указанного пользователя.
-def get_auth_credentials(user_id):
-    creds = user_credentials.get(str(user_id))
-    if not creds or len(creds) < 2:
-        return None, None, False
-    login, password = creds[0], creds[1]
-    notifications_enabled = creds[2] if len(creds) > 2 else False
-    return login, password, notifications_enabled
-
-# Возвращает основную клавиатуру для управления ботом.
-def get_main_keyboard():
-    kb = [
-        [KeyboardButton(text="Jobs"), KeyboardButton(text="Realtime"), KeyboardButton(text="Workers")],
-        [KeyboardButton(text="🔔 Уведомления"), KeyboardButton(text="🚪 Выход")],
-        [KeyboardButton(text="🧹 Очистить")]
-    ]
-    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 # Обеспечивает существование директории temp и возвращает её путь
 def ensure_temp_dir():
@@ -687,31 +455,71 @@ async def job_info_callback(callback_query: types.CallbackQuery):
                         total_tasks = props.get("Tasks", 0)
                         completed_chunks = job.get("CompletedChunks", 0)
                         progress_str = format_progress(completed_chunks, total_tasks)
-                        user = props.get("User", "Неизвестно")
-                        date_comp = props.get("DateComp", "Неизвестно")
                         full_name = props.get("Name", "Без имени")
                         name = full_name.split("/")[-1] if "/" in full_name else full_name
-                        stat_num = job.get("Stat", 0)
-                        stat = JOB_STATUS_MAP.get(stat_num, f"Unknown ({stat_num})")
+
+                        # --- Расчет примерного времени ожидания (ETA) ---
+                        eta_str = "N/A"
+                        async with session.get(f"{BASE_API_URL}/tasks?JobID={job_id}", auth=headers, ssl=False) as tasks_resp:
+                            if tasks_resp.status == 200:
+                                tasks_data = await tasks_resp.json()
+                                if isinstance(tasks_data, list):
+                                    tasks_list = tasks_data
+                                else:
+                                    tasks_list = tasks_data.get("Tasks", [])
+                                logger.info(f"job_info_callback: retrieved {len(tasks_list)} tasks for job {job_id}")
+                                try:
+                                    # Вычисляем длительности всех завершенных задач
+                                    durations = []
+                                    for t in tasks_list:
+                                        if t.get("Stat") == 5:
+                                            start_str = t.get("StartRen")
+                                            comp_str = t.get("Comp")
+                                            if start_str and comp_str and start_str != "0001-01-01T00:00:00Z" and comp_str != "0001-01-01T00:00:00Z":
+                                                start_time = datetime.fromisoformat(start_str)
+                                                comp_time = datetime.fromisoformat(comp_str)
+                                                duration_val = (comp_time - start_time).total_seconds()
+                                                logger.info(f"job_info_callback: task {t.get('TaskID')} start {start_time}, comp {comp_time}, duration {duration_val}")
+                                                durations.append(duration_val)
+                                            else:
+                                                logger.info(f"job_info_callback: task {t.get('TaskID')} has invalid timestamps: start {start_str}, comp {comp_str}")
+                                    logger.info(f"job_info_callback: durations for job {job_id}: {durations}")
+                                    if durations:
+                                        avg_duration = sum(durations) / len(durations)
+                                        logger.info(f"job_info_callback: average duration for job {job_id}: {avg_duration}")
+                                        # Считаем количество оставшихся задач по общему числу и завершённым
+                                        remaining = total_tasks - completed_chunks
+                                        logger.info(f"job_info_callback: total_tasks for job {job_id}: {total_tasks}, completed_chunks: {completed_chunks}, remaining: {remaining}")
+                                        total_eta_seconds = avg_duration * remaining
+                                        logger.info(f"job_info_callback: total_eta_seconds for job {job_id}: {total_eta_seconds}")
+                                        if total_eta_seconds > 0:
+                                            eta_td = timedelta(seconds=int(total_eta_seconds))
+                                            eta_str = str(eta_td)
+                                except Exception as e:
+                                    logger.error(f"job_info_callback: error calculating ETA for job {job_id}: {e}", exc_info=True)
+                                    eta_str = "N/A"
+                        # End of ETA block
+
                         message_text = (
                             f"Информация о подзадаче:\n"
-                            f"Name: {name}\n"
-                            f"Batch: {batch}\n"
+                            f"Hipname: {batch}\n"
+                            f"Rop: {name}\n"
                             f"Прогресс: {progress_str}\n"
-                            f"Пользователь: {user}\n"
-                            f"Статус: {stat}\n"
+                            f"ETA: {eta_str}\n"
                         )
                         await callback_query.message.answer(message_text)
 
                         job_id_btn = job.get("_id")
+                        stat_num = job.get("Stat", 0)
                         requeue_button = InlineKeyboardButton(text="🔄 Requeue", callback_data=f"requeue_job:{job_id_btn}")
                         delete_button = InlineKeyboardButton(text="🗑️ Delete", callback_data=f"delete_job:{job_id_btn}")
                         preview_button = InlineKeyboardButton(text="🔍 Preview", callback_data=f"preview_job:{job_id_btn}")
+                        tasks_button = InlineKeyboardButton(text="📋 Tasks", callback_data=f"tasks_job:{job_id_btn}")
                         if stat_num == 3:
                             # Completed: two rows, max 2 columns per row
                             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                                 [requeue_button, delete_button],
-                                [preview_button]
+                                [preview_button, tasks_button]
                             ])
                         else:
                             if stat_num == 2:
@@ -720,7 +528,8 @@ async def job_info_callback(callback_query: types.CallbackQuery):
                                 action_button = InlineKeyboardButton(text="⏸️ Suspend", callback_data=f"suspend_job:{job_id_btn}")
                             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                                 [action_button, requeue_button],
-                                [delete_button, preview_button]
+                                [delete_button, preview_button],
+                                [tasks_button]
                             ])
                         await callback_query.message.answer("Действия:", reply_markup=keyboard)
                     await callback_query.answer()
@@ -728,6 +537,86 @@ async def job_info_callback(callback_query: types.CallbackQuery):
                     await callback_query.answer(f"Ошибка при запросе: {resp.status}", show_alert=True)
         except Exception as e:
             await callback_query.answer(f"Ошибка при запросе: {e}", show_alert=True)
+
+
+# Обрабатывает запрос на просмотр информации по задачам Job (Tasks)
+@dp_router.callback_query(lambda c: c.data and c.data.startswith("tasks_job:"))
+async def tasks_job_callback(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    login, password, _ = get_auth_credentials(user_id)
+    if not login or not password:
+        await callback_query.answer("Сначала введите логин и пароль с помощью /start.", show_alert=True)
+        return
+    job_id = callback_query.data.split(":", 1)[1]
+    api_url = f"{BASE_API_URL}/tasks?JobID={job_id}"
+    async with aiohttp.ClientSession() as session:
+        try:
+            headers = aiohttp.BasicAuth(login, password)
+            async with session.get(api_url, auth=headers, ssl=False) as resp:
+                if resp.status != 200:
+                    await callback_query.answer(f"Ошибка при запросе задач: {resp.status}", show_alert=True)
+                    return
+                data = await resp.json()
+                tasks = data.get("Tasks", [])
+                if not tasks:
+                    await callback_query.message.answer("Нет задач для данного Job.")
+                    await callback_query.answer()
+                    return
+
+                # Формируем текст для отображения списка задач
+                lines = []
+                # Заголовок
+                header = f"{'Frames':<18} {'Prog':^10} {'Time':^12}"
+                header += f"\n{'-'*42}"
+                lines.append(header)
+                # Определение иконки для статуса задачи
+                def get_task_icon(stat):
+                    if stat == 5:   # Completed
+                        return "✅"
+                    elif stat == 4: # Rendering
+                        return "▶️"
+                    elif stat == 3: # Suspended
+                        return "⏸️"
+                    elif stat == 6: # Failed
+                        return "❌"
+                    elif stat in (2, 8): # Queued или Pending
+                        return "⏳"
+                    else:           # Unknown и другие
+                        return "❓"
+
+                from datetime import datetime, timezone
+                for task in tasks:
+                    frames = task.get("Frames", "")
+                    prog = task.get("Prog", "")
+                    stat = task.get("Stat", 1)
+                    icon = get_task_icon(stat)
+                    rendertime_str = ""
+                    start_str = task.get("StartRen")
+                    if start_str and start_str != "0001-01-01T00:00:00Z":
+                        try:
+                            start_time = datetime.fromisoformat(start_str)
+                            # Completed tasks
+                            if stat == 5:
+                                comp_str = task.get("Comp")
+                                if comp_str and comp_str != "0001-01-01T00:00:00Z":
+                                    comp_time = datetime.fromisoformat(comp_str)
+                                    duration = comp_time.astimezone(timezone.utc) - start_time.astimezone(timezone.utc)
+                                    rendertime_str = str(duration).split(".")[0]
+                            # Currently rendering tasks
+                            elif stat == 4:
+                                now_utc = datetime.now(timezone.utc)
+                                duration = now_utc - start_time.astimezone(timezone.utc)
+                                rendertime_str = str(duration).split(".")[0]
+                        except Exception:
+                            pass
+                    line = f"{icon} {frames:<16} {prog:^10} {rendertime_str:^12}"
+                    lines.append(line)
+
+                message_text = "<pre>" + "\n".join(lines) + "</pre>"
+                await callback_query.message.answer(message_text, parse_mode="HTML")
+                await callback_query.answer()
+        except Exception as e:
+            await callback_query.answer(f"Ошибка при получении задач: {e}", show_alert=True)
 
 
 # Обрабатывает запрос пользователя на просмотр списка воркеров (Workers).
@@ -1094,91 +983,6 @@ async def suspend_job_callback(callback_query: types.CallbackQuery):
 #
 # --- Вспомогательные функции для Dropbox EXR ---
 #
-# Считает количество EXR-файлов (исключая cryptomatte) рекурсивно в папке Dropbox
-async def count_exr_files(session_dbx, path, headers_dbx):
-    list_url = "https://api.dropboxapi.com/2/files/list_folder"
-    async with session_dbx.post(list_url, headers=headers_dbx, json={"path": path}) as list_resp:
-        if list_resp.status not in (0, 200):
-            return 0
-        result = await list_resp.json()
-    count = 0
-    for entry in result.get("entries", []):
-        name = entry["name"]
-        if "cryptomatte" in name.lower():
-            continue
-        if entry[".tag"] == "file" and name.lower().endswith(".exr"):
-            count += 1
-        elif entry[".tag"] == "folder":
-            count += await count_exr_files(session_dbx, entry["path_display"], headers_dbx)
-    return count
-
-async def download_exr_folder(session_dbx, download_url, headers_dbx, path, local_folder, job_id):
-    """
-    Рекурсивно скачивает EXR-файлы из папки Dropbox в локальную директорию.
-
-    Args:
-        session_dbx (aiohttp.ClientSession): сессия для запросов к Dropbox API.
-        download_url (str): URL для загрузки файлов.
-        headers_dbx (dict): заголовки для авторизации Dropbox API.
-        path (str): путь к папке в Dropbox.
-        local_folder (Path): локальная директория для сохранения EXR-файлов.
-        job_id (str): идентификатор задачи (для обновления прогресса).
-
-    Returns:
-        None
-    """
-    state = download_states.get(job_id)
-    downloaded_count = state["downloaded_count"]
-    list_url = "https://api.dropboxapi.com/2/files/list_folder"
-    async with session_dbx.post(list_url, headers=headers_dbx, json={"path": path}) as list_resp:
-        if list_resp.status not in (0, 200):
-            return
-        result = await list_resp.json()
-    for entry in result.get("entries", []):
-        name = entry["name"]
-        if "cryptomatte" in name.lower():
-            continue
-        if entry[".tag"] == "file" and name.lower().endswith(".exr"):
-            local_file = local_folder / name
-            dl_headers = {
-                "Authorization": f"Bearer {get_fresh_access_token()}",
-                "Dropbox-API-Select-User": TEAM_MEMBER_ID,
-                "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": ROOT_NAMESPACE_ID}),
-                "Dropbox-API-Arg": json.dumps({"path": entry["path_display"]})
-            }
-            try:
-                async with session_dbx.post(download_url, headers=dl_headers) as f_resp:
-                    if f_resp.status != 200:
-                        continue
-                    local_file.parent.mkdir(parents=True, exist_ok=True)
-                    try:
-                        with open(local_file, "wb") as f:
-                            data = await f_resp.read()
-                            f.write(data)
-                    except FileNotFoundError:
-                        # Файл недоступен, пропускаем
-                        continue
-            except Exception:
-                # Ошибка сети или других проблем при загрузке, пропускаем файл
-                continue
-            if stop_downloads.get(job_id) and stop_downloads[job_id].is_set():
-                return
-            downloaded_count += 1
-            download_states[job_id]["downloaded_count"] = downloaded_count
-            total_files = state["total_files"]
-            percent = int((downloaded_count / total_files) * 100) if total_files else 0
-            progress_msg = state["progress_msg"]
-            try:
-                await progress_msg.edit_text(f"Скачивание {percent}%", reply_markup=state["stop_kb"])
-            except Exception:
-                pass
-        elif entry[".tag"] == "folder":
-            subfolder = local_folder / name
-            subfolder.mkdir(exist_ok=True)
-            await download_exr_folder(session_dbx, download_url, headers_dbx, entry["path_display"], subfolder, job_id)
-            if stop_downloads.get(job_id) and stop_downloads[job_id].is_set():
-                return
-
 # Обрабатывает предпросмотр пути задачи (Preview Job Path).
 
 @dp_router.callback_query(lambda c: c.data and c.data.startswith("preview_job:"))
@@ -1278,63 +1082,63 @@ async def preview_job_callback(callback_query: types.CallbackQuery):
                     # Этап 1: Скачивание файлов (если ещё не скачаны)
                     exr_files_exist = lambda folder: folder.exists() and any(str(f).endswith(".exr") for f in folder.glob("*.exr"))
                     if exr_files_exist(local_root):
-                        await callback_query.message.answer("Этап 1: Файлы уже скачаны, пропускаем скачивание.")
+                        stage_msg = await callback_query.message.answer("Этап 1: Файлы уже скачаны, пропускаем скачивание.")
                     else:
                         try:
                             if metadata.get(".tag") == "file":
-                                await callback_query.message.answer("Загрузка файла не поддерживается для предпросмотра.")
+                                stage_msg = await callback_query.message.answer("Загрузка файла не поддерживается для предпросмотра.")
                                 return
                             elif metadata.get(".tag") == "folder":
-                                await callback_query.message.answer("Этап 1: Начинаем скачивание файлов...")
-                                download_url = "https://content.dropboxapi.com/2/files/download"
-                                # Подсчёт файлов, исключая cryptomatte
-                                total_files = await count_exr_files(session_dbx, metadata["path_display"], headers_dbx)
-                                downloaded_count = 0
+                                # Send a single message for downloading and keep editing it
                                 stop_button = InlineKeyboardButton(text="Stop", callback_data=f"stop_download:{job_id}")
                                 stop_kb = InlineKeyboardMarkup(inline_keyboard=[[stop_button]])
-                                progress_msg = await callback_query.message.answer(f"Скачивание 0%", reply_markup=stop_kb)
+                                stage_msg = await callback_query.message.answer("Этап 1: Скачивание 0%", reply_markup=stop_kb)
+                                download_url = "https://content.dropboxapi.com/2/files/download"
+                                total_files = await count_exr_files(session_dbx, metadata["path_display"], headers_dbx)
+                                downloaded_count = 0
                                 download_states[job_id] = {
                                     "total_files": total_files,
                                     "downloaded_count": downloaded_count,
-                                    "progress_msg": progress_msg,
+                                    "progress_msg": stage_msg,
                                     "stop_kb": stop_kb
                                 }
                                 local_root.mkdir(exist_ok=True)
-                                await download_exr_folder(session_dbx, download_url, headers_dbx, metadata["path_display"], local_root, job_id)
+                                await download_exr_folder(session_dbx, download_url, headers_dbx, metadata["path_display"], local_root, job_id, download_states, stop_downloads)
                                 if stop_downloads.get(job_id) and stop_downloads[job_id].is_set():
                                     stop_downloads.pop(job_id, None)
-                                    await callback_query.message.answer("Скачивание остановлено пользователем.")
+                                    await stage_msg.edit_text("Скачивание остановлено пользователем.")
                                     return
                                 stop_downloads.pop(job_id, None)
-                                await progress_msg.edit_text("Скачивание 100%")
+                                await stage_msg.edit_text("Этап 1: Скачивание 100%")
                             else:
-                                await callback_query.message.answer("Неподдерживаемый тип метаданных.")
+                                stage_msg = await callback_query.message.answer("Неподдерживаемый тип метаданных.")
                                 return
                         except Exception as e:
                             if stop_downloads.get(job_id) and stop_downloads[job_id].is_set():
                                 return
-                            await callback_query.message.answer(f"Ошибка при скачивании: {e}")
+                            await stage_msg.edit_text(f"Ошибка при скачивании: {e}")
                             return
 
                     try:
                         # --- Блок конвертации кадров ---
-                        await callback_query.message.answer("Этап 2: Конвертация кадров из ACES в sRGB...")
+                        await stage_msg.edit_text("Этап 2: Конвертация кадров из ACES в sRGB...")
                         async with conversion_semaphore:
                             loop = asyncio.get_event_loop()
                             await loop.run_in_executor(None, convert_exr_folder_to_srgb, local_root, conv_root, "config.ocio")
                     except Exception as e:
-                        await callback_query.message.answer(f"Ошибка при конвертации: {e}")
+                        await stage_msg.edit_text(f"Ошибка при конвертации: {e}")
                         return
 
                     try:
                         # --- Блок сборки видео ---
-                        await callback_query.message.answer("Этап 3: Сборка видео из кадров...")
+                        await stage_msg.edit_text("Этап 3: Сборка видео из кадров...")
                         async with conversion_semaphore:
                             loop = asyncio.get_event_loop()
                             video_path = await loop.run_in_executor(None, assemble_video_from_exr, conv_root, exr_folder_name)
-                            await callback_query.message.answer_document(document=types.FSInputFile(str(video_path)))
+                        await callback_query.message.answer_document(document=types.FSInputFile(str(video_path)))
+                        await stage_msg.delete()
                     except Exception as e:
-                        await callback_query.message.answer(f"Ошибка при сборке видео: {e}")
+                        await stage_msg.edit_text(f"Ошибка при сборке видео: {e}")
                         return
 
                     try:
@@ -1478,58 +1282,59 @@ async def create_new_video(callback_query: types.CallbackQuery):
                 video_path = conv_root / f"{exr_folder_name}.mp4"
                 exr_files_exist = lambda folder: folder.exists() and any(str(f).endswith(".exr") for f in folder.glob("*.exr"))
                 if exr_files_exist(local_root):
-                    await callback_query.message.answer("Этап 1: Файлы уже скачаны, пропускаем скачивание.")
+                    stage_msg = await callback_query.message.answer("Этап 1: Файлы уже скачаны, пропускаем скачивание.")
                 else:
                     try:
                         if metadata.get(".tag") == "file":
-                            await callback_query.message.answer("Загрузка файла не поддерживается для предпросмотра.")
+                            stage_msg = await callback_query.message.answer("Загрузка файла не поддерживается для предпросмотра.")
                             return
                         elif metadata.get(".tag") == "folder":
-                            await callback_query.message.answer("Этап 1: Начинаем скачивание файлов...")
+                            # Send a single message for downloading and keep editing it
+                            stop_button = InlineKeyboardButton(text="Stop", callback_data=f"stop_download:{job_id}")
+                            stop_kb = InlineKeyboardMarkup(inline_keyboard=[[stop_button]])
+                            stage_msg = await callback_query.message.answer("Этап 1: Скачивание 0%", reply_markup=stop_kb)
                             download_url = "https://content.dropboxapi.com/2/files/download"
                             total_files = await count_exr_files(session_dbx, metadata["path_display"], headers_dbx)
                             downloaded_count = 0
-                            stop_button = InlineKeyboardButton(text="Stop", callback_data=f"stop_download:{job_id}")
-                            stop_kb = InlineKeyboardMarkup(inline_keyboard=[[stop_button]])
-                            progress_msg = await callback_query.message.answer(f"Скачивание 0%", reply_markup=stop_kb)
                             download_states[job_id] = {
                                 "total_files": total_files,
                                 "downloaded_count": downloaded_count,
-                                "progress_msg": progress_msg,
+                                "progress_msg": stage_msg,
                                 "stop_kb": stop_kb
                             }
                             local_root.mkdir(exist_ok=True)
-                            await download_exr_folder(session_dbx, download_url, headers_dbx, metadata["path_display"], local_root, job_id)
+                            await download_exr_folder(session_dbx, download_url, headers_dbx, metadata["path_display"], local_root, job_id, download_states, stop_downloads)
                             if stop_downloads.get(job_id) and stop_downloads[job_id].is_set():
                                 stop_downloads.pop(job_id, None)
-                                await callback_query.message.answer("Скачивание остановлено пользователем.")
+                                await stage_msg.edit_text("Скачивание остановлено пользователем.")
                                 return
                             stop_downloads.pop(job_id, None)
-                            await progress_msg.edit_text("Скачивание 100%")
+                            await stage_msg.edit_text("Этап 1: Скачивание 100%")
                         else:
-                            await callback_query.message.answer("Неподдерживаемый тип метаданных.")
+                            stage_msg = await callback_query.message.answer("Неподдерживаемый тип метаданных.")
                             return
                     except Exception as e:
                         if stop_downloads.get(job_id) and stop_downloads[job_id].is_set():
                             return
-                        await callback_query.message.answer(f"Ошибка при скачивании: {e}")
+                        await stage_msg.edit_text(f"Ошибка при скачивании: {e}")
                         return
                 try:
-                    await callback_query.message.answer("Этап 2: Конвертация кадров из ACES в sRGB...")
+                    await stage_msg.edit_text("Этап 2: Конвертация кадров из ACES в sRGB...")
                     async with conversion_semaphore:
                         loop = asyncio.get_event_loop()
                         await loop.run_in_executor(None, convert_exr_folder_to_srgb, local_root, conv_root, "config.ocio")
                 except Exception as e:
-                    await callback_query.message.answer(f"Ошибка при конвертации: {e}")
+                    await stage_msg.edit_text(f"Ошибка при конвертации: {e}")
                     return
                 try:
-                    await callback_query.message.answer("Этап 3: Сборка видео из кадров...")
+                    await stage_msg.edit_text("Этап 3: Сборка видео из кадров...")
                     async with conversion_semaphore:
                         loop = asyncio.get_event_loop()
                         video_path = await loop.run_in_executor(None, assemble_video_from_exr, conv_root, exr_folder_name)
-                        await callback_query.message.answer_document(document=types.FSInputFile(str(video_path)))
+                    await callback_query.message.answer_document(document=types.FSInputFile(str(video_path)))
+                    await stage_msg.delete()
                 except Exception as e:
-                    await callback_query.message.answer(f"Ошибка при сборке видео: {e}")
+                    await stage_msg.edit_text(f"Ошибка при сборке видео: {e}")
                     return
                 try:
                     dropbox_path2 = await upload_video_to_dropbox(video_path, metadata)
