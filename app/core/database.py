@@ -1,0 +1,97 @@
+# app/core/database.py
+"""
+Database operations and connection management.
+
+This module handles SQLite database initialization, connection management,
+and provides basic database operations for the application.
+"""
+
+import logging
+import aiosqlite
+from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+# Global database connection
+tasks_db_conn: aiosqlite.Connection | None = None
+
+
+async def init_db():
+    """
+    Initialize the SQLite database and create all necessary tables.
+    
+    Creates the following tables:
+    - users: Stores user authentication and preferences
+    - user_sessions: Stores user session data and credentials
+    """
+    global tasks_db_conn
+    tasks_db_conn = await aiosqlite.connect(settings.db_path)
+    
+    # Create users table for authentication and user management
+    await tasks_db_conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE,
+            password_hash TEXT,
+            telegram_user_id INTEGER UNIQUE,
+            is_active INTEGER DEFAULT 1,
+            notifications_enabled INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # Create user_sessions table for storing session data
+    await tasks_db_conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_user_id INTEGER UNIQUE,
+            deadline_login TEXT,
+            deadline_password TEXT,
+            notifications_enabled INTEGER DEFAULT 0,
+            last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (telegram_user_id) REFERENCES users(telegram_user_id)
+        )
+    """)
+    
+    # Create indexes for better performance
+    await tasks_db_conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_users_telegram_id 
+        ON users(telegram_user_id)
+    """)
+    
+    await tasks_db_conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_users_username 
+        ON users(username)
+    """)
+    
+    await tasks_db_conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_user_sessions_telegram_id 
+        ON user_sessions(telegram_user_id)
+    """)
+    
+    await tasks_db_conn.commit()
+    logger.info("Database initialized successfully")
+
+
+async def close_db():
+    """
+    Close the SQLite database connection.
+    
+    Safely closes the database connection and resets the global connection
+    variable to None.
+    """
+    global tasks_db_conn
+    if tasks_db_conn:
+        await tasks_db_conn.close()
+        tasks_db_conn = None
+        logger.info("Database connection closed")
+
+
+def get_db_connection() -> aiosqlite.Connection | None:
+    """
+    Get the current database connection.
+    
+    Returns:
+        The current aiosqlite connection or None if not initialized
+    """
+    return tasks_db_conn 

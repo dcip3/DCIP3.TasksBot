@@ -6,13 +6,7 @@ from pathlib import Path, PurePosixPath
 import requests
 import aiohttp
 
-from config import (
-    DROPBOX_APP_KEY,
-    DROPBOX_APP_SECRET,
-    DROPBOX_REFRESH_TOKEN,
-    TEAM_MEMBER_ID,
-    ROOT_NAMESPACE_ID
-)
+from app.core.config import settings
 
 # Переменные для кеширования access_token
 _dropbox_access_token = None
@@ -29,7 +23,7 @@ def get_fresh_access_token():
         return _dropbox_access_token
 
     url = "https://api.dropboxapi.com/oauth2/token"
-    creds = f"{DROPBOX_APP_KEY}:{DROPBOX_APP_SECRET}".encode("ascii")
+    creds = f"{settings.dropbox_app_key}:{settings.dropbox_app_secret}".encode("ascii")
     b64_creds = base64.b64encode(creds).decode("ascii")
     headers = {
         "Authorization": f"Basic {b64_creds}",
@@ -37,7 +31,7 @@ def get_fresh_access_token():
     }
     data = {
         "grant_type": "refresh_token",
-        "refresh_token": DROPBOX_REFRESH_TOKEN
+        "refresh_token": settings.dropbox_refresh_token
     }
     resp = requests.post(url, headers=headers, data=data)
     if resp.status_code != 200:
@@ -113,8 +107,8 @@ async def download_exr_folder(
             local_file = local_folder / name
             dl_headers = {
                 "Authorization": f"Bearer {get_fresh_access_token()}",
-                "Dropbox-API-Select-User": TEAM_MEMBER_ID,
-                "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": ROOT_NAMESPACE_ID}),
+                "Dropbox-API-Select-User": settings.dropbox_team_member_id,
+                "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
                 "Dropbox-API-Arg": json.dumps({"path": entry["path_display"]})
             }
             try:
@@ -168,8 +162,8 @@ async def upload_video_to_dropbox(video_path: Path, metadata: dict) -> str:
     upload_url = "https://content.dropboxapi.com/2/files/upload"
     headers_upload = {
         "Authorization": f"Bearer {get_fresh_access_token()}",
-        "Dropbox-API-Select-User": TEAM_MEMBER_ID,
-        "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": ROOT_NAMESPACE_ID}),
+        "Dropbox-API-Select-User": settings.dropbox_team_member_id,
+        "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
         "Dropbox-API-Arg": json.dumps({"path": dropbox_upload_path, "mode": "overwrite"}),
         "Content-Type": "application/octet-stream"
     }
