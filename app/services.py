@@ -477,7 +477,8 @@ async def download_job_folder(login: str, password: str, job_id: str) -> Optiona
                 return None
                 
             exr_folder_name = metadata["name"]
-            local_root = temp_dir / exr_folder_name
+            # Use job_id to make the path unique
+            local_root = temp_dir / f"{exr_folder_name}_{job_id}"
             
             # Check if files already exist
             exr_files_exist = lambda folder: folder.exists() and any(str(f).endswith(".exr") for f in folder.glob("*.exr"))
@@ -582,8 +583,9 @@ async def create_video_from_job(login: str, password: str, job_id: str) -> Optio
                 return None
                 
             exr_folder_name = metadata["name"]
-            local_root = temp_dir / exr_folder_name
-            conv_root = conv_dir / exr_folder_name
+            # Use job_id to make the paths unique
+            local_root = temp_dir / f"{exr_folder_name}_{job_id}"
+            conv_root = conv_dir / f"{exr_folder_name}_{job_id}"
             video_path = conv_root / f"{exr_folder_name}.mp4"
             
             # Check if video already exists
@@ -607,7 +609,7 @@ async def create_video_from_job(login: str, password: str, job_id: str) -> Optio
             
             # Upload to Dropbox
             logger.info(f"Uploading video to Dropbox for job {job_id}")
-            dropbox_path = await upload_video_to_dropbox(video_path, metadata)
+            dropbox_path = await upload_video_to_dropbox(video_path, metadata, job_id)
             logger.info(f"Video uploaded to Dropbox: {dropbox_path}")
             
             return str(video_path)
@@ -676,8 +678,26 @@ async def check_video_exists_in_dropbox(login: str, password: str, job_id: str) 
             video_filename = f"{metadata['name']}.mp4"
             video_dropbox_path = f"{exr_parent}/{video_filename}"
             
+            # Also check if there's a job-specific video (with job_id in filename)
+            job_specific_video_filename = f"{metadata['name']}_{job_id}.mp4"
+            job_specific_video_dropbox_path = f"{exr_parent}/{job_specific_video_filename}"
+            
             try:
-                # Try to get metadata for the video file
+                # First try to get metadata for the job-specific video file
+                video_metadata = await fetch_dropbox_metadata(session_dbx, job_specific_video_dropbox_path, headers_dbx)
+                if video_metadata.get(".tag") == "file":
+                    return {
+                        "exists": True,
+                        "filename": job_specific_video_filename,
+                        "dropbox_path": job_specific_video_dropbox_path,
+                        "metadata": video_metadata
+                    }
+            except Exception:
+                # Job-specific video doesn't exist, try generic one
+                pass
+                
+            try:
+                # Try to get metadata for the generic video file
                 video_metadata = await fetch_dropbox_metadata(session_dbx, video_dropbox_path, headers_dbx)
                 if video_metadata.get(".tag") == "file":
                     return {
@@ -742,7 +762,15 @@ async def download_video_from_dropbox(login: str, password: str, job_id: str) ->
                     logger.error(f"Error downloading video: {text}")
                     return None
                     
-                temp_path = temp_dir / video_info["filename"]
+                # Use job_id to make the local filename unique
+                filename = video_info["filename"]
+                if not filename.endswith(f"_{job_id}.mp4"):
+                    name_without_ext = filename.rsplit('.', 1)[0]
+                    unique_filename = f"{name_without_ext}_{job_id}.mp4"
+                else:
+                    unique_filename = filename
+                    
+                temp_path = temp_dir / unique_filename
                 temp_path.parent.mkdir(parents=True, exist_ok=True)
                 
                 with open(temp_path, "wb") as f:

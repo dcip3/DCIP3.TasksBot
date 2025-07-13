@@ -1,6 +1,7 @@
 import time
 import base64
 import json
+from typing import Optional
 from pathlib import Path, PurePosixPath
 
 import requests
@@ -180,13 +181,21 @@ async def download_exr_folder(
             if stop_downloads.get(job_id) and stop_downloads[job_id].is_set():
                 return
 
-async def upload_video_to_dropbox(video_path: Path, metadata: dict) -> str:
+async def upload_video_to_dropbox(video_path: Path, metadata: dict, job_id: Optional[str] = None) -> str:
     """
     Загружает видео-файл на Dropbox в ту же директорию, что и исходные EXR.
     """
     filename = video_path.name
     exr_parent = str(PurePosixPath(metadata["path_display"]).parent)
-    dropbox_upload_path = f"{exr_parent}/{filename}"
+    
+    # If job_id is provided, create a unique filename
+    if job_id:
+        name_without_ext = filename.rsplit('.', 1)[0]
+        ext = filename.rsplit('.', 1)[1] if '.' in filename else ''
+        unique_filename = f"{name_without_ext}_{job_id}.{ext}"
+        dropbox_upload_path = f"{exr_parent}/{unique_filename}"
+    else:
+        dropbox_upload_path = f"{exr_parent}/{filename}"
 
     upload_url = "https://content.dropboxapi.com/2/files/upload"
     headers_upload = {
