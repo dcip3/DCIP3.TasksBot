@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     dropbox_app_secret: str
     dropbox_refresh_token: str
     dropbox_team_member_id: str
-    dropbox_root_namespace_id: int
+    dropbox_root_namespace_id: str
     dropbox_root_marker: str = "Team Folder"
     
     # Local Application Settings

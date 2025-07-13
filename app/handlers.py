@@ -156,6 +156,41 @@ async def cmd_start(message: Message):
     )
 
 
+@router.message(Command("setup_menu"))
+async def cmd_setup_menu(message: Message):
+    """
+    Setup the menu button for Mini App.
+    
+    Args:
+        message: Telegram message object
+    """
+    from app.utils import setup_menu_button
+    try:
+        await message.answer("🔄 Setting up menu button...")
+        await setup_menu_button()
+        await message.answer("✅ Menu button setup successfully! You should now see the 'Tasks' button in the chat menu.")
+    except Exception as e:
+        await message.answer(f"❌ Failed to setup menu button: {e}")
+        logger.error(f"Setup menu button error: {e}")
+
+
+@router.message(Command("menu_status"))
+async def cmd_menu_status(message: Message):
+    """
+    Check the current menu button status.
+    
+    Args:
+        message: Telegram message object
+    """
+    try:
+        # Попробуем получить текущую кнопку меню
+        current_button = await bot.get_chat_menu_button()
+        await message.answer(f"📋 Current menu button: {current_button}")
+    except Exception as e:
+        await message.answer(f"❌ Failed to get menu button status: {e}")
+        logger.error(f"Get menu button status error: {e}")
+
+
 @router.message(F.text == "🧹 Очистить")
 async def clear_chat_handler(message: Message):
     """
@@ -731,6 +766,7 @@ async def job_info_callback(callback_query: CallbackQuery):
                 buttons.append(InlineKeyboardButton(text="⏸ Suspend", callback_data=f"suspend_job:{job_id}"))
             buttons.append(InlineKeyboardButton(text="🔄 Requeue", callback_data=f"requeue_job:{job_id}"))
         
+        buttons.append(InlineKeyboardButton(text="🔍 Preview", callback_data=f"preview_job:{job_id}"))
         buttons.append(InlineKeyboardButton(text="🗑 Delete", callback_data=f"delete_job:{job_id}"))
         buttons.append(InlineKeyboardButton(text="📋 Tasks", callback_data=f"tasks_job:{job_id}"))
         buttons.append(InlineKeyboardButton(text="⬅ Back", callback_data="jobs_back"))
@@ -757,6 +793,68 @@ async def job_info_callback(callback_query: CallbackQuery):
     except Exception as e:
         logger.error(f"Error handling job info for user {callback_query.from_user.id}: {e}")
         await callback_query.answer("Error occurred while fetching job info.", show_alert=True)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("preview_job:"))
+async def preview_job_callback(callback_query: CallbackQuery):
+    """Handle preview job button press."""
+    if callback_query.from_user is None:
+        await callback_query.answer("Error: User information not available.", show_alert=True)
+        return
+        
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+    
+    job_id = callback_query.data.split(":", 1)[1]
+    
+    try:
+        # Get user credentials
+        from app.auth import get_deadline_credentials
+        credentials = await get_deadline_credentials(callback_query.from_user.id)
+        if not credentials:
+            await callback_query.answer("No credentials found. Please login again.", show_alert=True)
+            return
+        
+        login, password = credentials
+        
+        # Send initial message
+        progress_msg = await callback_query.message.answer("🔍 Starting preview generation...")
+        
+        try:
+            # Step 1: Download files
+            await progress_msg.edit_text("📥 Step 1: Downloading files from Dropbox...")
+            local_path = await download_job_folder(login, password, job_id)
+            
+            if not local_path:
+                await progress_msg.edit_text("❌ Failed to download job files")
+                return
+            
+            # Step 2: Create video
+            await progress_msg.edit_text("🎬 Step 2: Converting EXR files and creating video...")
+            video_path = await create_video_from_job(login, password, job_id)
+            
+            if not video_path:
+                await progress_msg.edit_text("❌ Failed to create video")
+                return
+            
+            # Step 3: Send video
+            await progress_msg.edit_text("📤 Step 3: Sending video...")
+            from aiogram.types import FSInputFile
+            await callback_query.message.answer_document(
+                document=FSInputFile(video_path),
+                caption="🎬 Preview video generated successfully!"
+            )
+            
+            await progress_msg.delete()
+            
+        except Exception as e:
+            logger.error(f"Error in preview generation: {e}")
+            await progress_msg.edit_text(f"❌ Error during preview generation: {str(e)}")
+            
+    except Exception as e:
+        logger.error(f"Error handling preview for user {callback_query.from_user.id}: {e}")
+        await callback_query.answer("Error occurred while generating preview.", show_alert=True)
 
 
 @router.callback_query(lambda c: c.data == "jobs_back")

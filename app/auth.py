@@ -108,20 +108,41 @@ async def is_authorized(telegram_user_id: int) -> bool:
     Check if Deadline credentials exist for the given telegram_user_id.
     Returns True if credentials are found, False otherwise.
     """
+    logger.info(f"Checking authorization for user {telegram_user_id}")
+    
     # Try user_sessions table
     conn = get_db_connection()
     if conn is not None:
-        async with conn.execute(
-            "SELECT 1 FROM user_sessions WHERE telegram_user_id = ?",
-            (telegram_user_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                return True
+        try:
+            async with conn.execute(
+                "SELECT 1 FROM user_sessions WHERE telegram_user_id = ?",
+                (telegram_user_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    logger.info(f"User {telegram_user_id} is authorized (found in user_sessions)")
+                    return True
+                else:
+                    logger.info(f"User {telegram_user_id} not found in user_sessions")
+        except Exception as e:
+            logger.error(f"Error checking user_sessions for {telegram_user_id}: {e}")
+    else:
+        logger.warning("Database connection not available")
+    
     # Fallback: check credentials.json if used
-    from app.core.config import get_auth_credentials
-    login, password, _ = get_auth_credentials(str(telegram_user_id))
-    return bool(login and password)
+    try:
+        from app.core.config import get_auth_credentials
+        login, password, _ = get_auth_credentials(str(telegram_user_id))
+        if login and password:
+            logger.info(f"User {telegram_user_id} is authorized (found in credentials.json)")
+            return True
+        else:
+            logger.info(f"User {telegram_user_id} not found in credentials.json")
+    except Exception as e:
+        logger.error(f"Error checking credentials.json for {telegram_user_id}: {e}")
+    
+    logger.info(f"User {telegram_user_id} is not authorized")
+    return False
 
 
 async def logout_user(telegram_user_id: int) -> bool:
@@ -176,8 +197,11 @@ async def save_deadline_credentials(telegram_user_id: int, deadline_login: str, 
     Returns:
         True if saved successfully, False otherwise
     """
+    logger.info(f"Saving Deadline credentials for user {telegram_user_id}")
+    
     conn = get_db_connection()
     if conn is None:
+        logger.error("Database connection not available")
         return False
     
     try:
@@ -188,8 +212,21 @@ async def save_deadline_credentials(telegram_user_id: int, deadline_login: str, 
             VALUES (?, ?, ?, CURRENT_TIMESTAMP)
         """, (telegram_user_id, deadline_login, deadline_password))
         await conn.commit()
-        logger.info(f"Saved Deadline credentials for user {telegram_user_id}")
-        return True
+        logger.info(f"Successfully saved Deadline credentials for user {telegram_user_id}")
+        
+        # Verify the save by checking if the record exists
+        async with conn.execute(
+            "SELECT 1 FROM user_sessions WHERE telegram_user_id = ?",
+            (telegram_user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                logger.info(f"Verified: credentials saved for user {telegram_user_id}")
+                return True
+            else:
+                logger.error(f"Failed to verify saved credentials for user {telegram_user_id}")
+                return False
+                
     except Exception as e:
         logger.error(f"Failed to save Deadline credentials for user {telegram_user_id}: {e}")
         return False
@@ -205,8 +242,11 @@ async def get_deadline_credentials(telegram_user_id: int) -> Optional[Tuple[str,
     Returns:
         Tuple of (login, password) or None if not found
     """
+    logger.info(f"Getting Deadline credentials for user {telegram_user_id}")
+    
     conn = get_db_connection()
     if conn is None:
+        logger.error("Database connection not available")
         return None
     
     try:
@@ -216,8 +256,11 @@ async def get_deadline_credentials(telegram_user_id: int) -> Optional[Tuple[str,
         ) as cursor:
             row = await cursor.fetchone()
             if row:
+                logger.info(f"Found credentials for user {telegram_user_id}")
                 return (row[0], row[1])
-            return None
+            else:
+                logger.info(f"No credentials found for user {telegram_user_id}")
+                return None
     except Exception as e:
         logger.error(f"Failed to get Deadline credentials for user {telegram_user_id}: {e}")
         return None

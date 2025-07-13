@@ -18,7 +18,7 @@ from functools import wraps
 from pathlib import Path
 from typing import cast
 
-from aiogram.types import Message, KeyboardButton, ReplyKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, KeyboardButton, ReplyKeyboardMarkup, InlineKeyboardButton, MenuButtonWebApp, WebAppInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -96,6 +96,58 @@ def get_main_keyboard():
         is_persistent=False,
         input_field_placeholder=""
     )
+
+async def setup_menu_button():
+    """
+    Setup the menu button for Mini App.
+    This creates a button in the chat menu that opens the Mini App.
+    """
+    try:
+        # URL для Mini App - для разработки используем localhost
+        # В продакшене замените на ваш домен с HTTPS
+        # mini_app_url = "http://localhost:3000"  # Для разработки
+        mini_app_url = "https://example.com"  # Для продакшена
+        
+        logger.info(f"Setting up menu button with URL: {mini_app_url}")
+        
+        # Используем правильный метод для aiogram 3.x
+        await bot.set_chat_menu_button(
+            menu_button=MenuButtonWebApp(
+                text="Tasks",
+                web_app=WebAppInfo(url=mini_app_url)
+            )
+        )
+        logger.info("Menu button setup successfully")
+    except Exception as e:
+        logger.error(f"Failed to setup menu button: {e}")
+        # Попробуем альтернативный способ
+        try:
+            logger.info("Trying alternative method...")
+            await bot.set_chat_menu_button(
+                menu_button=MenuButtonWebApp(
+                    text="Tasks",
+                    web_app=WebAppInfo(url=mini_app_url)
+                ),
+                chat_id=None  # Для всех пользователей
+            )
+            logger.info("Menu button setup successfully (alternative method)")
+        except Exception as e2:
+            logger.error(f"Alternative method also failed: {e2}")
+            # Попробуем третий способ - через BotFather API
+            try:
+                logger.info("Trying BotFather API method...")
+                # Этот метод может не работать в aiogram 3.x, но попробуем
+                await bot.set_chat_menu_button(
+                    menu_button=MenuButtonWebApp(
+                        text="Tasks",
+                        web_app=WebAppInfo(url=mini_app_url)
+                    ),
+                    chat_id=0  # Глобальная настройка
+                )
+                logger.info("Menu button setup successfully (BotFather API method)")
+            except Exception as e3:
+                logger.error(f"All methods failed: {e3}")
+                raise e3
 
 # ============================================================================
 # === UTILITY FUNCTIONS ===
@@ -271,6 +323,10 @@ async def on_startup(bot):
     # Initialize directories
     ensure_temp_dir()
     Path(settings.conv_dir).mkdir(exist_ok=True)
+    
+    # Setup menu button for Mini App
+    await setup_menu_button()
+    logger.info("Menu button setup completed")
     
     # Start scheduler
     scheduler.start()

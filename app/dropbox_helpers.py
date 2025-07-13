@@ -50,7 +50,15 @@ async def fetch_dropbox_metadata(session_dbx: aiohttp.ClientSession, dropbox_pat
     Получает метаданные объекта в Dropbox по указанному пути.
     """
     meta_url = "https://api.dropboxapi.com/2/files/get_metadata"
-    async with session_dbx.post(meta_url, headers=headers_dbx, json={"path": dropbox_path}) as resp:
+    
+    # Создаем копию заголовков и сериализуем Dropbox-API-Path-Root
+    headers_copy = headers_dbx.copy()
+    if "Dropbox-API-Path-Root" in headers_copy:
+        path_root = headers_copy["Dropbox-API-Path-Root"]
+        if not isinstance(path_root, str):
+            headers_copy["Dropbox-API-Path-Root"] = json.dumps(path_root)
+    
+    async with session_dbx.post(meta_url, headers=headers_copy, json={"path": dropbox_path}) as resp:
         if resp.status != 200:
             text = await resp.text()
             raise RuntimeError(f"Ошибка при получении метаданных: {text}")
@@ -61,7 +69,15 @@ async def count_exr_files(session_dbx: aiohttp.ClientSession, path: str, headers
     Считает количество EXR-файлов (исключая cryptomatte) рекурсивно в папке Dropbox.
     """
     list_url = "https://api.dropboxapi.com/2/files/list_folder"
-    async with session_dbx.post(list_url, headers=headers_dbx, json={"path": path}) as list_resp:
+    
+    # Создаем копию заголовков и сериализуем Dropbox-API-Path-Root
+    headers_copy = headers_dbx.copy()
+    if "Dropbox-API-Path-Root" in headers_copy:
+        path_root = headers_copy["Dropbox-API-Path-Root"]
+        if not isinstance(path_root, str):
+            headers_copy["Dropbox-API-Path-Root"] = json.dumps(path_root)
+    
+    async with session_dbx.post(list_url, headers=headers_copy, json={"path": path}) as list_resp:
         if list_resp.status not in (0, 200):
             return 0
         result = await list_resp.json()
@@ -91,12 +107,22 @@ async def download_exr_folder(
     Рекурсивно скачивает EXR-файлы из папки Dropbox в локальную директорию.
     """
     list_url = "https://api.dropboxapi.com/2/files/list_folder"
-    async with session_dbx.post(list_url, headers=headers_dbx, json={"path": path}) as list_resp:
+    
+    # Создаем копию заголовков и сериализуем Dropbox-API-Path-Root
+    headers_copy = headers_dbx.copy()
+    if "Dropbox-API-Path-Root" in headers_copy:
+        path_root = headers_copy["Dropbox-API-Path-Root"]
+        if not isinstance(path_root, str):
+            headers_copy["Dropbox-API-Path-Root"] = json.dumps(path_root)
+    
+    async with session_dbx.post(list_url, headers=headers_copy, json={"path": path}) as list_resp:
         if list_resp.status not in (0, 200):
             return
         result = await list_resp.json()
 
     state = download_states.get(job_id)
+    if state is None:
+        return
     downloaded_count = state["downloaded_count"]
 
     for entry in result.get("entries", []):
@@ -126,12 +152,15 @@ async def download_exr_folder(
                 return
 
             downloaded_count += 1
-            download_states[job_id]["downloaded_count"] = downloaded_count
-            total_files = state["total_files"]
+            if job_id in download_states:
+                download_states[job_id]["downloaded_count"] = downloaded_count
+            total_files = state.get("total_files", 0)
             percent = int((downloaded_count / total_files) * 100) if total_files else 0
-            progress_msg = state["progress_msg"]
+            progress_msg = state.get("progress_msg")
             try:
-                await progress_msg.edit_text(f"Этап 1: Скачивание {percent}%", reply_markup=state["stop_kb"])
+                if progress_msg:
+                    stop_kb = state.get("stop_kb")
+                    await progress_msg.edit_text(f"Этап 1: Скачивание {percent}%", reply_markup=stop_kb)
             except Exception:
                 pass
 

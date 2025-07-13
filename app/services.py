@@ -10,6 +10,7 @@ import logging
 import aiohttp
 from typing import List, Dict, Any, Optional
 from app.core.config import settings
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -106,11 +107,19 @@ async def get_job_info(login: str, password: str, job_id: str) -> Optional[Dict[
     try:
         async with aiohttp.ClientSession() as session:
             headers = aiohttp.BasicAuth(login, password)
-            async with session.get(f"{settings.base_api_url}/jobs/{job_id}", auth=headers, ssl=False) as resp:
+            # Get all jobs and find the specific one
+            async with session.get(f"{settings.base_api_url}/jobs", auth=headers, ssl=False) as resp:
                 if resp.status == 200:
-                    return await resp.json()
+                    jobs = await resp.json()
+                    # Find the job by _id
+                    matching_jobs = [j for j in jobs if j.get("_id") == job_id]
+                    if matching_jobs:
+                        return matching_jobs[0]
+                    else:
+                        logger.error(f"Job {job_id} not found in jobs list")
+                        return None
                 else:
-                    logger.error(f"Failed to get job info: {resp.status}")
+                    logger.error(f"Failed to get jobs list: {resp.status}")
                     return None
     except Exception as e:
         logger.error(f"Error getting job info: {e}")
@@ -266,14 +275,90 @@ async def download_job_folder(login: str, password: str, job_id: str) -> Optiona
         Local path to downloaded folder or None if error
     """
     try:
-        from app.dropbox_helpers import download_exr_folder, get_fresh_access_token
-        from app.core.config import settings
         import aiohttp
         from pathlib import Path
+        from app.dropbox_helpers import (
+            download_exr_folder, get_fresh_access_token, 
+            fetch_dropbox_metadata, count_exr_files
+        )
+        from app.core.config import settings
         
-        # Implementation would go here
-        logger.info(f"Download job folder {job_id} - integration with dropbox_helpers")
-        return None
+        # Get job info to find output directory
+        job_info = await get_job_info(login, password, job_id)
+        if not job_info:
+            logger.error(f"Could not get job info for {job_id}")
+            return None
+            
+        outdirs = job_info.get("OutDir", [])
+        if not outdirs:
+            logger.error(f"No OutDir found for job {job_id}")
+            return None
+            
+        fullpath = outdirs[0]
+        # Find root folder marker
+        idx = fullpath.find(settings.dropbox_root_marker)
+        if idx == -1:
+            logger.error(f"Dropbox root marker not found in path: {fullpath}")
+            return None
+            
+        trimmed = fullpath[idx:]
+        dropbox_path = "/" + trimmed.replace("\\", "/").lstrip("/")
+        
+        # Create temp directory
+        temp_dir = Path("temp")
+        temp_dir.mkdir(exist_ok=True)
+        
+        headers_dbx = {
+            "Authorization": f"Bearer {get_fresh_access_token()}",
+            "Dropbox-API-Select-User": settings.dropbox_team_member_id,
+            "Dropbox-API-Path-Root": {".tag": "root", "root": settings.dropbox_root_namespace_id},
+            "Content-Type": "application/json"
+        }
+        
+        async with aiohttp.ClientSession() as session_dbx:
+            # Get metadata
+            metadata = await fetch_dropbox_metadata(session_dbx, dropbox_path, headers_dbx)
+            
+            if metadata.get(".tag") == "file":
+                logger.error("File download not supported for preview")
+                return None
+            elif metadata.get(".tag") != "folder":
+                logger.error("Unsupported metadata type")
+                return None
+                
+            exr_folder_name = metadata["name"]
+            local_root = temp_dir / exr_folder_name
+            
+            # Check if files already exist
+            exr_files_exist = lambda folder: folder.exists() and any(str(f).endswith(".exr") for f in folder.glob("*.exr"))
+            if exr_files_exist(local_root):
+                logger.info(f"Files already downloaded for job {job_id}")
+                return str(local_root)
+            
+            # Download files
+            download_url = "https://content.dropboxapi.com/2/files/download"
+            total_files = await count_exr_files(session_dbx, metadata["path_display"], headers_dbx)
+            
+            # Create download state for progress tracking
+            download_states = {
+                job_id: {
+                    "total_files": total_files,
+                    "downloaded_count": 0,
+                    "progress_msg": None,
+                    "stop_kb": None
+                }
+            }
+            stop_downloads = {}
+            
+            local_root.mkdir(exist_ok=True)
+            await download_exr_folder(
+                session_dbx, download_url, headers_dbx, 
+                metadata["path_display"], local_root, job_id, 
+                download_states, stop_downloads
+            )
+            
+            return str(local_root)
+            
     except Exception as e:
         logger.error(f"Error downloading job folder {job_id}: {e}")
         return None
@@ -292,13 +377,91 @@ async def create_video_from_job(login: str, password: str, job_id: str) -> Optio
         Path to created video file or None if error
     """
     try:
-        from app.video_helpers import convert_exr_folder_to_srgb, assemble_video_from_exr
-        from app.core.config import settings
+        import aiohttp
         from pathlib import Path
+        from app.video_helpers import convert_exr_folder_to_srgb, assemble_video_from_exr
+        from app.dropbox_helpers import (
+            get_fresh_access_token, fetch_dropbox_metadata, 
+            upload_video_to_dropbox
+        )
+        from app.core.config import settings
         
-        # Implementation would go here
-        logger.info(f"Create video from job {job_id} - integration with video_helpers")
-        return None
+        # Get job info to find output directory
+        job_info = await get_job_info(login, password, job_id)
+        if not job_info:
+            logger.error(f"Could not get job info for {job_id}")
+            return None
+            
+        outdirs = job_info.get("OutDir", [])
+        if not outdirs:
+            logger.error(f"No OutDir found for job {job_id}")
+            return None
+            
+        fullpath = outdirs[0]
+        # Find root folder marker
+        idx = fullpath.find(settings.dropbox_root_marker)
+        if idx == -1:
+            logger.error(f"Dropbox root marker not found in path: {fullpath}")
+            return None
+            
+        trimmed = fullpath[idx:]
+        dropbox_path = "/" + trimmed.replace("\\", "/").lstrip("/")
+        
+        # Create directories
+        temp_dir = Path("temp")
+        conv_dir = Path("conv")
+        temp_dir.mkdir(exist_ok=True)
+        conv_dir.mkdir(exist_ok=True)
+        
+        headers_dbx = {
+            "Authorization": f"Bearer {get_fresh_access_token()}",
+            "Dropbox-API-Select-User": settings.dropbox_team_member_id,
+            "Dropbox-API-Path-Root": {".tag": "root", "root": settings.dropbox_root_namespace_id},
+            "Content-Type": "application/json"
+        }
+        
+        async with aiohttp.ClientSession() as session_dbx:
+            # Get metadata
+            metadata = await fetch_dropbox_metadata(session_dbx, dropbox_path, headers_dbx)
+            
+            if metadata.get(".tag") == "file":
+                logger.error("File processing not supported for preview")
+                return None
+            elif metadata.get(".tag") != "folder":
+                logger.error("Unsupported metadata type")
+                return None
+                
+            exr_folder_name = metadata["name"]
+            local_root = temp_dir / exr_folder_name
+            conv_root = conv_dir / exr_folder_name
+            video_path = conv_root / f"{exr_folder_name}.mp4"
+            
+            # Check if video already exists
+            if video_path.exists():
+                logger.info(f"Video already exists for job {job_id}")
+                return str(video_path)
+            
+            # Check if files already exist
+            exr_files_exist = lambda folder: folder.exists() and any(str(f).endswith(".exr") for f in folder.glob("*.exr"))
+            if not exr_files_exist(local_root):
+                logger.error(f"No EXR files found in {local_root}")
+                return None
+            
+            # Convert EXR files from ACES to sRGB
+            logger.info(f"Converting EXR files for job {job_id}")
+            convert_exr_folder_to_srgb(local_root, conv_root, "config.ocio")
+            
+            # Assemble video from converted EXR files
+            logger.info(f"Assembling video for job {job_id}")
+            video_path = assemble_video_from_exr(conv_root, exr_folder_name)
+            
+            # Upload to Dropbox
+            logger.info(f"Uploading video to Dropbox for job {job_id}")
+            dropbox_path = await upload_video_to_dropbox(video_path, metadata)
+            logger.info(f"Video uploaded to Dropbox: {dropbox_path}")
+            
+            return str(video_path)
+            
     except Exception as e:
         logger.error(f"Error creating video from job {job_id}: {e}")
         return None 
