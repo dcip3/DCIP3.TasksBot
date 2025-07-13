@@ -35,12 +35,12 @@ def get_fresh_access_token():
     }
     resp = requests.post(url, headers=headers, data=data)
     if resp.status_code != 200:
-        raise RuntimeError(f"Не удалось обновить access_token: {resp.status_code} – {resp.text}")
+        raise RuntimeError(f"Failed to update access_token: {resp.status_code} – {resp.text}")
     token_info = resp.json()
     access_token = token_info.get("access_token")
     expires_in = token_info.get("expires_in", 0)
     if not access_token:
-        raise RuntimeError("В ответе нет поля access_token")
+        raise RuntimeError("No access_token field in response")
     _dropbox_access_token = access_token
     _dropbox_access_token_expires_at = now + expires_in
     return _dropbox_access_token
@@ -61,7 +61,7 @@ async def fetch_dropbox_metadata(session_dbx: aiohttp.ClientSession, dropbox_pat
     async with session_dbx.post(meta_url, headers=headers_copy, json={"path": dropbox_path}) as resp:
         if resp.status != 200:
             text = await resp.text()
-            raise RuntimeError(f"Ошибка при получении метаданных: {text}")
+            raise RuntimeError(f"Error getting metadata: {text}")
         return await resp.json()
 
 async def count_exr_files(session_dbx: aiohttp.ClientSession, path: str, headers_dbx: dict) -> int:
@@ -160,7 +160,7 @@ async def download_exr_folder(
             try:
                 if progress_msg:
                     stop_kb = state.get("stop_kb")
-                    await progress_msg.edit_text(f"Этап 1: Скачивание {percent}%", reply_markup=stop_kb)
+                    await progress_msg.edit_text(f"Step 1: Downloading {percent}%", reply_markup=stop_kb)
             except Exception:
                 pass
 
@@ -201,5 +201,5 @@ async def upload_video_to_dropbox(video_path: Path, metadata: dict) -> str:
         async with session_upload.post(upload_url, headers=headers_upload, data=data) as resp_up:
             if resp_up.status != 200:
                 text = await resp_up.text()
-                raise RuntimeError(f"Ошибка при загрузке видео на Dropbox: {text}")
+                raise RuntimeError(f"Error uploading video to Dropbox: {text}")
     return dropbox_upload_path

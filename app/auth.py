@@ -341,6 +341,7 @@ async def get_all_users_with_notifications() -> list[Tuple[int, str, str]]:
     """
     conn = get_db_connection()
     if conn is None:
+        logger.error("Database connection not available for get_all_users_with_notifications")
         return []
     
     try:
@@ -350,7 +351,9 @@ async def get_all_users_with_notifications() -> list[Tuple[int, str, str]]:
             WHERE notifications_enabled = 1
         """) as cursor:
             rows = await cursor.fetchall()
-            return [(row[0], row[1], row[2]) for row in rows]
+            result = [(row[0], row[1], row[2]) for row in rows]
+            logger.info(f"Found {len(result)} users with notifications enabled: {[user_id for user_id, _, _ in result]}")
+            return result
     except Exception as e:
         logger.error(f"Failed to get users with notifications: {e}")
         return [] 

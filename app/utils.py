@@ -82,10 +82,10 @@ def get_main_keyboard():
         ],
         [
             KeyboardButton(text="Realtime", request_contact=False, request_location=False),
-            KeyboardButton(text="🔔 Уведомления", request_contact=False, request_location=False),
+            KeyboardButton(text="🔔 Notifications", request_contact=False, request_location=False),
         ],
         [
-            KeyboardButton(text="🧹 Очистить", request_contact=False, request_location=False),
+            KeyboardButton(text="🧹 Clear", request_contact=False, request_location=False),
         ],
     ]
     return ReplyKeyboardMarkup(
@@ -333,7 +333,7 @@ async def on_startup(bot):
     logger.info("Scheduler started")
     
     # Start job progress watcher
-    asyncio.create_task(job_progress_watcher())
+    asyncio.create_task(job_progress_watcher(bot))
     logger.info("Job progress watcher started")
 
 
@@ -359,9 +359,12 @@ async def on_shutdown(bot):
     logger.info("Temp files cleaned up")
 
 
-async def job_progress_watcher():
+async def job_progress_watcher(bot):
     """
     Monitor job completion and notify users about finished jobs.
+    
+    Args:
+        bot: Bot instance for sending notifications
     """
     import aiohttp
     from datetime import datetime, timezone, timedelta
@@ -371,6 +374,8 @@ async def job_progress_watcher():
         await asyncio.sleep(60)
         
         users_with_notifications = await get_all_users_with_notifications()
+        logger.info(f"Job progress watcher: Found {len(users_with_notifications)} users with notifications enabled")
+        
         for telegram_user_id, login, password in users_with_notifications:
                 
             try:
@@ -409,9 +414,10 @@ async def job_progress_watcher():
                                     except Exception:
                                         continue
                                         
-                                    batch = job.get("Props", {}).get("Batch", "Без имени")
-                                    message_text = f"✅ Задача '{batch}' завершена (100%)."
+                                    batch = job.get("Props", {}).get("Batch", "Untitled")
+                                    message_text = f"✅ Job '{batch}' completed (100%)."
                                     await bot.send_message(telegram_user_id, message_text)
+                                    logger.info(f"Notification sent to user {telegram_user_id} for job {job_id} ({batch})")
                                     notified_jobs.add(job_id)
                         else:
                             logger.error(f"Watcher: Error requesting jobs for user {telegram_user_id}: {resp.status}")

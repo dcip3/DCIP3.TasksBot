@@ -9,23 +9,23 @@ import subprocess
 
 def convert_exr_folder_to_srgb(local_root: Path, conv_root: Path, ocio_config_path: str):
     """
-    Конвертирует все EXR-файлы из ACEScg в sRGB с помощью OCIO.
+    Converts all EXR files from ACEScg to sRGB using OCIO.
 
     Args:
-        local_root (Path): папка с исходными EXR-файлами.
-        conv_root (Path): папка для сохранения конвертированных EXR-файлов.
-        ocio_config_path (str): путь к файлу конфига OCIO.
+        local_root (Path): folder with original EXR files.
+        conv_root (Path): folder to save converted EXR files.
+        ocio_config_path (str): path to OCIO config file.
 
     Raises:
-        RuntimeError: если не найдено EXR-файлов или отсутствует конфиг OCIO.
+        RuntimeError: if no EXR files are found or OCIO config is missing.
     """
     conv_root.mkdir(parents=True, exist_ok=True)
     exr_files = sorted([f for f in local_root.glob("*.exr") if "cryptomatte" not in f.name.lower()])
     if not exr_files:
-        raise RuntimeError("Не найдено EXR-кадров для конвертации.")
+        raise RuntimeError("No EXR frames found for conversion.")
 
     if not Path(ocio_config_path).exists():
-        raise RuntimeError(f"OCIO config не найден: {ocio_config_path}")
+        raise RuntimeError(f"OCIO config not found: {ocio_config_path}")
     config = ocio.Config.CreateFromFile(str(ocio_config_path))
     transform = ocio.DisplayViewTransform()
     transform.setSrc("ACEScg")
@@ -35,7 +35,7 @@ def convert_exr_folder_to_srgb(local_root: Path, conv_root: Path, ocio_config_pa
     processor = config.getProcessor(transform)
     cpu_processor = processor.getDefaultCPUProcessor()
 
-    # Определяем размеры по первому файлу
+    # Define dimensions based on the first file
     first_exr = exr_files[0]
     exr_file = OpenEXR.InputFile(str(first_exr))
     header = exr_file.header()
@@ -70,22 +70,22 @@ def convert_exr_folder_to_srgb(local_root: Path, conv_root: Path, ocio_config_pa
 
 def assemble_video_from_exr(conv_root: Path, exr_folder_name: str) -> Path:
     """
-    Собирает MP4 из конвертированных EXR-файлов с помощью ffmpeg.
+    Assembles MP4 from converted EXR files using ffmpeg.
 
     Args:
-        conv_root (Path): папка с конвертированными EXR-файлами.
-        exr_folder_name (str): имя папки используется для имени выходного видео.
+        conv_root (Path): folder with converted EXR files.
+        exr_folder_name (str): name of the folder used for the output video name.
 
     Returns:
-        Path: путь к сгенерированному видео-файлу.
+        Path: path to the generated video file.
 
     Raises:
-        RuntimeError: если в папке нет EXR-файлов или при ошибке ffmpeg.
+        RuntimeError: if no EXR files are found or if ffmpeg fails.
     """
     video_path = conv_root / f"{exr_folder_name}.mp4"
     exr_pattern = str(conv_root / "*.exr")
     if not any(conv_root.glob("*.exr")):
-        raise RuntimeError("Нет кадров для сборки видео.")
+        raise RuntimeError("No frames to assemble video.")
     cmd = [
         "ffmpeg",
         "-y",

@@ -20,9 +20,9 @@ from app.core.bot_core import bot, dp
 from app.core.config import settings
 from app.auth import authenticate_user, logout_user, is_authorized, toggle_notifications, save_deadline_credentials
 from app.services import (
-    get_jobs_list, get_workers_list, get_job_info, get_job_tasks,
-    requeue_job, resume_job, suspend_job, delete_job,
-    download_job_folder, create_video_from_job
+    get_jobs_list, get_workers_list, get_job_info_by_user_id, get_job_tasks_by_user_id,
+    requeue_job_by_user_id, resume_job_by_user_id, suspend_job_by_user_id, delete_job_by_user_id,
+    download_job_folder, create_video_from_job, check_video_exists_in_dropbox, download_video_from_dropbox
 )
 
 logger = logging.getLogger(__name__)
@@ -191,7 +191,7 @@ async def cmd_menu_status(message: Message):
         logger.error(f"Get menu button status error: {e}")
 
 
-@router.message(F.text == "🧹 Очистить")
+@router.message(F.text == "🧹 Clear")
 async def clear_chat_handler(message: Message):
     """
     Clear chat history by deleting recent messages.
@@ -255,7 +255,7 @@ async def handle_jobs(message: Message, page: int = 0):
         from collections import defaultdict
         grouped_jobs = defaultdict(list)
         for job in jobs:
-            batch = job.get("Props", {}).get("Batch", "Без имени")
+            batch = job.get("Props", {}).get("Batch", "Untitled")
             grouped_jobs[batch].append(job)
         
         # Combine jobs by batch (like in old version)
@@ -313,7 +313,7 @@ async def handle_jobs(message: Message, page: int = 0):
         
         for job in normal_jobs:
             props = job.get("Props", {})
-            batch = props.get("Batch", "Без имени")
+            batch = props.get("Batch", "Untitled")
             total_tasks = props.get("Tasks", 0)
             completed_chunks = job.get("CompletedChunks", 0)
             progress_str = format_progress_old(completed_chunks, total_tasks)
@@ -342,7 +342,7 @@ async def handle_jobs(message: Message, page: int = 0):
             
             for job in suspended_jobs:
                 props = job.get("Props", {})
-                batch = props.get("Batch", "Без имени")
+                batch = props.get("Batch", "Untitled")
                 total_tasks = props.get("Tasks", 0)
                 completed_chunks = job.get("CompletedChunks", 0)
                 progress_str = format_progress_old(completed_chunks, total_tasks)
@@ -356,7 +356,7 @@ async def handle_jobs(message: Message, page: int = 0):
         
         header = f"{'Batch':<24} {'Progress':^16}"
         header += f"\n{'-'*40}"
-        batch_text = "\n".join(messages) if messages else "Нет данных"
+        batch_text = "\n".join(messages) if messages else "No data"
         
         # Create inline keyboard
         if buttons:
@@ -375,17 +375,17 @@ async def handle_jobs(message: Message, page: int = 0):
             total_pages = (total_items + 3) // 4
             nav_buttons = []
             if page > 0:
-                nav_buttons.append(InlineKeyboardButton(text="⬅ Назад", callback_data=f"jobs_page:{page-1}"))
+                nav_buttons.append(InlineKeyboardButton(text="⬅ Back", callback_data=f"jobs_page:{page-1}"))
             if (page + 1) < total_pages:
-                nav_buttons.append(InlineKeyboardButton(text="Вперёд ➡", callback_data=f"jobs_page:{page+1}"))
+                nav_buttons.append(InlineKeyboardButton(text="Next ➡", callback_data=f"jobs_page:{page+1}"))
             if nav_buttons:
                 inline_keyboard.append(nav_buttons)
             
             keyboard = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
-            page_info = f"Страница {page+1} из {total_pages}"
+            page_info = f"Page {page+1} of {total_pages}"
             
             await message.answer(
-                f"<pre>{header}\n{batch_text}\n{page_info}</pre>\n\nВыберите задачу для подробной информации:",
+                f"<pre>{header}\n{batch_text}\n{page_info}</pre>\n\nSelect a job for details:",
                 parse_mode="HTML",
                 reply_markup=keyboard
             )
@@ -435,7 +435,7 @@ async def handle_workers(message: Message):
         
         header = f"{'Name':<24} Status"
         header += f"\n{'-'*40}"
-        body = "\n".join(messages) if messages else "Нет данных"
+        body = "\n".join(messages) if messages else "No data"
         
         await message.answer(f"<pre>{header}\n{body}</pre>", parse_mode="HTML")
         
@@ -447,7 +447,7 @@ async def handle_workers(message: Message):
 # === NOTIFICATION HANDLERS ===
 # ============================================================================
 
-@router.message(F.text == "🔔 Уведомления")
+@router.message(F.text == "🔔 Notifications")
 @authorized_only
 async def toggle_notifications_handler(message: Message):
     """
@@ -552,7 +552,7 @@ async def jobs_page_callback(callback_query: CallbackQuery):
     try:
         page = int(page_str)
     except ValueError:
-        await callback_query.answer("Неверный номер страницы.", show_alert=True)
+        await callback_query.answer("Invalid page number.", show_alert=True)
         return
     
     await callback_query.answer()
@@ -575,7 +575,7 @@ async def jobs_page_callback(callback_query: CallbackQuery):
         from collections import defaultdict
         grouped_jobs = defaultdict(list)
         for job in jobs:
-            batch = job.get("Props", {}).get("Batch", "Без имени")
+            batch = job.get("Props", {}).get("Batch", "Untitled")
             grouped_jobs[batch].append(job)
         
         # Combine jobs by batch (like in old version)
@@ -633,7 +633,7 @@ async def jobs_page_callback(callback_query: CallbackQuery):
         
         for job in normal_jobs:
             props = job.get("Props", {})
-            batch = props.get("Batch", "Без имени")
+            batch = props.get("Batch", "Untitled")
             total_tasks = props.get("Tasks", 0)
             completed_chunks = job.get("CompletedChunks", 0)
             progress_str = format_progress_old(completed_chunks, total_tasks)
@@ -662,7 +662,7 @@ async def jobs_page_callback(callback_query: CallbackQuery):
             
             for job in suspended_jobs:
                 props = job.get("Props", {})
-                batch = props.get("Batch", "Без имени")
+                batch = props.get("Batch", "Untitled")
                 total_tasks = props.get("Tasks", 0)
                 completed_chunks = job.get("CompletedChunks", 0)
                 progress_str = format_progress_old(completed_chunks, total_tasks)
@@ -676,7 +676,7 @@ async def jobs_page_callback(callback_query: CallbackQuery):
         
         header = f"{'Batch':<24} {'Progress':^16}"
         header += f"\n{'-'*40}"
-        batch_text = "\n".join(messages) if messages else "Нет данных"
+        batch_text = "\n".join(messages) if messages else "No data"
         
         # Create inline keyboard
         if buttons:
@@ -695,17 +695,17 @@ async def jobs_page_callback(callback_query: CallbackQuery):
             total_pages = (total_items + 3) // 4
             nav_buttons = []
             if page > 0:
-                nav_buttons.append(InlineKeyboardButton(text="⬅ Назад", callback_data=f"jobs_page:{page-1}"))
+                nav_buttons.append(InlineKeyboardButton(text="⬅ Back", callback_data=f"jobs_page:{page-1}"))
             if (page + 1) < total_pages:
-                nav_buttons.append(InlineKeyboardButton(text="Вперёд ➡", callback_data=f"jobs_page:{page+1}"))
+                nav_buttons.append(InlineKeyboardButton(text="Next ➡", callback_data=f"jobs_page:{page+1}"))
             if nav_buttons:
                 inline_keyboard.append(nav_buttons)
             
             keyboard = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
-            page_info = f"Страница {page+1} из {total_pages}"
+            page_info = f"Page {page+1} of {total_pages}"
             
             await callback_query.message.edit_text(
-                f"<pre>{header}\n{batch_text}\n{page_info}</pre>\n\nВыберите задачу для подробной информации:",
+                f"<pre>{header}\n{batch_text}\n{page_info}</pre>\n\nSelect a job for details:",
                 parse_mode="HTML",
                 reply_markup=keyboard
             )
@@ -731,21 +731,55 @@ async def job_info_callback(callback_query: CallbackQuery):
     job_id = callback_query.data.split(":", 1)[1]
     
     try:
-        job_info = await get_job_info(callback_query.from_user.id, job_id)
+        job_info = await get_job_info_by_user_id(callback_query.from_user.id, job_id)
         if not job_info:
             await callback_query.answer("Job not found.", show_alert=True)
             return
         
         # Format job info in old style
         props = job_info.get("Props", {})
-        batch = props.get("Batch", "Без имени")
+        batch = props.get("Batch", "Untitled")
         total_tasks = props.get("Tasks", 0)
         completed_chunks = job_info.get("CompletedChunks", 0)
         progress_str = format_progress_old(completed_chunks, total_tasks)
-        full_name = props.get("Name", "Без имени")
+        full_name = props.get("Name", "Untitled")
         name = full_name.split("/")[-1] if "/" in full_name else full_name
         stat = job_info.get("Stat", 0)
         stat_name = settings.job_status_map.get(stat, "Unknown")
+        
+        # Calculate ETA like in old version
+        eta_str = "N/A"
+        try:
+            tasks = await get_job_tasks_by_user_id(callback_query.from_user.id, job_id)
+            if tasks:
+                from datetime import datetime, timedelta
+                # Calculate durations of completed tasks
+                durations = []
+                for task in tasks:
+                    if task.get("Stat") == 5:  # Completed
+                        start_str = task.get("StartRen")
+                        comp_str = task.get("Comp")
+                        if (start_str and comp_str and 
+                            start_str != "0001-01-01T00:00:00Z" and 
+                            comp_str != "0001-01-01T00:00:00Z"):
+                            try:
+                                start_time = datetime.fromisoformat(start_str)
+                                comp_time = datetime.fromisoformat(comp_str)
+                                duration_val = (comp_time - start_time).total_seconds()
+                                durations.append(duration_val)
+                            except Exception:
+                                pass
+                
+                if durations:
+                    avg_duration = sum(durations) / len(durations)
+                    remaining = total_tasks - completed_chunks
+                    total_eta_seconds = avg_duration * remaining
+                    if total_eta_seconds > 0:
+                        eta_td = timedelta(seconds=int(total_eta_seconds))
+                        eta_str = str(eta_td)
+        except Exception as e:
+            logger.error(f"Error calculating ETA for job {job_id}: {e}")
+            eta_str = "N/A"
         
         # Create job info message
         info_text = f"<pre>Job Info:\n{'-'*40}\n"
@@ -753,6 +787,7 @@ async def job_info_callback(callback_query: CallbackQuery):
         info_text += f"Name: {name}\n"
         info_text += f"Status: {stat_name}\n"
         info_text += f"Progress: {progress_str}\n"
+        info_text += f"ETA: {eta_str}\n"
         info_text += f"Total Tasks: {total_tasks}\n"
         info_text += f"Completed: {completed_chunks}\n"
         info_text += f"{'-'*40}</pre>"
@@ -818,6 +853,39 @@ async def preview_job_callback(callback_query: CallbackQuery):
         
         login, password = credentials
         
+        # Check if video already exists in Dropbox
+        video_info = await check_video_exists_in_dropbox(login, password, job_id)
+        if video_info:
+            # Video exists - offer options
+            send_button = InlineKeyboardButton(
+                text="📤 Send from Dropbox",
+                callback_data=f"send_dbx_video:{job_id}"
+            )
+            recreate_button = InlineKeyboardButton(
+                text="🔄 Create new",
+                callback_data=f"create_new_video:{job_id}"
+            )
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[[send_button, recreate_button]]
+            )
+            await callback_query.message.answer(
+                f"🎬 Video '{video_info['filename']}' already exists on Dropbox.",
+                reply_markup=keyboard
+            )
+            await callback_query.answer()
+            return
+        
+        # Video doesn't exist - create new one
+        await create_new_video_process(callback_query, login, password, job_id)
+            
+    except Exception as e:
+        logger.error(f"Error handling preview for user {callback_query.from_user.id}: {e}")
+        await callback_query.answer("Error occurred while generating preview.", show_alert=True)
+
+
+async def create_new_video_process(callback_query: CallbackQuery, login: str, password: str, job_id: str):
+    """Create new video from job files."""
+    try:
         # Send initial message
         progress_msg = await callback_query.message.answer("🔍 Starting preview generation...")
         
@@ -848,13 +916,17 @@ async def preview_job_callback(callback_query: CallbackQuery):
             
             await progress_msg.delete()
             
+            # Answer callback to stop button animation
+            await callback_query.answer("Video created successfully!")
+            
         except Exception as e:
             logger.error(f"Error in preview generation: {e}")
             await progress_msg.edit_text(f"❌ Error during preview generation: {str(e)}")
+            await callback_query.answer("Error occurred while creating video.", show_alert=True)
             
     except Exception as e:
-        logger.error(f"Error handling preview for user {callback_query.from_user.id}: {e}")
-        await callback_query.answer("Error occurred while generating preview.", show_alert=True)
+        logger.error(f"Error in create_new_video_process: {e}")
+        await callback_query.answer("Error occurred while creating video.", show_alert=True)
 
 
 @router.callback_query(lambda c: c.data == "jobs_back")
@@ -873,7 +945,7 @@ async def jobs_back_callback(callback_query: CallbackQuery):
             from collections import defaultdict
             grouped_jobs = defaultdict(list)
             for job in jobs:
-                batch = job.get("Props", {}).get("Batch", "Без имени")
+                batch = job.get("Props", {}).get("Batch", "Untitled")
                 grouped_jobs[batch].append(job)
             
             # Combine jobs by batch (like in old version)
@@ -931,7 +1003,7 @@ async def jobs_back_callback(callback_query: CallbackQuery):
             
             for job in normal_jobs:
                 props = job.get("Props", {})
-                batch = props.get("Batch", "Без имени")
+                batch = props.get("Batch", "Untitled")
                 total_tasks = props.get("Tasks", 0)
                 completed_chunks = job.get("CompletedChunks", 0)
                 progress_str = format_progress_old(completed_chunks, total_tasks)
@@ -960,7 +1032,7 @@ async def jobs_back_callback(callback_query: CallbackQuery):
                 
                 for job in suspended_jobs:
                     props = job.get("Props", {})
-                    batch = props.get("Batch", "Без имени")
+                    batch = props.get("Batch", "Untitled")
                     total_tasks = props.get("Tasks", 0)
                     completed_chunks = job.get("CompletedChunks", 0)
                     progress_str = format_progress_old(completed_chunks, total_tasks)
@@ -974,7 +1046,7 @@ async def jobs_back_callback(callback_query: CallbackQuery):
             
             header = f"{'Batch':<24} {'Progress':^16}"
             header += f"\n{'-'*40}"
-            batch_text = "\n".join(messages) if messages else "Нет данных"
+            batch_text = "\n".join(messages) if messages else "No data"
             
             # Create inline keyboard
             if buttons:
@@ -993,17 +1065,17 @@ async def jobs_back_callback(callback_query: CallbackQuery):
                 total_pages = (total_items + 3) // 4
                 nav_buttons = []
                 if 0 > 0:
-                    nav_buttons.append(InlineKeyboardButton(text="⬅ Назад", callback_data=f"jobs_page:{0-1}"))
+                    nav_buttons.append(InlineKeyboardButton(text="⬅ Back", callback_data=f"jobs_page:{0-1}"))
                 if (0 + 1) < total_pages:
-                    nav_buttons.append(InlineKeyboardButton(text="Вперёд ➡", callback_data=f"jobs_page:{0+1}"))
+                    nav_buttons.append(InlineKeyboardButton(text="Next ➡", callback_data=f"jobs_page:{0+1}"))
                 if nav_buttons:
                     inline_keyboard.append(nav_buttons)
                 
                 keyboard = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
-                page_info = f"Страница {0+1} из {total_pages}"
+                page_info = f"Page {0+1} of {total_pages}"
                 
                 await callback_query.message.edit_text(
-                    f"<pre>{header}\n{batch_text}\n{page_info}</pre>\n\nВыберите задачу для подробной информации:",
+                    f"<pre>{header}\n{batch_text}\n{page_info}</pre>\n\nSelect a job for details:",
                     parse_mode="HTML",
                     reply_markup=keyboard
                 )
@@ -1033,20 +1105,20 @@ async def handle_realtime(message: Message):
         active_realtime_tasks[chat_id].cancel()
         del active_realtime_tasks[chat_id]
 
-    await message.answer("Задачи будут обновляться каждые 5 секунд до следующего сообщения.")
+    await message.answer("Tasks will be updated every 5 seconds until the next message.")
 
     async def realtime_loop():
         from collections import defaultdict
         from datetime import datetime
         try:
-            msg = await message.answer("Загрузка...")
+            msg = await message.answer("Loading...")
             last_text = None
             while True:
                 jobs = await get_jobs_list(user_id)
                 # Группировка и форматирование как в handle_jobs
                 grouped_jobs = defaultdict(list)
                 for job in jobs:
-                    batch = job.get("Props", {}).get("Batch", "Без имени")
+                    batch = job.get("Props", {}).get("Batch", "Untitled")
                     grouped_jobs[batch].append(job)
                 combined_jobs = []
                 for batch, batch_jobs in grouped_jobs.items():
@@ -1086,7 +1158,7 @@ async def handle_realtime(message: Message):
                 messages = []
                 for job in normal_jobs:
                     props = job.get("Props", {})
-                    batch = props.get("Batch", "Без имени")
+                    batch = props.get("Batch", "Untitled")
                     total_tasks = props.get("Tasks", 0)
                     completed_chunks = job.get("CompletedChunks", 0)
                     progress_str = format_progress_old(completed_chunks, total_tasks)
@@ -1102,14 +1174,14 @@ async def handle_realtime(message: Message):
                     messages.append(separator)
                     for job in suspended_jobs:
                         props = job.get("Props", {})
-                        batch = props.get("Batch", "Без имени")
+                        batch = props.get("Batch", "Untitled")
                         total_tasks = props.get("Tasks", 0)
                         completed_chunks = job.get("CompletedChunks", 0)
                         progress_str = format_progress_old(completed_chunks, total_tasks)
                         messages.append(f"⏸️ {batch:<22} {progress_str:^16}\n{'-'*40}")
                 header = f"{'Batch':<24} {'Progress':^16}"
                 header += f"\n{'-'*40}"
-                batch_text = "\n".join(messages) if messages else "Нет данных"
+                batch_text = "\n".join(messages) if messages else "No data"
                 new_text = f"<pre>{header}\n{batch_text}</pre>"
                 if new_text != last_text:
                     await msg.edit_text(new_text, parse_mode="HTML")
@@ -1118,9 +1190,287 @@ async def handle_realtime(message: Message):
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            await message.answer(f"Ошибка: {e}")
+            await message.answer(f"Error: {e}")
     task = asyncio.create_task(realtime_loop())
     active_realtime_tasks[chat_id] = task
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("requeue_job:"))
+async def requeue_job_callback(callback_query: CallbackQuery):
+    """Handle requeue job button press."""
+    if callback_query.from_user is None:
+        await callback_query.answer("Error: User information not available.", show_alert=True)
+        return
+        
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+    
+    job_id = callback_query.data.split(":", 1)[1]
+    
+    try:
+        success = await requeue_job_by_user_id(callback_query.from_user.id, job_id)
+        if success:
+            await callback_query.answer("Job requeued successfully!")
+        else:
+            await callback_query.answer("Failed to requeue job.", show_alert=True)
+    except Exception as e:
+        logger.error(f"Error requeuing job for user {callback_query.from_user.id}: {e}")
+        await callback_query.answer("Error occurred while requeuing job.", show_alert=True)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("resume_job:"))
+async def resume_job_callback(callback_query: CallbackQuery):
+    """Handle resume job button press."""
+    if callback_query.from_user is None:
+        await callback_query.answer("Error: User information not available.", show_alert=True)
+        return
+        
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+    
+    job_id = callback_query.data.split(":", 1)[1]
+    
+    try:
+        success = await resume_job_by_user_id(callback_query.from_user.id, job_id)
+        if success:
+            await callback_query.answer("Job resumed successfully!")
+        else:
+            await callback_query.answer("Failed to resume job.", show_alert=True)
+    except Exception as e:
+        logger.error(f"Error resuming job for user {callback_query.from_user.id}: {e}")
+        await callback_query.answer("Error occurred while resuming job.", show_alert=True)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("suspend_job:"))
+async def suspend_job_callback(callback_query: CallbackQuery):
+    """Handle suspend job button press."""
+    if callback_query.from_user is None:
+        await callback_query.answer("Error: User information not available.", show_alert=True)
+        return
+        
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+    
+    job_id = callback_query.data.split(":", 1)[1]
+    
+    try:
+        success = await suspend_job_by_user_id(callback_query.from_user.id, job_id)
+        if success:
+            await callback_query.answer("Job suspended successfully!")
+        else:
+            await callback_query.answer("Failed to suspend job.", show_alert=True)
+    except Exception as e:
+        logger.error(f"Error suspending job for user {callback_query.from_user.id}: {e}")
+        await callback_query.answer("Error occurred while suspending job.", show_alert=True)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("delete_job:"))
+async def delete_job_callback(callback_query: CallbackQuery):
+    """Handle delete job button press."""
+    if callback_query.from_user is None:
+        await callback_query.answer("Error: User information not available.", show_alert=True)
+        return
+        
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+    
+    job_id = callback_query.data.split(":", 1)[1]
+    
+    try:
+        success = await delete_job_by_user_id(callback_query.from_user.id, job_id)
+        if success:
+            await callback_query.answer("Job deleted successfully!")
+            # Update the message to show job was deleted
+            await callback_query.message.edit_text("Job has been deleted.")
+        else:
+            await callback_query.answer("Failed to delete job.", show_alert=True)
+    except Exception as e:
+        logger.error(f"Error deleting job for user {callback_query.from_user.id}: {e}")
+        await callback_query.answer("Error occurred while deleting job.", show_alert=True)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("tasks_job:"))
+async def tasks_job_callback(callback_query: CallbackQuery):
+    """Handle tasks job button press."""
+    if callback_query.from_user is None:
+        await callback_query.answer("Error: User information not available.", show_alert=True)
+        return
+        
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+    
+    job_id = callback_query.data.split(":", 1)[1]
+    
+    try:
+        tasks = await get_job_tasks_by_user_id(callback_query.from_user.id, job_id)
+        if not tasks:
+            await callback_query.message.answer("No tasks found for this job.")
+            await callback_query.answer()
+            return
+
+        # Format tasks list
+        lines = []
+        header = f"{'Frames':<18} {'Prog':^10} {'Time':^12}"
+        header += f"\n{'-'*42}"
+        lines.append(header)
+        
+        def get_task_icon(stat):
+            if stat == 5:   # Completed
+                return "✅"
+            elif stat == 4: # Rendering
+                return "▶️"
+            elif stat == 3: # Suspended
+                return "⏸️"
+            elif stat == 6: # Failed
+                return "❌"
+            elif stat in (2, 8): # Queued или Pending
+                return "⏳"
+            else:           # Unknown и другие
+                return "❓"
+
+        from datetime import datetime, timezone
+        for task in tasks:
+            frames = task.get("Frames", "")
+            prog = task.get("Prog", "")
+            stat = task.get("Stat", 1)
+            icon = get_task_icon(stat)
+            rendertime_str = ""
+            start_str = task.get("StartRen")
+            if start_str and start_str != "0001-01-01T00:00:00Z":
+                try:
+                    start_time = datetime.fromisoformat(start_str)
+                    # Completed tasks
+                    if stat == 5:
+                        comp_str = task.get("Comp")
+                        if comp_str and comp_str != "0001-01-01T00:00:00Z":
+                            comp_time = datetime.fromisoformat(comp_str)
+                            duration = comp_time.astimezone(timezone.utc) - start_time.astimezone(timezone.utc)
+                            rendertime_str = str(duration).split(".")[0]
+                    # Currently rendering tasks
+                    elif stat == 4:
+                        now_utc = datetime.now(timezone.utc)
+                        duration = now_utc - start_time.astimezone(timezone.utc)
+                        rendertime_str = str(duration).split(".")[0]
+                except Exception:
+                    pass
+            line = f"{icon} {frames:<16} {prog:^10} {rendertime_str:^12}"
+            lines.append(line)
+
+        message_text = "<pre>" + "\n".join(lines) + "</pre>"
+        await callback_query.message.answer(message_text, parse_mode="HTML")
+        await callback_query.answer()
+        
+    except Exception as e:
+        logger.error(f"Error getting tasks for user {callback_query.from_user.id}: {e}")
+        await callback_query.answer("Error occurred while fetching tasks.", show_alert=True)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("send_dbx_video:"))
+async def send_dbx_video_callback(callback_query: CallbackQuery):
+    """Handle send video from Dropbox button press."""
+    if callback_query.from_user is None:
+        await callback_query.answer("Error: User information not available.", show_alert=True)
+        return
+        
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+    
+    job_id = callback_query.data.split(":", 1)[1]
+    
+    try:
+        # Get user credentials
+        from app.auth import get_deadline_credentials
+        credentials = await get_deadline_credentials(callback_query.from_user.id)
+        if not credentials:
+            await callback_query.answer("No credentials found. Please login again.", show_alert=True)
+            return
+        
+        login, password = credentials
+        
+        # Download video from Dropbox
+        progress_msg = await callback_query.message.answer("📥 Downloading video from Dropbox...")
+        
+        try:
+            video_path = await download_video_from_dropbox(login, password, job_id)
+            
+            if not video_path:
+                await progress_msg.edit_text("❌ Failed to download video from Dropbox")
+                return
+            
+            # Send video
+            await progress_msg.edit_text("📤 Sending video...")
+            from aiogram.types import FSInputFile
+            from pathlib import Path
+            
+            video_filename = Path(video_path).name
+            await callback_query.message.answer_document(
+                document=FSInputFile(video_path),
+                caption=f"🎬 Video '{video_filename}' from Dropbox"
+            )
+            
+            await progress_msg.delete()
+            
+            # Clean up temporary file
+            try:
+                Path(video_path).unlink()
+            except Exception:
+                pass
+            
+            # Answer callback to stop button animation
+            await callback_query.answer("Video sent successfully!")
+                
+        except Exception as e:
+            logger.error(f"Error downloading video from Dropbox: {e}")
+            await progress_msg.edit_text(f"❌ Error downloading video: {str(e)}")
+            await callback_query.answer("Error occurred while downloading video.", show_alert=True)
+            
+    except Exception as e:
+        logger.error(f"Error handling send_dbx_video for user {callback_query.from_user.id}: {e}")
+        await callback_query.answer("Error occurred while downloading video.", show_alert=True)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("create_new_video:"))
+async def create_new_video_callback(callback_query: CallbackQuery):
+    """Handle create new video button press."""
+    if callback_query.from_user is None:
+        await callback_query.answer("Error: User information not available.", show_alert=True)
+        return
+        
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+    
+    job_id = callback_query.data.split(":", 1)[1]
+    
+    try:
+        # Get user credentials
+        from app.auth import get_deadline_credentials
+        credentials = await get_deadline_credentials(callback_query.from_user.id)
+        if not credentials:
+            await callback_query.answer("No credentials found. Please login again.", show_alert=True)
+            return
+        
+        login, password = credentials
+        
+        # Create new video
+        await create_new_video_process(callback_query, login, password, job_id)
+        
+        # Answer callback to stop button animation (if not already answered in create_new_video_process)
+        try:
+            await callback_query.answer("Video creation completed!")
+        except Exception:
+            pass  # Already answered in create_new_video_process
+        
+    except Exception as e:
+        logger.error(f"Error handling create_new_video for user {callback_query.from_user.id}: {e}")
+        await callback_query.answer("Error occurred while creating video.", show_alert=True)
+
 
 # ============================================================================
 # === HANDLER REGISTRATION ===

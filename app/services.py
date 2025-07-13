@@ -126,6 +126,31 @@ async def get_job_info(login: str, password: str, job_id: str) -> Optional[Dict[
         return None
 
 
+async def get_job_info_by_user_id(telegram_user_id: int, job_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Get detailed information about a specific job using telegram user ID.
+    
+    Args:
+        telegram_user_id: Telegram user ID
+        job_id: Job ID
+        
+    Returns:
+        Job information dictionary or None if error
+    """
+    try:
+        from app.auth import get_deadline_credentials
+        credentials = await get_deadline_credentials(telegram_user_id)
+        if not credentials:
+            logger.error(f"No Deadline credentials found for user {telegram_user_id}")
+            return None
+        
+        login, password = credentials
+        return await get_job_info(login, password, job_id)
+    except Exception as e:
+        logger.error(f"Error getting job info for user {telegram_user_id}: {e}")
+        return None
+
+
 async def get_job_tasks(login: str, password: str, job_id: str) -> List[Dict[str, Any]]:
     """
     Get tasks for a specific job.
@@ -156,6 +181,31 @@ async def get_job_tasks(login: str, password: str, job_id: str) -> List[Dict[str
         return []
 
 
+async def get_job_tasks_by_user_id(telegram_user_id: int, job_id: str) -> List[Dict[str, Any]]:
+    """
+    Get tasks for a specific job using telegram user ID.
+    
+    Args:
+        telegram_user_id: Telegram user ID
+        job_id: Job ID
+        
+    Returns:
+        List of task dictionaries
+    """
+    try:
+        from app.auth import get_deadline_credentials
+        credentials = await get_deadline_credentials(telegram_user_id)
+        if not credentials:
+            logger.error(f"No Deadline credentials found for user {telegram_user_id}")
+            return []
+        
+        login, password = credentials
+        return await get_job_tasks(login, password, job_id)
+    except Exception as e:
+        logger.error(f"Error getting job tasks for user {telegram_user_id}: {e}")
+        return []
+
+
 async def requeue_job(login: str, password: str, job_id: str) -> bool:
     """
     Requeue a job.
@@ -179,6 +229,31 @@ async def requeue_job(login: str, password: str, job_id: str) -> bool:
                 return success
     except Exception as e:
         logger.error(f"Error requeuing job: {e}")
+        return False
+
+
+async def requeue_job_by_user_id(telegram_user_id: int, job_id: str) -> bool:
+    """
+    Requeue a job using telegram user ID.
+    
+    Args:
+        telegram_user_id: Telegram user ID
+        job_id: Job ID
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        from app.auth import get_deadline_credentials
+        credentials = await get_deadline_credentials(telegram_user_id)
+        if not credentials:
+            logger.error(f"No Deadline credentials found for user {telegram_user_id}")
+            return False
+        
+        login, password = credentials
+        return await requeue_job(login, password, job_id)
+    except Exception as e:
+        logger.error(f"Error requeuing job for user {telegram_user_id}: {e}")
         return False
 
 
@@ -208,6 +283,31 @@ async def resume_job(login: str, password: str, job_id: str) -> bool:
         return False
 
 
+async def resume_job_by_user_id(telegram_user_id: int, job_id: str) -> bool:
+    """
+    Resume a suspended job using telegram user ID.
+    
+    Args:
+        telegram_user_id: Telegram user ID
+        job_id: Job ID
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        from app.auth import get_deadline_credentials
+        credentials = await get_deadline_credentials(telegram_user_id)
+        if not credentials:
+            logger.error(f"No Deadline credentials found for user {telegram_user_id}")
+            return False
+        
+        login, password = credentials
+        return await resume_job(login, password, job_id)
+    except Exception as e:
+        logger.error(f"Error resuming job for user {telegram_user_id}: {e}")
+        return False
+
+
 async def suspend_job(login: str, password: str, job_id: str) -> bool:
     """
     Suspend a job.
@@ -234,6 +334,31 @@ async def suspend_job(login: str, password: str, job_id: str) -> bool:
         return False
 
 
+async def suspend_job_by_user_id(telegram_user_id: int, job_id: str) -> bool:
+    """
+    Suspend a job using telegram user ID.
+    
+    Args:
+        telegram_user_id: Telegram user ID
+        job_id: Job ID
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        from app.auth import get_deadline_credentials
+        credentials = await get_deadline_credentials(telegram_user_id)
+        if not credentials:
+            logger.error(f"No Deadline credentials found for user {telegram_user_id}")
+            return False
+        
+        login, password = credentials
+        return await suspend_job(login, password, job_id)
+    except Exception as e:
+        logger.error(f"Error suspending job for user {telegram_user_id}: {e}")
+        return False
+
+
 async def delete_job(login: str, password: str, job_id: str) -> bool:
     """
     Delete a job.
@@ -256,6 +381,31 @@ async def delete_job(login: str, password: str, job_id: str) -> bool:
                 return success
     except Exception as e:
         logger.error(f"Error deleting job: {e}")
+        return False
+
+
+async def delete_job_by_user_id(telegram_user_id: int, job_id: str) -> bool:
+    """
+    Delete a job using telegram user ID.
+    
+    Args:
+        telegram_user_id: Telegram user ID
+        job_id: Job ID
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        from app.auth import get_deadline_credentials
+        credentials = await get_deadline_credentials(telegram_user_id)
+        if not credentials:
+            logger.error(f"No Deadline credentials found for user {telegram_user_id}")
+            return False
+        
+        login, password = credentials
+        return await delete_job(login, password, job_id)
+    except Exception as e:
+        logger.error(f"Error deleting job for user {telegram_user_id}: {e}")
         return False
 
 # ============================================================================
@@ -464,4 +614,144 @@ async def create_video_from_job(login: str, password: str, job_id: str) -> Optio
             
     except Exception as e:
         logger.error(f"Error creating video from job {job_id}: {e}")
+        return None
+
+
+async def check_video_exists_in_dropbox(login: str, password: str, job_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Check if video already exists in Dropbox for a job.
+    
+    Args:
+        login: User login
+        password: User password
+        job_id: Job ID
+        
+    Returns:
+        Video info dict if exists, None otherwise
+    """
+    try:
+        import aiohttp
+        from pathlib import PurePosixPath
+        from app.dropbox_helpers import get_fresh_access_token, fetch_dropbox_metadata
+        from app.core.config import settings
+        
+        # Get job info to find output directory
+        job_info = await get_job_info(login, password, job_id)
+        if not job_info:
+            logger.error(f"Could not get job info for {job_id}")
+            return None
+            
+        outdirs = job_info.get("OutDir", [])
+        if not outdirs:
+            logger.error(f"No OutDir found for job {job_id}")
+            return None
+            
+        fullpath = outdirs[0]
+        # Find root folder marker
+        idx = fullpath.find(settings.dropbox_root_marker)
+        if idx == -1:
+            logger.error(f"Dropbox root marker not found in path: {fullpath}")
+            return None
+            
+        trimmed = fullpath[idx:]
+        dropbox_path = "/" + trimmed.replace("\\", "/").lstrip("/")
+        
+        headers_dbx = {
+            "Authorization": f"Bearer {get_fresh_access_token()}",
+            "Dropbox-API-Select-User": settings.dropbox_team_member_id,
+            "Dropbox-API-Path-Root": {".tag": "root", "root": settings.dropbox_root_namespace_id},
+            "Content-Type": "application/json"
+        }
+        
+        async with aiohttp.ClientSession() as session_dbx:
+            # Get metadata for the folder
+            metadata = await fetch_dropbox_metadata(session_dbx, dropbox_path, headers_dbx)
+            
+            if metadata.get(".tag") != "folder":
+                logger.error("Not a folder")
+                return None
+                
+            # Check if video exists in the same folder
+            exr_parent = str(PurePosixPath(metadata["path_display"]).parent)
+            video_filename = f"{metadata['name']}.mp4"
+            video_dropbox_path = f"{exr_parent}/{video_filename}"
+            
+            try:
+                # Try to get metadata for the video file
+                video_metadata = await fetch_dropbox_metadata(session_dbx, video_dropbox_path, headers_dbx)
+                if video_metadata.get(".tag") == "file":
+                    return {
+                        "exists": True,
+                        "filename": video_filename,
+                        "dropbox_path": video_dropbox_path,
+                        "metadata": video_metadata
+                    }
+            except Exception:
+                # Video doesn't exist
+                pass
+                
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error checking video existence for job {job_id}: {e}")
+        return None
+
+
+async def download_video_from_dropbox(login: str, password: str, job_id: str) -> Optional[str]:
+    """
+    Download existing video from Dropbox.
+    
+    Args:
+        login: User login
+        password: User password
+        job_id: Job ID
+        
+    Returns:
+        Local path to downloaded video or None if error
+    """
+    try:
+        import aiohttp
+        import json
+        from pathlib import Path
+        from app.dropbox_helpers import get_fresh_access_token
+        from app.core.config import settings
+        
+        # Check if video exists
+        video_info = await check_video_exists_in_dropbox(login, password, job_id)
+        if not video_info:
+            logger.error(f"Video not found in Dropbox for job {job_id}")
+            return None
+            
+        # Create temp directory
+        temp_dir = Path("temp")
+        temp_dir.mkdir(exist_ok=True)
+        
+        # Download video
+        download_url = "https://content.dropboxapi.com/2/files/download"
+        dl_headers = {
+            "Authorization": f"Bearer {get_fresh_access_token()}",
+            "Dropbox-API-Select-User": settings.dropbox_team_member_id,
+            "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
+            "Dropbox-API-Arg": json.dumps({"path": video_info["dropbox_path"]})
+        }
+        
+        async with aiohttp.ClientSession() as session_dbx:
+            async with session_dbx.post(download_url, headers=dl_headers) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    logger.error(f"Error downloading video: {text}")
+                    return None
+                    
+                temp_path = temp_dir / video_info["filename"]
+                temp_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                with open(temp_path, "wb") as f:
+                    data = await resp.read()
+                    f.write(data)
+                    
+                logger.info(f"Video downloaded to {temp_path}")
+                return str(temp_path)
+                
+    except Exception as e:
+        logger.error(f"Error downloading video for job {job_id}: {e}")
         return None 
