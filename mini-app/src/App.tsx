@@ -3,10 +3,9 @@ import { LoginForm } from './components/LoginForm';
 import { Navigation } from './components/Navigation';
 import { JobCard } from './components/JobCard';
 import { WorkerCard } from './components/WorkerCard';
-import { JobDetailsModal } from './components/JobDetailsModal';
 import { initTelegramApp, getTelegramUser, getTelegramThemeParams, subscribeThemeChanged } from './utils/telegram';
 import { jobsApi, workersApi, authApi } from './services/api';
-import { Job, Worker, User, Task } from './types';
+import { Job, Worker, User } from './types';
 
 function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -17,14 +16,6 @@ function App() {
   const [jobs, setJobs] = useState<Job[]>([]);
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [notification, setNotification] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
-  
-  // Modal state
-  const [selectedJob, setSelectedJob] = useState<Job | null>(null);
-  const [jobTasks, setJobTasks] = useState<Task[]>([]);
-  const [modalOpen, setModalOpen] = useState(false);
-  const [modalLoading, setModalLoading] = useState(false);
-  const [previewLoading, setPreviewLoading] = useState(false);
 
   useEffect(() => {
     console.log('App mounted');
@@ -41,6 +32,9 @@ function App() {
         const cssVar = '--tg-theme-' + key.replace(/_/g, '-');
         root.style.setProperty(cssVar, value);
       });
+
+      // Устанавливаем фон для body
+      document.body.style.backgroundColor = themeParams.bg_color || '#ffffff';
     };
     // Применяем тему при запуске
     const themeParams = getTelegramThemeParams();
@@ -52,11 +46,6 @@ function App() {
     // --- END THEME INIT ---
   }, []);
 
-  useEffect(() => {
-    console.log('Workers state changed:', workers.length);
-    console.log('Workers data:', workers);
-  }, [workers]);
-
   const checkAuth = async () => {
     console.log('Checking auth...');
     try {
@@ -65,7 +54,6 @@ function App() {
       if (response.data.authenticated) {
         setIsAuthenticated(true);
         setUser(response.data.user);
-        // loadData будет вызван автоматически через useEffect
       }
     } catch (error) {
       console.error('Auth check failed:', error);
@@ -87,13 +75,12 @@ function App() {
       if (response.data.success) {
         setIsAuthenticated(true);
         setUser(response.data.user);
-        // loadData будет вызван автоматически через useEffect
       } else {
-        setError(response.data.message || 'Неверный логин или пароль');
+        setError(response.data.message || 'Invalid login or password');
       }
     } catch (error: any) {
       console.error('Login error:', error);
-      setError(error.response?.data?.detail || 'Ошибка входа. Попробуйте еще раз.');
+      setError(error.response?.data?.detail || 'Login error. Please try again.');
     } finally {
       setLoginLoading(false);
     }
@@ -120,15 +107,19 @@ function App() {
         console.log('Loading jobs...');
         const response = await jobsApi.getJobs();
         console.log('Jobs response:', response.data);
-        setJobs(response.data);
+        
+        // Sort jobs by date
+        const sortedJobs = [...response.data].sort((a, b) => {
+          const dateA = a.Date ? new Date(a.Date).getTime() : 0;
+          const dateB = b.Date ? new Date(b.Date).getTime() : 0;
+          return dateB - dateA;  // Newest first
+        });
+        
+        setJobs(sortedJobs);
       } else if (activeTab === 'workers') {
         console.log('Loading workers...');
-        console.log('Making request to /api/slaves...');
         const response = await workersApi.getWorkers();
         console.log('Workers response:', response);
-        console.log('Workers data:', response.data);
-        console.log('Workers length:', Array.isArray(response.data) ? response.data.length : 'Not an array');
-        console.log('Workers type:', typeof response.data);
         if (Array.isArray(response.data)) {
           setWorkers(response.data);
         } else {
@@ -138,28 +129,20 @@ function App() {
       }
     } catch (error) {
       console.error('Error loading data:', error);
-      setError('Ошибка загрузки данных');
+      setError('Error loading data');
     } finally {
       setLoading(false);
     }
   };
 
-  // useEffect для загрузки данных при изменении вкладки
   useEffect(() => {
-    console.log('ActiveTab changed to:', activeTab);
-    // Загружаем данные при изменении вкладки
     if (isAuthenticated) {
-      console.log('Loading data for tab:', activeTab);
       loadData();
     }
   }, [activeTab, isAuthenticated]);
 
   const handleTabChange = (tab: 'jobs' | 'workers') => {
-    console.log('=== handleTabChange called ===');
-    console.log('Tab changed to:', tab);
-    console.log('Previous activeTab:', activeTab);
     setActiveTab(tab);
-    // loadData будет вызван автоматически через useEffect
   };
 
   const handleJobAction = async (jobId: string, action: 'requeue' | 'resume' | 'suspend' | 'delete') => {
@@ -178,125 +161,31 @@ function App() {
           await jobsApi.deleteJob(jobId);
           break;
       }
-      loadData(); // Перезагружаем данные после действия
+      loadData();
     } catch (error) {
-      setError('Ошибка выполнения действия');
-    }
-  };
-
-  const handleViewJobDetails = async (jobId: string) => {
-    try {
-      setModalLoading(true);
-      
-      // Найти задачу в списке
-      const job = jobs.find(j => j._id === jobId);
-      if (!job) {
-        setError('Задача не найдена');
-        return;
-      }
-      
-      setSelectedJob(job);
-      
-      // Загрузить задачи для этой job
-      try {
-        const tasksResponse = await jobsApi.getJobTasks(jobId);
-        setJobTasks(tasksResponse.data);
-      } catch (error) {
-        console.error('Error loading tasks:', error);
-        setJobTasks([]);
-      }
-      
-      setModalOpen(true);
-    } catch (error) {
-      console.error('Error opening job details:', error);
-      setError('Ошибка загрузки деталей задачи');
-    } finally {
-      setModalLoading(false);
-    }
-  };
-
-  const closeModal = () => {
-    setModalOpen(false);
-    setSelectedJob(null);
-    setJobTasks([]);
-  };
-
-  const handleDownloadFiles = async (jobId: string) => {
-    try {
-      setPreviewLoading(true);
-      setError(null);
-      setNotification(null);
-      
-      const response = await jobsApi.downloadJobFiles(jobId);
-      console.log('Download files response:', response.data);
-      
-      if (response.data.success) {
-        setNotification({ type: 'success', message: 'Файлы успешно скачаны!' });
-      } else {
-        setNotification({ type: 'error', message: 'Ошибка скачивания файлов' });
-      }
-    } catch (error: any) {
-      console.error('Download files error:', error);
-      setNotification({ type: 'error', message: error.response?.data?.detail || 'Ошибка скачивания файлов' });
-    } finally {
-      setPreviewLoading(false);
-    }
-  };
-
-  const handleCreateVideo = async (jobId: string) => {
-    try {
-      setPreviewLoading(true);
-      setError(null);
-      setNotification(null);
-      
-      const response = await jobsApi.createJobVideo(jobId);
-      console.log('Create video response:', response.data);
-      
-      if (response.data.success) {
-        setNotification({ type: 'success', message: 'Видео успешно создано!' });
-        
-        // Обновляем информацию о задаче с видео
-        const updatedJobs = jobs.map(job => {
-          if (job._id === jobId) {
-            return {
-              ...job,
-              video_path: response.data.video_path,
-              video_dropbox_path: response.data.video_dropbox_path
-            };
-          }
-          return job;
-        });
-        setJobs(updatedJobs);
-      } else {
-        setNotification({ type: 'error', message: 'Ошибка создания видео' });
-      }
-    } catch (error: any) {
-      console.error('Create video error:', error);
-      setNotification({ type: 'error', message: error.response?.data?.detail || 'Ошибка создания видео' });
-    } finally {
-      setPreviewLoading(false);
+      setError('Error performing action');
     }
   };
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center">
-        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary-600"></div>
+      <div className="min-h-screen flex items-center justify-center bg-tg-bg">
+        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-tg-button"></div>
       </div>
     );
   }
 
   if (!isAuthenticated) {
-    return (
-      <LoginForm 
-        onLogin={handleLogin} 
-        loading={loginLoading}
-      />
-    );
+    return <LoginForm onLogin={handleLogin} loading={loginLoading} />;
   }
 
+  // Separate jobs by status
+  const activeJobs = jobs.filter(job => job.Stat === 1);
+  const suspendedJobs = jobs.filter(job => job.Stat === 2);
+  const otherJobs = jobs.filter(job => job.Stat !== 1 && job.Stat !== 2);
+
   return (
-    <div className="min-h-screen bg-gray-50">
+    <div className="min-h-screen bg-tg-bg">
       <Navigation
         activeTab={activeTab}
         onTabChange={handleTabChange}
@@ -305,93 +194,87 @@ function App() {
         loading={loading}
       />
       
-      <div className="p-4">
-        {error && (
-          <div className="mb-4 p-3 bg-red-100 border border-red-400 text-red-700 rounded-md">
-            {error}
-          </div>
+      {error && (
+        <div className="p-4 bg-red-100 text-red-700 text-sm">
+          {error}
+        </div>
+      )}
+
+      <div className="p-4 space-y-4">
+        {activeTab === 'jobs' && (
+          <>
+            {/* Active Jobs */}
+            {activeJobs.length > 0 && (
+              <div className="space-y-4">
+                {activeJobs.map(job => (
+                  <JobCard
+                    key={job._id}
+                    job={job}
+                    onRequeue={(id) => handleJobAction(id, 'requeue')}
+                    onResume={(id) => handleJobAction(id, 'resume')}
+                    onSuspend={(id) => handleJobAction(id, 'suspend')}
+                    onDelete={(id) => handleJobAction(id, 'delete')}
+                  />
+                ))}
+              </div>
+            )}
+
+            {/* Suspended Jobs */}
+            {suspendedJobs.length > 0 && (
+              <div className="space-y-4">
+                <div className="text-center text-tg-hint py-2 border-t border-b border-tg-secondary-bg">
+                  Suspended Jobs
+                </div>
+                {suspendedJobs.map(job => (
+                  <JobCard
+                    key={job._id}
+                    job={job}
+                    onRequeue={(id) => handleJobAction(id, 'requeue')}
+                    onResume={(id) => handleJobAction(id, 'resume')}
+                    onSuspend={(id) => handleJobAction(id, 'suspend')}
+                    onDelete={(id) => handleJobAction(id, 'delete')}
+                  />
+                ))}
+              </div>
+            )}
+
+            {/* Other Jobs */}
+            {otherJobs.length > 0 && (
+              <div className="space-y-4">
+                {otherJobs.map(job => (
+                  <JobCard
+                    key={job._id}
+                    job={job}
+                    onRequeue={(id) => handleJobAction(id, 'requeue')}
+                    onResume={(id) => handleJobAction(id, 'resume')}
+                    onSuspend={(id) => handleJobAction(id, 'suspend')}
+                    onDelete={(id) => handleJobAction(id, 'delete')}
+                  />
+                ))}
+              </div>
+            )}
+
+            {jobs.length === 0 && !loading && (
+              <div className="text-center text-tg-hint py-8">
+                No jobs found
+              </div>
+            )}
+          </>
         )}
         
-        {notification && (
-          <div className={`mb-4 p-3 border rounded-md ${
-            notification.type === 'success' 
-              ? 'bg-green-100 border-green-400 text-green-700' 
-              : 'bg-red-100 border-red-400 text-red-700'
-          }`}>
-            <div className="flex justify-between items-center">
-              <span>{notification.message}</span>
-              <button 
-                onClick={() => setNotification(null)}
-                className="text-gray-500 hover:text-gray-700"
-              >
-                ✕
-              </button>
-            </div>
-          </div>
-        )}
+        {activeTab === 'workers' && workers.map(worker => (
+          <WorkerCard
+            key={worker.Info.Name}
+            worker={worker}
+          />
+        ))}
         
-        {activeTab === 'jobs' ? (
-          <div className="space-y-4">
-            {jobs.length === 0 ? (
-              <div className="text-center py-8 text-gray-500">
-                Задачи не найдены
-              </div>
-            ) : (
-              jobs.map((job) => (
-                <JobCard
-                  key={job._id}
-                  job={job}
-                  onViewDetails={handleViewJobDetails}
-                  onRequeue={(jobId) => handleJobAction(jobId, 'requeue')}
-                  onResume={(jobId) => handleJobAction(jobId, 'resume')}
-                  onSuspend={(jobId) => handleJobAction(jobId, 'suspend')}
-                  onDelete={(jobId) => handleJobAction(jobId, 'delete')}
-                />
-              ))
-            )}
-          </div>
-        ) : (
-          <div className="space-y-4">
-            {workers.length === 0 ? (
-              <div className="text-center py-8 text-gray-500">
-                Воркеры не найдены
-              </div>
-            ) : (
-              workers.map((worker) => (
-                <WorkerCard key={worker._id} worker={worker} />
-              ))
-            )}
+        {activeTab === 'workers' && workers.length === 0 && !loading && (
+          <div className="text-center text-tg-hint py-8">
+            No workers found
           </div>
         )}
       </div>
-
-      {/* Job Details Modal */}
-      <JobDetailsModal
-        job={selectedJob}
-        tasks={jobTasks}
-        isOpen={modalOpen}
-        onClose={closeModal}
-        onRequeue={(jobId) => {
-          handleJobAction(jobId, 'requeue');
-          closeModal();
-        }}
-        onResume={(jobId) => {
-          handleJobAction(jobId, 'resume');
-          closeModal();
-        }}
-        onSuspend={(jobId) => {
-          handleJobAction(jobId, 'suspend');
-          closeModal();
-        }}
-        onDelete={(jobId) => {
-          handleJobAction(jobId, 'delete');
-          closeModal();
-        }}
-        onDownloadFiles={handleDownloadFiles}
-        onCreateVideo={handleCreateVideo}
-        loading={modalLoading}
-        previewLoading={previewLoading}
-      />
     </div>
   );
 }

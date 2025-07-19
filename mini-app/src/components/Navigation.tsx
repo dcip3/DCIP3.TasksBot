@@ -17,7 +17,7 @@ export const Navigation: React.FC<NavigationProps> = ({
   loading = false,
 }) => {
   return (
-    <div className="bg-telegram-white border-b border-telegram-secondary">
+    <div className="bg-tg-header border-b border-tg-secondary-bg">
       <div className="flex items-center justify-between px-4 py-3">
         <div className="flex space-x-1">
           <button
@@ -27,12 +27,12 @@ export const Navigation: React.FC<NavigationProps> = ({
             }}
             className={`flex items-center px-3 py-2 text-sm font-medium rounded-md transition-colors ${
               activeTab === 'jobs'
-                ? 'bg-telegram-accent text-telegram-white'
-                : 'text-telegram-gray hover:text-telegram-dark hover:bg-telegram-secondary/20'
+                ? 'bg-tg-button text-tg-button-text'
+                : 'text-tg-hint hover:text-tg-base hover:bg-tg-secondary-bg'
             }`}
           >
             <Briefcase className="w-4 h-4 mr-2" />
-            Задачи
+            Jobs
           </button>
           <button
             onClick={() => {
@@ -41,12 +41,12 @@ export const Navigation: React.FC<NavigationProps> = ({
             }}
             className={`flex items-center px-3 py-2 text-sm font-medium rounded-md transition-colors ${
               activeTab === 'workers'
-                ? 'bg-telegram-accent text-telegram-white'
-                : 'text-telegram-gray hover:text-telegram-dark hover:bg-telegram-secondary/20'
+                ? 'bg-tg-button text-tg-button-text'
+                : 'text-tg-hint hover:text-tg-base hover:bg-tg-secondary-bg'
             }`}
           >
             <Users className="w-4 h-4 mr-2" />
-            Воркеры
+            Workers
           </button>
         </div>
         
@@ -54,16 +54,16 @@ export const Navigation: React.FC<NavigationProps> = ({
           <button
             onClick={onRefresh}
             disabled={loading}
-            className="p-2 text-telegram-gray hover:text-telegram-dark hover:bg-telegram-secondary/20 rounded-md transition-colors disabled:opacity-50"
+            className="p-2 text-tg-hint hover:text-tg-base hover:bg-tg-secondary-bg rounded-md transition-colors disabled:opacity-50"
           >
             <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
           </button>
           <button
             onClick={onLogout}
-            className="flex items-center px-3 py-2 text-sm font-medium text-red-600 hover:text-red-700 hover:bg-red-50 rounded-md transition-colors"
+            className="flex items-center px-3 py-2 text-sm font-medium text-tg-destructive hover:bg-tg-secondary-bg rounded-md transition-colors"
           >
             <LogOut className="w-4 h-4 mr-2" />
-            Выйти
+            Logout
           </button>
         </div>
       </div>

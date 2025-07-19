@@ -79,8 +79,14 @@ def convert_single_exr_file_streaming(args):
         exr = OpenEXR.InputFile(str(exr_path))
         channels = exr.channels(["R", "G", "B"], FLOAT)
         
+        # Get image dimensions
+        header = exr.header()
+        dw = header['dataWindow']
+        width = dw.max.x - dw.min.x + 1
+        height = dw.max.y - dw.min.y + 1
+        
         # Read channels in smaller chunks to reduce memory usage
-        chunk_size = min(1024, height)  # Process in chunks of max 1024 lines
+        chunk_size = min(256, height)  # Process in smaller chunks for better memory usage
         
         # Calculate scaling factors
         scale_x = target_width / width if target_width else 1.0
@@ -113,8 +119,9 @@ def convert_single_exr_file_streaming(args):
             flat_chunk = rgb_chunk.reshape(-1, 3).astype(np.float32)
             
             # Apply color transform
-            img_desc = ocio.PackedImageDesc(flat_chunk, width, chunk_height, 3)
-            cpu_processor.apply(img_desc)
+            if cpu_processor:
+                img_desc = ocio.PackedImageDesc(flat_chunk, width, chunk_height, 3)
+                cpu_processor.apply(img_desc)
             processed_chunk = flat_chunk.reshape(chunk_height, width, 3)
             
             if need_resize:
@@ -126,6 +133,7 @@ def convert_single_exr_file_streaming(args):
             
             # Clear chunk memory immediately
             del r_chunk, g_chunk, b_chunk, rgb_chunk, flat_chunk
+            gc.collect()
         
         # Combine chunks
         if processed_chunks:
@@ -144,15 +152,31 @@ def convert_single_exr_file_streaming(args):
         }
         
         out_exr = OpenEXR.OutputFile(str(out_exr_path), header_out)
-        r_half = (img[:, :, 0].astype(np.float16)).tobytes()
-        g_half = (img[:, :, 1].astype(np.float16)).tobytes()
-        b_half = (img[:, :, 2].astype(np.float16)).tobytes()
-        out_exr.writePixels({"R": r_half, "G": g_half, "B": b_half})
+        
+        # Save in chunks to minimize memory usage
+        chunk_size = min(256, new_height)
+        for y_start in range(0, new_height, chunk_size):
+            y_end = min(y_start + chunk_size, new_height)
+            chunk = img[y_start:y_end]
+            
+            r_half = (chunk[:, :, 0].astype(np.float16)).tobytes()
+            g_half = (chunk[:, :, 1].astype(np.float16)).tobytes()
+            b_half = (chunk[:, :, 2].astype(np.float16)).tobytes()
+            
+            out_exr.writePixels({
+                "R": r_half,
+                "G": g_half,
+                "B": b_half
+            }, y_start)
+            
+            del r_half, g_half, b_half
+            gc.collect()
+        
         out_exr.close()
         exr.close()
         
         # Aggressive memory cleanup
-        del processed_chunks, img, r_half, g_half, b_half, channels
+        del processed_chunks, img, channels
         gc.collect()
         
         # IMMEDIATELY delete source file after successful conversion
@@ -209,32 +233,27 @@ def convert_exr_folder_to_srgb_optimized(local_root: Path, conv_root: Path, ocio
     transform.setDirection(ocio.TRANSFORM_DIR_FORWARD)
     processor = config.getProcessor(transform)
     cpu_processor = processor.getDefaultCPUProcessor()
-
-    # Get dimensions from first file
-    first_exr = exr_files[0]
-    exr_file = OpenEXR.InputFile(str(first_exr))
-    header = exr_file.header()
-    dw = header["dataWindow"]
+    
+    # Get first frame dimensions for reference
+    first_frame = OpenEXR.InputFile(str(exr_files[0]))
+    header = first_frame.header()
+    dw = header['dataWindow']
     width = dw.max.x - dw.min.x + 1
     height = dw.max.y - dw.min.y + 1
-    exr_file.close()
-
-    # Calculate optimal workers based on current system state
-    max_workers = calculate_optimal_workers()
-    logger.info(f"Using {max_workers} workers for conversion")
+    first_frame.close()
     
-    # Prepare arguments for parallel processing
-    conversion_args = [(exr_path, conv_root, cpu_processor, width, height, target_width, target_height) 
-                      for exr_path in exr_files]
+    # Prepare conversion arguments
+    conversion_args = [(f, conv_root, cpu_processor, width, height, target_width, target_height) for f in exr_files]
     
-    # Process files with resource monitoring
+    # Track statistics
+    start_time = time.time()
     successful_conversions = 0
     failed_conversions = 0
-    start_time = time.time()
     
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    # Process files
+    with ThreadPoolExecutor(max_workers=1) as executor:
         # Submit tasks in smaller batches to avoid overwhelming the system
-        batch_size = max(1, len(exr_files) // 4)  # Process in 4 batches
+        batch_size = 3  # Process in batches of 3 files
         
         for i in range(0, len(conversion_args), batch_size):
             batch = conversion_args[i:i + batch_size]
@@ -256,7 +275,7 @@ def convert_exr_folder_to_srgb_optimized(local_root: Path, conv_root: Path, ocio
                     success, path, error = future.result()
                     if success:
                         successful_conversions += 1
-                        if successful_conversions % 5 == 0:  # Log progress every 5 files
+                        if successful_conversions % 3 == 0:  # Log progress every 3 files
                             elapsed = time.time() - start_time
                             rate = successful_conversions / elapsed if elapsed > 0 else 0
                             logger.info(f"Converted {successful_conversions}/{len(exr_files)} files "
@@ -273,21 +292,16 @@ def convert_exr_folder_to_srgb_optimized(local_root: Path, conv_root: Path, ocio
     
     # Final statistics
     total_time = time.time() - start_time
-    logger.info(f"Conversion completed in {total_time:.1f}s: {successful_conversions} successful, {failed_conversions} failed")
-    
-    # Check disk usage after conversion
     disk_usage_after = get_disk_usage(conv_root)
-    logger.info(f"Disk usage after conversion: {disk_usage_after:.1f} MB (+{disk_usage_after - disk_usage_before:.1f} MB)")
+    disk_usage_diff = disk_usage_after - disk_usage_before
+    
+    logger.info(f"Conversion completed in {total_time:.1f}s")
+    logger.info(f"Successfully converted: {successful_conversions}/{len(exr_files)} files")
+    logger.info(f"Failed conversions: {failed_conversions}")
+    logger.info(f"Disk usage change: {disk_usage_diff:.1f} MB")
     
     if failed_conversions > 0:
-        logger.warning(f"{failed_conversions} files failed to convert")
-    
-    # Note: Original files are already deleted during conversion for disk space efficiency
-    
-    # Final resource check
-    final_resources = get_system_resources()
-    logger.info(f"Final resources - Memory: {final_resources['memory_available_mb']:.0f}MB available, "
-                f"CPU: {final_resources['cpu_percent']:.1f}%, Disk: {final_resources['disk_free_mb']:.0f}MB free")
+        raise RuntimeError(f"Failed to convert {failed_conversions} files")
 
 def cleanup_original_files_aggressive(exr_files):
     """Aggressively clean up original EXR files to save disk space."""

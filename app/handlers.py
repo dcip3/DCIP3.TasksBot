@@ -731,99 +731,124 @@ async def job_info_callback(callback_query: CallbackQuery):
     job_id = callback_query.data.split(":", 1)[1]
     
     try:
-        job_info = await get_job_info_by_user_id(callback_query.from_user.id, job_id)
-        if not job_info:
+        # Get all jobs first
+        from app.services import get_jobs_list
+        all_jobs = await get_jobs_list(callback_query.from_user.id)
+        if not all_jobs:
+            await callback_query.answer("Failed to get jobs list.", show_alert=True)
+            return
+
+        # Find the selected job and get its batch name
+        selected_job = next((j for j in all_jobs if j.get("_id") == job_id), None)
+        if not selected_job:
             await callback_query.answer("Job not found.", show_alert=True)
             return
+
+        batch_name = selected_job.get("Props", {}).get("Batch")
+        if not batch_name:
+            await callback_query.answer("Invalid job data.", show_alert=True)
+            return
+
+        # Find all jobs with the same batch name
+        batch_jobs = [j for j in all_jobs if j.get("Props", {}).get("Batch") == batch_name]
         
-        # Format job info in old style
-        props = job_info.get("Props", {})
-        batch = props.get("Batch", "Untitled")
-        total_tasks = props.get("Tasks", 0)
-        completed_chunks = job_info.get("CompletedChunks", 0)
-        progress_str = format_progress_old(completed_chunks, total_tasks)
-        full_name = props.get("Name", "Untitled")
-        name = full_name.split("/")[-1] if "/" in full_name else full_name
-        stat = job_info.get("Stat", 0)
-        stat_name = settings.job_status_map.get(stat, "Unknown")
+        # Delete the original message
+        await callback_query.message.delete()
         
-        # Calculate ETA like in old version
-        eta_str = "N/A"
-        try:
-            tasks = await get_job_tasks_by_user_id(callback_query.from_user.id, job_id)
-            if tasks:
-                from datetime import datetime, timedelta
-                # Calculate durations of completed tasks
-                durations = []
-                for task in tasks:
-                    if task.get("Stat") == 5:  # Completed
-                        start_str = task.get("StartRen")
-                        comp_str = task.get("Comp")
-                        if (start_str and comp_str and 
-                            start_str != "0001-01-01T00:00:00Z" and 
-                            comp_str != "0001-01-01T00:00:00Z"):
-                            try:
-                                start_time = datetime.fromisoformat(start_str)
-                                comp_time = datetime.fromisoformat(comp_str)
-                                duration_val = (comp_time - start_time).total_seconds()
-                                durations.append(duration_val)
-                            except Exception:
-                                pass
-                
-                if durations:
-                    avg_duration = sum(durations) / len(durations)
-                    remaining = total_tasks - completed_chunks
-                    total_eta_seconds = avg_duration * remaining
-                    if total_eta_seconds > 0:
-                        eta_td = timedelta(seconds=int(total_eta_seconds))
-                        eta_str = str(eta_td)
-        except Exception as e:
-            logger.error(f"Error calculating ETA for job {job_id}: {e}")
+        # Send info for each job in the batch
+        for job in batch_jobs:
+            props = job.get("Props", {})
+            total_tasks = props.get("Tasks", 0)
+            completed_chunks = job.get("CompletedChunks", 0)
+            progress_str = format_progress_old(completed_chunks, total_tasks)
+            full_name = props.get("Name", "Untitled")
+            name = full_name.split("/")[-1] if "/" in full_name else full_name
+            stat = job.get("Stat", 0)
+            stat_name = settings.job_status_map.get(stat, "Unknown")
+            
+            # Calculate ETA for this job
             eta_str = "N/A"
-        
-        # Create job info message
-        info_text = f"<pre>Job Info:\n{'-'*40}\n"
-        info_text += f"Batch: {batch}\n"
-        info_text += f"Name: {name}\n"
-        info_text += f"Status: {stat_name}\n"
-        info_text += f"Progress: {progress_str}\n"
-        info_text += f"ETA: {eta_str}\n"
-        info_text += f"Total Tasks: {total_tasks}\n"
-        info_text += f"Completed: {completed_chunks}\n"
-        info_text += f"{'-'*40}</pre>"
-        
-        # Create action buttons
-        buttons = []
-        if stat != 3:  # Not completed
-            if stat == 2:  # Suspended
-                buttons.append(InlineKeyboardButton(text="▶ Resume", callback_data=f"resume_job:{job_id}"))
-            else:
-                buttons.append(InlineKeyboardButton(text="⏸ Suspend", callback_data=f"suspend_job:{job_id}"))
-            buttons.append(InlineKeyboardButton(text="🔄 Requeue", callback_data=f"requeue_job:{job_id}"))
-        
-        buttons.append(InlineKeyboardButton(text="🔍 Preview", callback_data=f"preview_job:{job_id}"))
-        buttons.append(InlineKeyboardButton(text="🗑 Delete", callback_data=f"delete_job:{job_id}"))
-        buttons.append(InlineKeyboardButton(text="📋 Tasks", callback_data=f"tasks_job:{job_id}"))
-        buttons.append(InlineKeyboardButton(text="⬅ Back", callback_data="jobs_back"))
-        
-        # Arrange buttons in rows
-        inline_keyboard = []
-        row = []
-        for i, button in enumerate(buttons, 1):
-            row.append(button)
-            if i % 2 == 0:
+            try:
+                tasks = await get_job_tasks_by_user_id(callback_query.from_user.id, job.get("_id"))
+                if tasks:
+                    from datetime import datetime, timedelta
+                    # Calculate durations of completed tasks
+                    durations = []
+                    for task in tasks:
+                        if task.get("Stat") == 5:  # Completed
+                            start_str = task.get("StartRen")
+                            comp_str = task.get("Comp")
+                            if (start_str and comp_str and 
+                                start_str != "0001-01-01T00:00:00Z" and 
+                                comp_str != "0001-01-01T00:00:00Z"):
+                                try:
+                                    start_time = datetime.fromisoformat(start_str)
+                                    comp_time = datetime.fromisoformat(comp_str)
+                                    duration_val = (comp_time - start_time).total_seconds()
+                                    durations.append(duration_val)
+                                except Exception:
+                                    pass
+                    
+                    if durations:
+                        avg_duration = sum(durations) / len(durations)
+                        remaining = total_tasks - completed_chunks
+                        total_eta_seconds = avg_duration * remaining
+                        if total_eta_seconds > 0:
+                            eta_td = timedelta(seconds=int(total_eta_seconds))
+                            eta_str = str(eta_td)
+            except Exception as e:
+                logger.error(f"Error calculating ETA for job {job.get('_id')}: {e}")
+                eta_str = "N/A"
+            
+            # Create job info message
+            info_text = f"<pre>Job Info:\n{'-'*40}\n"
+            info_text += f"Batch: {batch_name}\n"
+            info_text += f"Name: {name}\n"
+            info_text += f"Status: {stat_name}\n"
+            info_text += f"Progress: {progress_str}\n"
+            info_text += f"ETA: {eta_str}\n"
+            info_text += f"Total Tasks: {total_tasks}\n"
+            info_text += f"Completed: {completed_chunks}\n"
+            info_text += f"{'-'*40}</pre>"
+            
+            # Create action buttons for this job
+            current_job_id = job.get("_id")
+            buttons = []
+            if stat != 3:  # Not completed
+                if stat == 2:  # Suspended
+                    buttons.append(InlineKeyboardButton(text="▶ Resume", callback_data=f"resume_job:{current_job_id}"))
+                else:
+                    buttons.append(InlineKeyboardButton(text="⏸ Suspend", callback_data=f"suspend_job:{current_job_id}"))
+                buttons.append(InlineKeyboardButton(text="🔄 Requeue", callback_data=f"requeue_job:{current_job_id}"))
+            
+            buttons.append(InlineKeyboardButton(text="🔍 Preview", callback_data=f"preview_job:{current_job_id}"))
+            buttons.append(InlineKeyboardButton(text="🗑 Delete", callback_data=f"delete_job:{current_job_id}"))
+            buttons.append(InlineKeyboardButton(text="📋 Tasks", callback_data=f"tasks_job:{current_job_id}"))
+            
+            # Arrange buttons in rows
+            inline_keyboard = []
+            row = []
+            for i, button in enumerate(buttons, 1):
+                row.append(button)
+                if i % 2 == 0:
+                    inline_keyboard.append(row)
+                    row = []
+            if row:
                 inline_keyboard.append(row)
-                row = []
-        if row:
-            inline_keyboard.append(row)
+            
+            # Add back button in a separate row
+            inline_keyboard.append([InlineKeyboardButton(text="⬅ Back", callback_data="jobs_back")])
+            
+            keyboard = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
+            
+            # Send combined message with info and buttons
+            await callback_query.message.answer(
+                info_text + "\nActions:",
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
         
-        keyboard = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
-        
-        await callback_query.message.edit_text(
-            info_text,
-            parse_mode="HTML",
-            reply_markup=keyboard
-        )
+        await callback_query.answer()
         
     except Exception as e:
         logger.error(f"Error handling job info for user {callback_query.from_user.id}: {e}")
