@@ -900,32 +900,137 @@ async def create_new_video_process(callback_query: CallbackQuery, login: str, pa
             
             # Step 2: Create video
             await progress_msg.edit_text("🎬 Step 2: Converting EXR files and creating video...")
-            video_path = await create_video_from_job(login, password, job_id)
+            video_result = await create_video_from_job(login, password, job_id)
             
-            if not video_path:
+            if not video_result:
                 await progress_msg.edit_text("❌ Failed to create video")
                 return
             
-            # Step 3: Send video
-            await progress_msg.edit_text("📤 Step 3: Sending video...")
-            from aiogram.types import FSInputFile
-            await callback_query.message.answer_document(
-                document=FSInputFile(video_path),
-                caption="🎬 Preview video generated successfully!"
-            )
+            # video_result is now a tuple: (video_path, dropbox_path)
+            video_path, dropbox_path = video_result
+            
+            # Step 3: Check file size and compress if needed for Telegram (50MB limit)
+            await progress_msg.edit_text("📏 Step 3: Checking file size...")
+            from app.video_helpers import get_file_size_mb, compress_video_if_needed
+            from pathlib import Path
+            
+            video_path_obj = Path(video_path)
+            video_size_mb = get_file_size_mb(video_path_obj)
+            logger.info(f"Video size: {video_size_mb:.2f} MB")
+            
+            # Compress video if it's larger than 45MB (safe margin for Telegram's 50MB limit)
+            if video_size_mb > 45.0:
+                await progress_msg.edit_text(f"🗜️ Step 3.5: Compressing video ({video_size_mb:.1f} MB → target: <45 MB)...")
+                final_video_path = compress_video_if_needed(video_path_obj, max_size_mb=45.0)
+                final_size_mb = get_file_size_mb(final_video_path)
+                logger.info(f"Final video size after compression: {final_size_mb:.2f} MB")
+            else:
+                final_video_path = video_path_obj
+                final_size_mb = video_size_mb
+            
+            await progress_msg.edit_text(f"📤 Step 4: Sending video ({final_size_mb:.1f} MB)...")
+            
+            try:
+                from aiogram.types import FSInputFile
+                # Send as video for better playback experience
+                # This provides native video controls and preview
+                video_filename = final_video_path.name
+                
+                # Extract project name from dropbox path
+                # Example: /Team Folder/Project/render/shot_v01/Redshift_ROP1.mp4
+                # We want to extract: shot_v01
+                project_name = video_filename.replace('.mp4', '')  # Default fallback
+                try:
+                    # Split path and look for the render folder
+                    path_parts = dropbox_path.split('/')
+                    for i, part in enumerate(path_parts):
+                        if part == 'render' and i + 1 < len(path_parts):
+                            project_name = path_parts[i + 1]
+                            break
+                except Exception:
+                    pass  # Use default if parsing fails
+                
+                # Create caption with project name instead of filename
+                caption = f"📁 {project_name}\n<code>{dropbox_path}</code>"
+                
+                await callback_query.message.answer_video(
+                    video=FSInputFile(str(final_video_path)),
+                    caption=caption,
+                    parse_mode="HTML"
+                )
+                
+                # Clean up compressed files if they were created
+                if final_video_path != video_path_obj:
+                    from app.video_helpers import cleanup_compressed_files
+                    cleanup_compressed_files(video_path_obj)
+                    
+            except Exception as send_error:
+                logger.error(f"Error sending video: {send_error}")
+                error_msg = str(send_error)
+                if "Request Entity Too Large" in error_msg:
+                    await progress_msg.edit_text(f"❌ Video is too large ({final_size_mb:.1f} MB). Telegram limit is 50 MB.")
+                else:
+                    await progress_msg.edit_text(f"❌ Error sending video: {error_msg}")
+                return
             
             await progress_msg.delete()
             
-            # Answer callback to stop button animation
-            await callback_query.answer("Video created successfully!")
+            # Answer callback to stop button animation (with error handling for old queries)
+            try:
+                await callback_query.answer("Video created successfully!")
+            except Exception as answer_error:
+                logger.warning(f"Could not answer callback query (likely too old): {answer_error}")
+                # Don't send additional message - video was already sent
+            
+            # Clean up temp and conv directories after successful video creation and sending
+            # This matches the behavior of the old version
+            try:
+                from app.utils import cleanup_temp_and_conv
+                cleanup_temp_and_conv()
+                logger.info(f"Cleaned up temp and conv directories after video creation for job {job_id}")
+            except Exception as cleanup_error:
+                logger.error(f"Error cleaning up directories after video creation: {cleanup_error}")
             
         except Exception as e:
             logger.error(f"Error in preview generation: {e}")
-            await progress_msg.edit_text(f"❌ Error during preview generation: {str(e)}")
-            await callback_query.answer("Error occurred while creating video.", show_alert=True)
+            try:
+                await progress_msg.edit_text(f"❌ Error during preview generation: {str(e)}")
+            except Exception as edit_error:
+                logger.warning(f"Could not edit progress message: {edit_error}")
+                await callback_query.message.answer(f"❌ Error during preview generation: {str(e)}")
+            
+            try:
+                await callback_query.answer("Error occurred while creating video.", show_alert=True)
+            except Exception as answer_error:
+                logger.warning(f"Could not answer callback query: {answer_error}")
+                await callback_query.message.answer("❌ Error occurred while creating video.")
+            
+            # Clean up job files even on error
+            try:
+                from app.video_helpers import cleanup_job_files, cleanup_old_files
+                from app.utils import cleanup_temp_and_conv
+                cleanup_job_files(job_id)
+                # Clean up temp and conv directories
+                cleanup_temp_and_conv()
+                # Also clean up old files to save disk space
+                cleanup_old_files(max_age_hours=6)
+                logger.info(f"Cleaned up files after error for job {job_id}")
+            except Exception as cleanup_error:
+                logger.error(f"Error cleaning up job files after error: {cleanup_error}")
             
     except Exception as e:
         logger.error(f"Error in create_new_video_process: {e}")
+        # Clean up files even on critical error
+        try:
+            from app.utils import cleanup_temp_and_conv
+            from app.video_helpers import cleanup_job_files, cleanup_old_files
+            cleanup_job_files(job_id)
+            cleanup_temp_and_conv()
+            cleanup_old_files(max_age_hours=6)
+            logger.info(f"Cleaned up files after critical error for job {job_id}")
+        except Exception as cleanup_error:
+            logger.error(f"Error cleaning up files after critical error: {cleanup_error}")
+        
         await callback_query.answer("Error occurred while creating video.", show_alert=True)
 
 
@@ -1397,22 +1502,73 @@ async def send_dbx_video_callback(callback_query: CallbackQuery):
         progress_msg = await callback_query.message.answer("📥 Downloading video from Dropbox...")
         
         try:
-            video_path = await download_video_from_dropbox(login, password, job_id)
+            video_result = await download_video_from_dropbox(login, password, job_id)
             
-            if not video_path:
+            if not video_result:
                 await progress_msg.edit_text("❌ Failed to download video from Dropbox")
                 return
             
-            # Send video
-            await progress_msg.edit_text("📤 Sending video...")
+            # video_result is now a tuple: (video_path, dropbox_path)
+            video_path, dropbox_path = video_result
+            
+            # Check file size (no compression needed for documents up to 2GB)
+            await progress_msg.edit_text("📏 Checking file size...")
+            from app.video_helpers import get_file_size_mb
             from aiogram.types import FSInputFile
             from pathlib import Path
             
-            video_filename = Path(video_path).name
-            await callback_query.message.answer_document(
-                document=FSInputFile(video_path),
-                caption=f"🎬 Video '{video_filename}' from Dropbox"
+            video_path_obj = Path(video_path)
+            video_size_mb = get_file_size_mb(video_path_obj)
+            logger.info(f"Video size: {video_size_mb:.2f} MB")
+            
+            # No compression needed - documents support up to 2GB
+            final_video_path = video_path_obj
+            final_size_mb = video_size_mb
+            
+            await progress_msg.edit_text(f"📤 Sending video ({final_size_mb:.1f} MB)...")
+            
+            video_filename = final_video_path.name
+            
+            # Extract project name from dropbox path
+            # Example: /Team Folder/Project/render/shot_v01/Redshift_ROP1.mp4
+            # We want to extract: shot_v01
+            project_name = video_filename.replace('.mp4', '')  # Default fallback
+            try:
+                # Split path and look for the render folder
+                path_parts = dropbox_path.split('/')
+                for i, part in enumerate(path_parts):
+                    if part == 'render' and i + 1 < len(path_parts):
+                        project_name = path_parts[i + 1]
+                        break
+            except Exception:
+                pass  # Use default if parsing fails
+            
+            # Create caption with project name instead of filename
+            caption = f"📁 {project_name}\n<code>{dropbox_path}</code>"
+            
+            # Send as video instead of document
+            await callback_query.message.answer_video(
+                video=FSInputFile(str(final_video_path)),
+                caption=caption,
+                parse_mode="HTML"
             )
+            
+            # No compression cleanup needed - we send original files
+                
+            # Clean up job files after successful send
+            from app.video_helpers import cleanup_job_files, cleanup_old_files
+            cleanup_job_files(job_id)
+            # Also clean up old files to save disk space
+            cleanup_old_files(max_age_hours=6)  # Clean files older than 6 hours
+            
+            # Clean up temp and conv directories after successful video send
+            # This matches the behavior of the old version
+            try:
+                from app.utils import cleanup_temp_and_conv
+                cleanup_temp_and_conv()
+                logger.info(f"Cleaned up temp and conv directories after video send for job {job_id}")
+            except Exception as cleanup_error:
+                logger.error(f"Error cleaning up directories after video send: {cleanup_error}")
             
             await progress_msg.delete()
             
@@ -1423,7 +1579,11 @@ async def send_dbx_video_callback(callback_query: CallbackQuery):
                 pass
             
             # Answer callback to stop button animation
-            await callback_query.answer("Video sent successfully!")
+            try:
+                await callback_query.answer("Video sent successfully!")
+            except Exception as answer_error:
+                logger.warning(f"Could not answer callback query: {answer_error}")
+                # Don't send additional message - video was already sent
                 
         except Exception as e:
             logger.error(f"Error downloading video from Dropbox: {e}")
@@ -1464,8 +1624,9 @@ async def create_new_video_callback(callback_query: CallbackQuery):
         # Answer callback to stop button animation (if not already answered in create_new_video_process)
         try:
             await callback_query.answer("Video creation completed!")
-        except Exception:
-            pass  # Already answered in create_new_video_process
+        except Exception as answer_error:
+            logger.warning(f"Could not answer callback query in create_new_video_callback: {answer_error}")
+            # Already answered in create_new_video_process or query is too old
         
     except Exception as e:
         logger.error(f"Error handling create_new_video for user {callback_query.from_user.id}: {e}")

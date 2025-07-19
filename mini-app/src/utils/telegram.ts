@@ -32,6 +32,8 @@ declare global {
           hide: () => void;
           onClick: (callback: () => void) => void;
         };
+        themeParams: any; // Added for getTelegramThemeParams
+        onEvent: (event: string, callback: () => void) => void; // Added for subscribeThemeChanged
       };
     };
   }
@@ -51,4 +53,19 @@ export const getTelegramUser = () => {
 
 export const closeTelegramApp = () => {
   window.Telegram?.WebApp?.close();
+};
+
+export const getTelegramThemeParams = () => {
+  // themeParams могут быть в window.Telegram.WebApp.themeParams
+  return window.Telegram?.WebApp?.themeParams || null;
+};
+
+export const subscribeThemeChanged = (callback: (themeParams: any) => void) => {
+  // Telegram WebApp поддерживает событие theme_changed через window.Telegram.WebApp.onEvent
+  const tg = window.Telegram?.WebApp;
+  if (tg && typeof tg.onEvent === 'function') {
+    tg.onEvent('themeChanged', () => {
+      callback(tg.themeParams);
+    });
+  }
 }; 

@@ -31,16 +31,16 @@ const getStatusText = (stat: number) => {
 
 export const WorkerCard: React.FC<WorkerCardProps> = ({ worker }) => {
   return (
-    <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-3">
+    <div className="bg-telegram-white rounded-lg shadow-sm border border-telegram-secondary p-3">
       <div className="flex items-center justify-between">
         <div className="flex-1 min-w-0">
-          <h3 className="text-sm font-medium text-gray-900 truncate">
+          <h3 className="text-sm font-medium text-telegram-dark truncate">
             {worker.Info.Name}
           </h3>
         </div>
         <div className="flex items-center space-x-2 ml-2">
           <span className="text-sm">{getStatusIcon(worker.Info.Stat)}</span>
-          <span className="text-xs text-gray-600">
+          <span className="text-xs text-telegram-gray">
             {getStatusText(worker.Info.Stat)}
           </span>
         </div>

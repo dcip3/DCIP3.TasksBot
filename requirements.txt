@@ -12,6 +12,7 @@ uvicorn[standard]>=0.24.0
 numpy>=1.21.0
 OpenEXR>=1.3.2
 opencolorio>=2.1.0
+scipy>=1.9.0
 
 # Scheduling
 APScheduler>=3.10.0
@@ -22,9 +23,13 @@ python-dotenv>=0.19.0
 # Async support
 asyncio-mqtt>=0.11.0
 aiosqlite>=0.19.0
+aiofiles>=23.0.0
 
 # File handling
 pathlib2>=2.3.0
+
+# System monitoring
+psutil>=5.9.0
 
 # Development dependencies (optional)
 pytest>=7.0.0

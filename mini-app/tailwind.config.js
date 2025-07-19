@@ -12,6 +12,14 @@ export default {
           500: '#3b82f6',
           600: '#2563eb',
           700: '#1d4ed8',
+        },
+        telegram: {
+          primary: '#0088cc',
+          accent: '#2AABEE',
+          secondary: '#229ED9',
+          white: '#ffffff',
+          gray: '#8c8c8c',
+          dark: '#333333',
         }
       }
     },

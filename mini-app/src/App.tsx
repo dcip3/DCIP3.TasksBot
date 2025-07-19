@@ -4,7 +4,7 @@ import { Navigation } from './components/Navigation';
 import { JobCard } from './components/JobCard';
 import { WorkerCard } from './components/WorkerCard';
 import { JobDetailsModal } from './components/JobDetailsModal';
-import { initTelegramApp, getTelegramUser } from './utils/telegram';
+import { initTelegramApp, getTelegramUser, getTelegramThemeParams, subscribeThemeChanged } from './utils/telegram';
 import { jobsApi, workersApi, authApi } from './services/api';
 import { Job, Worker, User, Task } from './types';
 
@@ -30,6 +30,26 @@ function App() {
     console.log('App mounted');
     initTelegramApp();
     checkAuth();
+
+    // --- THEME INIT ---
+    const applyTheme = (themeParams: any) => {
+      if (!themeParams) return;
+      const root = document.documentElement;
+      // Применяем все параметры как CSS custom properties
+      Object.entries(themeParams).forEach(([key, value]) => {
+        // Преобразуем accent_text_color -> --tg-theme-accent-text-color
+        const cssVar = '--tg-theme-' + key.replace(/_/g, '-');
+        root.style.setProperty(cssVar, value);
+      });
+    };
+    // Применяем тему при запуске
+    const themeParams = getTelegramThemeParams();
+    if (themeParams) {
+      applyTheme(themeParams);
+    }
+    // Подписываемся на смену темы
+    subscribeThemeChanged(applyTheme);
+    // --- END THEME INIT ---
   }, []);
 
   useEffect(() => {

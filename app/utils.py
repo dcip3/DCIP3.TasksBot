@@ -195,9 +195,106 @@ def clear_folder(folder_path: str | Path) -> None:
 def cleanup_temp_and_conv() -> None:
     """
     Clear contents of 'temp' and 'conv' directories.
+    Removes all files including .mp4 files (videos are stored in Dropbox).
     """
+    # Clear temp directory completely
     clear_folder(Path(settings.temp_dir))
+    
+    # Clear conv directory completely (including .mp4 files)
     clear_folder(Path(settings.conv_dir))
+    
+    logger.info("Cleaned up temp and conv directories (removed all files)")
+
+
+def force_cleanup_temp_and_conv() -> None:
+    """
+    Force clear ALL contents of 'temp' and 'conv' directories.
+    Use this for error recovery.
+    """
+    # Clear temp directory completely
+    clear_folder(Path(settings.temp_dir))
+    
+    # Clear conv directory completely
+    clear_folder(Path(settings.conv_dir))
+    
+    logger.info("Force cleaned up temp and conv directories (removed all files)")
+
+
+def cleanup_old_files(max_age_hours: int = 24) -> None:
+    """
+    Clean up old files in temp and conv directories.
+    
+    Args:
+        max_age_hours: Maximum age of files in hours before deletion
+    """
+    import time
+    from datetime import datetime, timedelta
+    
+    current_time = time.time()
+    cutoff_time = current_time - (max_age_hours * 3600)
+    
+    temp_dir = Path(settings.temp_dir)
+    conv_dir = Path(settings.conv_dir)
+    
+    cleaned_count = 0
+    
+    for directory in [temp_dir, conv_dir]:
+        if not directory.exists():
+            continue
+            
+        for item in directory.iterdir():
+            try:
+                # Check file age
+                if item.stat().st_mtime < cutoff_time:
+                    if item.is_dir():
+                        shutil.rmtree(item, ignore_errors=True)
+                    else:
+                        item.unlink()
+                    cleaned_count += 1
+                    logger.debug(f"Cleaned up old file: {item}")
+            except Exception as e:
+                logger.warning(f"Failed to clean up {item}: {e}")
+    
+    if cleaned_count > 0:
+        logger.info(f"Cleaned up {cleaned_count} old files (older than {max_age_hours} hours)")
+
+
+def get_directory_sizes() -> dict:
+    """
+    Get sizes of temp and conv directories.
+    
+    Returns:
+        Dictionary with directory sizes in MB
+    """
+    temp_dir = Path(settings.temp_dir)
+    conv_dir = Path(settings.conv_dir)
+    
+    def get_dir_size(path: Path) -> float:
+        if not path.exists():
+            return 0.0
+        total_size = 0
+        for item in path.rglob('*'):
+            if item.is_file():
+                total_size += item.stat().st_size
+        return total_size / (1024 * 1024)  # Convert to MB
+    
+    return {
+        'temp_mb': get_dir_size(temp_dir),
+        'conv_mb': get_dir_size(conv_dir),
+        'total_mb': get_dir_size(temp_dir) + get_dir_size(conv_dir)
+    }
+
+
+def log_directory_sizes() -> None:
+    """
+    Log the current sizes of temp and conv directories.
+    """
+    sizes = get_directory_sizes()
+    logger.info(f"Directory sizes - Temp: {sizes['temp_mb']:.1f}MB, Conv: {sizes['conv_mb']:.1f}MB, Total: {sizes['total_mb']:.1f}MB")
+    
+    # Warning if total size is too large
+    if sizes['total_mb'] > 1000:  # More than 1GB
+        logger.warning(f"Large directory size detected: {sizes['total_mb']:.1f}MB total")
 
 
 def ensure_temp_dir() -> Path:
@@ -324,6 +421,10 @@ async def on_startup(bot):
     ensure_temp_dir()
     Path(settings.conv_dir).mkdir(exist_ok=True)
     
+    # Clean up any existing files on startup
+    cleanup_temp_and_conv()
+    logger.info("Startup cleanup completed")
+    
     # Setup menu button for Mini App
     await setup_menu_button()
     logger.info("Menu button setup completed")
@@ -331,6 +432,26 @@ async def on_startup(bot):
     # Start scheduler
     scheduler.start()
     logger.info("Scheduler started")
+    
+    # Schedule automatic cleanup tasks
+    # Clean up old files every 6 hours
+    scheduler.add_job(
+        cleanup_old_files,
+        CronTrigger(hour="*/6"),  # Every 6 hours
+        args=[24],  # Remove files older than 24 hours
+        id="cleanup_old_files",
+        replace_existing=True
+    )
+    
+    # Log directory sizes every hour
+    scheduler.add_job(
+        log_directory_sizes,
+        CronTrigger(minute=0),  # Every hour at minute 0
+        id="log_directory_sizes",
+        replace_existing=True
+    )
+    
+    logger.info("Scheduled cleanup tasks added")
     
     # Start job progress watcher
     asyncio.create_task(job_progress_watcher(bot))
@@ -369,6 +490,7 @@ async def job_progress_watcher(bot):
     import aiohttp
     from datetime import datetime, timezone, timedelta
     from app.auth import get_all_users_with_notifications
+    from app.core.bot_core import notified_jobs
     
     while True:
         await asyncio.sleep(60)
@@ -385,22 +507,13 @@ async def job_progress_watcher(bot):
                         if resp.status == 200:
                             jobs = await resp.json()
                             for job in jobs:
-                                job_id = job.get("JobId") or job.get("_id") or job.get("Props", {}).get("JobId")
+                                job_id = job.get("_id", "")
                                 if not job_id:
                                     continue
                                     
-                                # Remove job_id from notified_jobs if status is no longer Completed
-                                stat_num = job.get("Stat", 0)
-                                if job_id in notified_jobs and stat_num != 3:
-                                    notified_jobs.remove(job_id)
-                                    
-                                total_tasks = job.get("Props", {}).get("Tasks", 0)
-                                completed_chunks = job.get("CompletedChunks", 0)
-                                progress = 0
-                                if total_tasks:
-                                    progress = int((completed_chunks / total_tasks) * 100)
-                                    
-                                if progress == 100 and job_id not in notified_jobs:
+                                progress = job.get("Props", {}).get("Progress", 0)
+                                
+                                if progress == 100 and (job_id, telegram_user_id) not in notified_jobs:
                                     date_comp_str = job.get("DateComp") or job.get("Props", {}).get("DateComp")
                                     if not date_comp_str or date_comp_str == "0001-01-01T00:00:00Z":
                                         continue
@@ -418,7 +531,7 @@ async def job_progress_watcher(bot):
                                     message_text = f"✅ Job '{batch}' completed (100%)."
                                     await bot.send_message(telegram_user_id, message_text)
                                     logger.info(f"Notification sent to user {telegram_user_id} for job {job_id} ({batch})")
-                                    notified_jobs.add(job_id)
+                                    notified_jobs.add((job_id, telegram_user_id))
                         else:
                             logger.error(f"Watcher: Error requesting jobs for user {telegram_user_id}: {resp.status}")
             except Exception as e:

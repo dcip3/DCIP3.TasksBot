@@ -15,6 +15,33 @@ import json
 logger = logging.getLogger(__name__)
 
 # ============================================================================
+# === UTILITY FUNCTIONS ===
+# ============================================================================
+
+def create_optimized_session() -> aiohttp.ClientSession:
+    """
+    Create an optimized aiohttp session for better performance.
+    
+    Returns:
+        Optimized aiohttp ClientSession
+    """
+    timeout = aiohttp.ClientTimeout(total=300, connect=30)  # 5 minutes total, 30 seconds connect
+    connector = aiohttp.TCPConnector(
+        limit=100,  # Total connection pool size
+        limit_per_host=30,  # Connections per host
+        ttl_dns_cache=300,  # DNS cache TTL
+        use_dns_cache=True,
+        keepalive_timeout=30,
+        enable_cleanup_closed=True
+    )
+    
+    return aiohttp.ClientSession(
+        timeout=timeout,
+        connector=connector,
+        headers={"User-Agent": "TasksBot/1.0"}
+    )
+
+# ============================================================================
 # === DEADLINE API FUNCTIONS ===
 # ============================================================================
 
@@ -515,7 +542,7 @@ async def download_job_folder(login: str, password: str, job_id: str) -> Optiona
         return None
 
 
-async def create_video_from_job(login: str, password: str, job_id: str) -> Optional[str]:
+async def create_video_from_job(login: str, password: str, job_id: str) -> Optional[tuple[str, str]]:
     """
     Create video from job files.
     
@@ -530,7 +557,7 @@ async def create_video_from_job(login: str, password: str, job_id: str) -> Optio
     try:
         import aiohttp
         from pathlib import Path
-        from app.video_helpers import convert_exr_folder_to_srgb, assemble_video_from_exr
+        from app.video_helpers import convert_exr_folder_to_srgb_optimized, assemble_video_from_exr_optimized
         from app.dropbox_helpers import (
             get_fresh_access_token, fetch_dropbox_metadata, 
             upload_video_to_dropbox
@@ -586,12 +613,15 @@ async def create_video_from_job(login: str, password: str, job_id: str) -> Optio
             # Use job_id to make the paths unique
             local_root = temp_dir / f"{exr_folder_name}_{job_id}"
             conv_root = conv_dir / f"{exr_folder_name}_{job_id}"
+            # Use proper video filename without job_id suffix for better naming
             video_path = conv_root / f"{exr_folder_name}.mp4"
             
             # Check if video already exists
             if video_path.exists():
                 logger.info(f"Video already exists for job {job_id}")
-                return str(video_path)
+                # For existing videos, we don't have dropbox path, so return None
+                # This will trigger recreation of the video
+                return None
             
             # Check if files already exist
             exr_files_exist = lambda folder: folder.exists() and any(str(f).endswith(".exr") for f in folder.glob("*.exr"))
@@ -599,20 +629,25 @@ async def create_video_from_job(login: str, password: str, job_id: str) -> Optio
                 logger.error(f"No EXR files found in {local_root}")
                 return None
             
-            # Convert EXR files from ACES to sRGB
-            logger.info(f"Converting EXR files for job {job_id}")
-            convert_exr_folder_to_srgb(local_root, conv_root, "config.ocio")
+            # Convert EXR files from ACES to sRGB with VDS optimizations
+            logger.info(f"Converting EXR files for job {job_id} with VDS optimizations")
+            convert_exr_folder_to_srgb_optimized(local_root, conv_root, "config.ocio")
             
-            # Assemble video from converted EXR files
-            logger.info(f"Assembling video for job {job_id}")
-            video_path = assemble_video_from_exr(conv_root, exr_folder_name)
+            # Assemble video from converted EXR files with VDS optimizations
+            logger.info(f"Assembling video for job {job_id} with VDS optimizations")
+            video_path = assemble_video_from_exr_optimized(conv_root, exr_folder_name)
             
-            # Upload to Dropbox
+            # Compress video if needed to ensure it's under 50MB for Telegram compatibility
+            logger.info(f"Compressing video for job {job_id} to ensure Telegram compatibility")
+            from app.video_helpers import compress_video_if_needed
+            final_video_path = compress_video_if_needed(video_path, max_size_mb=45.0)
+            
+            # Upload video to Dropbox (now with original name, compressed if needed)
             logger.info(f"Uploading video to Dropbox for job {job_id}")
-            dropbox_path = await upload_video_to_dropbox(video_path, metadata, job_id)
+            dropbox_path = await upload_video_to_dropbox(final_video_path, metadata, job_id)
             logger.info(f"Video uploaded to Dropbox: {dropbox_path}")
             
-            return str(video_path)
+            return (str(final_video_path), dropbox_path)
             
     except Exception as e:
         logger.error(f"Error creating video from job {job_id}: {e}")
@@ -678,26 +713,8 @@ async def check_video_exists_in_dropbox(login: str, password: str, job_id: str) 
             video_filename = f"{metadata['name']}.mp4"
             video_dropbox_path = f"{exr_parent}/{video_filename}"
             
-            # Also check if there's a job-specific video (with job_id in filename)
-            job_specific_video_filename = f"{metadata['name']}_{job_id}.mp4"
-            job_specific_video_dropbox_path = f"{exr_parent}/{job_specific_video_filename}"
-            
             try:
-                # First try to get metadata for the job-specific video file
-                video_metadata = await fetch_dropbox_metadata(session_dbx, job_specific_video_dropbox_path, headers_dbx)
-                if video_metadata.get(".tag") == "file":
-                    return {
-                        "exists": True,
-                        "filename": job_specific_video_filename,
-                        "dropbox_path": job_specific_video_dropbox_path,
-                        "metadata": video_metadata
-                    }
-            except Exception:
-                # Job-specific video doesn't exist, try generic one
-                pass
-                
-            try:
-                # Try to get metadata for the generic video file
+                # Try to get metadata for the video file
                 video_metadata = await fetch_dropbox_metadata(session_dbx, video_dropbox_path, headers_dbx)
                 if video_metadata.get(".tag") == "file":
                     return {
@@ -717,7 +734,7 @@ async def check_video_exists_in_dropbox(login: str, password: str, job_id: str) 
         return None
 
 
-async def download_video_from_dropbox(login: str, password: str, job_id: str) -> Optional[str]:
+async def download_video_from_dropbox(login: str, password: str, job_id: str) -> Optional[tuple[str, str]]:
     """
     Download existing video from Dropbox.
     
@@ -762,15 +779,9 @@ async def download_video_from_dropbox(login: str, password: str, job_id: str) ->
                     logger.error(f"Error downloading video: {text}")
                     return None
                     
-                # Use job_id to make the local filename unique
+                # Use the original filename for local storage
                 filename = video_info["filename"]
-                if not filename.endswith(f"_{job_id}.mp4"):
-                    name_without_ext = filename.rsplit('.', 1)[0]
-                    unique_filename = f"{name_without_ext}_{job_id}.mp4"
-                else:
-                    unique_filename = filename
-                    
-                temp_path = temp_dir / unique_filename
+                temp_path = temp_dir / filename
                 temp_path.parent.mkdir(parents=True, exist_ok=True)
                 
                 with open(temp_path, "wb") as f:
@@ -778,7 +789,7 @@ async def download_video_from_dropbox(login: str, password: str, job_id: str) ->
                     f.write(data)
                     
                 logger.info(f"Video downloaded to {temp_path}")
-                return str(temp_path)
+                return (str(temp_path), video_info["dropbox_path"])
                 
     except Exception as e:
         logger.error(f"Error downloading video for job {job_id}: {e}")

@@ -1,13 +1,18 @@
 import time
 import base64
 import json
+import logging
 from typing import Optional
 from pathlib import Path, PurePosixPath
-
-import requests
+import asyncio
+import aiofiles
 import aiohttp
+import requests
+from aiohttp import ClientTimeout
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 # Переменные для кеширования access_token
 _dropbox_access_token = None
@@ -94,7 +99,43 @@ async def count_exr_files(session_dbx: aiohttp.ClientSession, path: str, headers
             count += await count_exr_files(session_dbx, entry["path_display"], headers_dbx)
     return count
 
-async def download_exr_folder(
+async def download_file_parallel(
+    session: aiohttp.ClientSession,
+    download_url: str,
+    headers: dict,
+    local_file: Path,
+    semaphore: asyncio.Semaphore
+) -> bool:
+    """
+    Download a single file with semaphore control.
+    
+    Args:
+        session: aiohttp session
+        download_url: Dropbox download URL
+        headers: Request headers
+        local_file: Local file path
+        semaphore: Semaphore to limit concurrent downloads
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    async with semaphore:
+        try:
+            async with session.post(download_url, headers=headers) as resp:
+                if resp.status != 200:
+                    return False
+                
+                local_file.parent.mkdir(parents=True, exist_ok=True)
+                async with aiofiles.open(local_file, 'wb') as f:
+                    async for chunk in resp.content.iter_chunked(8192):  # 8KB chunks
+                        await f.write(chunk)
+                return True
+        except Exception as e:
+            logger.error(f"Error downloading {local_file.name}: {e}")
+            return False
+
+
+async def download_exr_folder_parallel(
     session_dbx: aiohttp.ClientSession,
     download_url: str,
     headers_dbx: dict,
@@ -102,10 +143,22 @@ async def download_exr_folder(
     local_folder: Path,
     job_id: str,
     download_states: dict,
-    stop_downloads: dict
+    stop_downloads: dict,
+    max_concurrent: int = 5
 ):
     """
-    Рекурсивно скачивает EXR-файлы из папки Dropbox в локальную директорию.
+    Рекурсивно скачивает EXR-файлы из папки Dropbox в локальную директорию с параллельным скачиванием.
+    
+    Args:
+        session_dbx: aiohttp session
+        download_url: Dropbox download URL
+        headers_dbx: Base headers
+        path: Dropbox path
+        local_folder: Local folder path
+        job_id: Job ID
+        download_states: Download state tracking
+        stop_downloads: Stop download flags
+        max_concurrent: Maximum concurrent downloads
     """
     list_url = "https://api.dropboxapi.com/2/files/list_folder"
     
@@ -124,12 +177,15 @@ async def download_exr_folder(
     state = download_states.get(job_id)
     if state is None:
         return
-    downloaded_count = state["downloaded_count"]
-
+    
+    # Collect all files to download
+    files_to_download = []
+    
     for entry in result.get("entries", []):
         name = entry["name"]
         if "cryptomatte" in name.lower():
             continue
+            
         if entry[".tag"] == "file" and name.lower().endswith(".exr"):
             local_file = local_folder / name
             dl_headers = {
@@ -138,37 +194,13 @@ async def download_exr_folder(
                 "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
                 "Dropbox-API-Arg": json.dumps({"path": entry["path_display"]})
             }
-            try:
-                async with session_dbx.post(download_url, headers=dl_headers) as f_resp:
-                    if f_resp.status != 200:
-                        continue
-                    local_file.parent.mkdir(parents=True, exist_ok=True)
-                    with open(local_file, "wb") as f:
-                        data = await f_resp.read()
-                        f.write(data)
-            except Exception:
-                continue
-
-            if stop_downloads.get(job_id) and stop_downloads[job_id].is_set():
-                return
-
-            downloaded_count += 1
-            if job_id in download_states:
-                download_states[job_id]["downloaded_count"] = downloaded_count
-            total_files = state.get("total_files", 0)
-            percent = int((downloaded_count / total_files) * 100) if total_files else 0
-            progress_msg = state.get("progress_msg")
-            try:
-                if progress_msg:
-                    stop_kb = state.get("stop_kb")
-                    await progress_msg.edit_text(f"Step 1: Downloading {percent}%", reply_markup=stop_kb)
-            except Exception:
-                pass
-
+            files_to_download.append((download_url, dl_headers, local_file))
+            
         elif entry[".tag"] == "folder":
             subfolder = local_folder / name
             subfolder.mkdir(exist_ok=True)
-            await download_exr_folder(
+            # Recursively collect files from subfolders
+            await download_exr_folder_parallel(
                 session_dbx,
                 download_url,
                 headers_dbx,
@@ -176,10 +208,70 @@ async def download_exr_folder(
                 subfolder,
                 job_id,
                 download_states,
-                stop_downloads
+                stop_downloads,
+                max_concurrent
             )
             if stop_downloads.get(job_id) and stop_downloads[job_id].is_set():
                 return
+    
+    # Download files in parallel
+    if files_to_download:
+        semaphore = asyncio.Semaphore(max_concurrent)
+        tasks = []
+        
+        for download_url, dl_headers, local_file in files_to_download:
+            task = download_file_parallel(session_dbx, download_url, dl_headers, local_file, semaphore)
+            tasks.append(task)
+        
+        # Wait for all downloads to complete
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Update progress
+        downloaded_count = state.get("downloaded_count", 0)
+        successful_downloads = sum(1 for result in results if result is True)
+        downloaded_count += successful_downloads
+        
+        if job_id in download_states:
+            download_states[job_id]["downloaded_count"] = downloaded_count
+            
+        total_files = state.get("total_files", 0)
+        percent = int((downloaded_count / total_files) * 100) if total_files else 0
+        progress_msg = state.get("progress_msg")
+        
+        try:
+            if progress_msg:
+                stop_kb = state.get("stop_kb")
+                await progress_msg.edit_text(f"Step 1: Downloading {percent}% ({downloaded_count}/{total_files})", reply_markup=stop_kb)
+        except Exception:
+            pass
+
+
+async def download_exr_folder(
+    session_dbx: aiohttp.ClientSession,
+    download_url: str,
+    headers_dbx: dict,
+    path: str,
+    local_folder: Path,
+    job_id: str,
+    download_states: dict,
+    stop_downloads: dict
+):
+    """
+    Рекурсивно скачивает EXR-файлы из папки Dropbox в локальную директорию.
+    Использует параллельное скачивание для ускорения.
+    """
+    # Use parallel download by default
+    await download_exr_folder_parallel(
+        session_dbx,
+        download_url,
+        headers_dbx,
+        path,
+        local_folder,
+        job_id,
+        download_states,
+        stop_downloads,
+        max_concurrent=5  # Adjust based on your needs
+    )
 
 async def upload_video_to_dropbox(video_path: Path, metadata: dict, job_id: Optional[str] = None) -> str:
     """
@@ -188,14 +280,9 @@ async def upload_video_to_dropbox(video_path: Path, metadata: dict, job_id: Opti
     filename = video_path.name
     exr_parent = str(PurePosixPath(metadata["path_display"]).parent)
     
-    # If job_id is provided, create a unique filename
-    if job_id:
-        name_without_ext = filename.rsplit('.', 1)[0]
-        ext = filename.rsplit('.', 1)[1] if '.' in filename else ''
-        unique_filename = f"{name_without_ext}_{job_id}.{ext}"
-        dropbox_upload_path = f"{exr_parent}/{unique_filename}"
-    else:
-        dropbox_upload_path = f"{exr_parent}/{filename}"
+    # Use the original filename without job_id suffix for better naming
+    # This matches the behavior of the old version
+    dropbox_upload_path = f"{exr_parent}/{filename}"
 
     upload_url = "https://content.dropboxapi.com/2/files/upload"
     headers_upload = {

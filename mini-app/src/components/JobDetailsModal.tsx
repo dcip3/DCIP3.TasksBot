@@ -45,10 +45,10 @@ const getStatusColor = (stat: number) => {
   switch (stat) {
     case 1: return 'text-green-600'; // Active
     case 2: return 'text-yellow-600'; // Suspended
-    case 3: return 'text-blue-600'; // Completed
+    case 3: return 'text-telegram-primary'; // Completed
     case 4: return 'text-red-600'; // Failed
-    case 6: return 'text-gray-600'; // Pending
-    default: return 'text-gray-500';
+    case 6: return 'text-telegram-gray'; // Pending
+    default: return 'text-telegram-gray';
   }
 };
 
@@ -74,16 +74,16 @@ export const JobDetailsModal: React.FC<JobDetailsModalProps> = ({
 
   return (
     <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
-      <div className="bg-white rounded-lg max-w-4xl w-full max-h-[90vh] overflow-y-auto">
+      <div className="bg-telegram-white rounded-lg max-w-4xl w-full max-h-[90vh] overflow-y-auto">
         {/* Header */}
-        <div className="flex items-center justify-between p-6 border-b border-gray-200">
+        <div className="flex items-center justify-between p-6 border-b border-telegram-secondary">
           <div>
-            <h2 className="text-xl font-semibold text-gray-900">{job.Props.Name}</h2>
-            <p className="text-sm text-gray-500 mt-1">ID: {job._id}</p>
+            <h2 className="text-xl font-semibold text-telegram-dark">{job.Props.Name}</h2>
+            <p className="text-sm text-telegram-gray mt-1">ID: {job._id}</p>
           </div>
           <button
             onClick={onClose}
-            className="text-gray-400 hover:text-gray-600 transition-colors"
+            className="text-telegram-gray hover:text-telegram-dark transition-colors"
           >
             <X className="w-6 h-6" />
           </button>
@@ -94,29 +94,29 @@ export const JobDetailsModal: React.FC<JobDetailsModalProps> = ({
           {/* Job Info */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
-              <h3 className="text-lg font-medium text-gray-900 mb-3">Информация о задаче</h3>
+              <h3 className="text-lg font-medium text-telegram-dark mb-3">Информация о задаче</h3>
               <div className="space-y-2 text-sm">
                 <div className="flex justify-between">
-                  <span className="text-gray-600">Батч:</span>
+                  <span className="text-telegram-gray">Батч:</span>
                   <span className="font-medium">{job.Props.Batch}</span>
                 </div>
                 <div className="flex justify-between">
-                  <span className="text-gray-600">Пользователь:</span>
+                  <span className="text-telegram-gray">Пользователь:</span>
                   <span className="font-medium">{job.Props.User}</span>
                 </div>
                 <div className="flex justify-between">
-                  <span className="text-gray-600">Статус:</span>
+                  <span className="text-telegram-gray">Статус:</span>
                   <span className={`font-medium ${getStatusColor(job.Stat)}`}>
                     {getStatusIcon(job.Stat)} {getStatusText(job.Stat)}
                   </span>
                 </div>
                 <div className="flex justify-between">
-                  <span className="text-gray-600">Дата создания:</span>
+                  <span className="text-telegram-gray">Дата создания:</span>
                   <span className="font-medium">{new Date(job.Date).toLocaleString()}</span>
                 </div>
                 {job.Props.Comment && (
                   <div className="flex justify-between">
-                    <span className="text-gray-600">Комментарий:</span>
+                    <span className="text-telegram-gray">Комментарий:</span>
                     <span className="font-medium">{job.Props.Comment}</span>
                   </div>
                 )}
@@ -124,19 +124,19 @@ export const JobDetailsModal: React.FC<JobDetailsModalProps> = ({
             </div>
 
             <div>
-              <h3 className="text-lg font-medium text-gray-900 mb-3">Прогресс</h3>
+              <h3 className="text-lg font-medium text-telegram-dark mb-3">Прогресс</h3>
               <div className="space-y-3">
                 <div className="flex justify-between text-sm">
-                  <span className="text-gray-600">Выполнено:</span>
+                  <span className="text-telegram-gray">Выполнено:</span>
                   <span className="font-medium">{job.CompletedChunks} / {job.Props.Tasks}</span>
                 </div>
-                <div className="w-full bg-gray-200 rounded-full h-3">
+                <div className="w-full bg-telegram-secondary rounded-full h-3">
                   <div
-                    className="bg-primary-600 h-3 rounded-full transition-all duration-300"
+                    className="bg-telegram-primary h-3 rounded-full transition-all duration-300"
                     style={{ width: `${progress}%` }}
                   />
                 </div>
-                <div className="text-center text-sm font-medium text-gray-700">
+                <div className="text-center text-sm font-medium text-telegram-dark">
                   {progress}%
                 </div>
               </div>
@@ -144,8 +144,8 @@ export const JobDetailsModal: React.FC<JobDetailsModalProps> = ({
           </div>
 
           {/* Actions */}
-          <div className="border-t border-gray-200 pt-4">
-            <h3 className="text-lg font-medium text-gray-900 mb-3">Действия</h3>
+          <div className="border-t border-telegram-secondary pt-4">
+            <h3 className="text-lg font-medium text-telegram-dark mb-3">Действия</h3>
             <div className="flex flex-wrap gap-2">
               {job.Stat === 2 && (
                 <button
@@ -172,7 +172,7 @@ export const JobDetailsModal: React.FC<JobDetailsModalProps> = ({
               <button
                 onClick={() => onRequeue(job._id)}
                 disabled={loading}
-                className="flex items-center px-4 py-2 text-sm font-medium text-blue-700 bg-blue-100 rounded-md hover:bg-blue-200 transition-colors disabled:opacity-50"
+                className="flex items-center px-4 py-2 text-sm font-medium text-telegram-primary bg-telegram-accent rounded-md hover:bg-telegram-primary hover:text-telegram-white transition-colors disabled:opacity-50"
               >
                 <RotateCcw className="w-4 h-4 mr-2" />
                 Перезапустить
@@ -190,16 +190,16 @@ export const JobDetailsModal: React.FC<JobDetailsModalProps> = ({
               {/* Preview Actions */}
               {(onDownloadFiles || onCreateVideo) && (
                 <>
-                  <div className="w-full border-t border-gray-200 my-2" />
+                  <div className="w-full border-t border-telegram-secondary my-2" />
                   <div className="w-full">
-                    <h4 className="text-sm font-medium text-gray-700 mb-2">Preview</h4>
+                    <h4 className="text-sm font-medium text-telegram-dark mb-2">Preview</h4>
                   </div>
                   
                   {onDownloadFiles && (
                     <button
                       onClick={() => onDownloadFiles(job._id)}
                       disabled={previewLoading}
-                      className="flex items-center px-4 py-2 text-sm font-medium text-purple-700 bg-purple-100 rounded-md hover:bg-purple-200 transition-colors disabled:opacity-50"
+                      className="flex items-center px-4 py-2 text-sm font-medium text-telegram-accent bg-telegram-secondary rounded-md hover:bg-telegram-accent hover:text-telegram-white transition-colors disabled:opacity-50"
                     >
                       <Eye className="w-4 h-4 mr-2" />
                       Скачать файлы
@@ -210,7 +210,7 @@ export const JobDetailsModal: React.FC<JobDetailsModalProps> = ({
                     <button
                       onClick={() => onCreateVideo(job._id)}
                       disabled={previewLoading}
-                      className="flex items-center px-4 py-2 text-sm font-medium text-indigo-700 bg-indigo-100 rounded-md hover:bg-indigo-200 transition-colors disabled:opacity-50"
+                      className="flex items-center px-4 py-2 text-sm font-medium text-telegram-primary bg-telegram-accent rounded-md hover:bg-telegram-primary hover:text-telegram-white transition-colors disabled:opacity-50"
                     >
                       <Eye className="w-4 h-4 mr-2" />
                       Создать видео
@@ -223,14 +223,14 @@ export const JobDetailsModal: React.FC<JobDetailsModalProps> = ({
 
           {/* Tasks */}
           {tasks.length > 0 && (
-            <div className="border-t border-gray-200 pt-4">
-              <h3 className="text-lg font-medium text-gray-900 mb-3">Задачи ({tasks.length})</h3>
+            <div className="border-t border-telegram-secondary pt-4">
+              <h3 className="text-lg font-medium text-telegram-dark mb-3">Задачи ({tasks.length})</h3>
               <div className="space-y-2 max-h-60 overflow-y-auto">
                 {tasks.map((task) => (
-                  <div key={task._id} className="flex items-center justify-between p-3 bg-gray-50 rounded-md">
+                  <div key={task._id} className="flex items-center justify-between p-3 bg-telegram-secondary rounded-md">
                     <div className="flex-1">
-                      <p className="text-sm font-medium text-gray-900">{task.Props.Name}</p>
-                      <p className="text-xs text-gray-500">ID: {task._id}</p>
+                      <p className="text-sm font-medium text-telegram-dark">{task.Props.Name}</p>
+                      <p className="text-xs text-telegram-gray">ID: {task._id}</p>
                     </div>
                     <div className="flex items-center space-x-2">
                       <span className="text-lg">{getStatusIcon(task.Stat)}</span>

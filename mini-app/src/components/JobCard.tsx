@@ -27,10 +27,10 @@ const getStatusColor = (stat: number) => {
   switch (stat) {
     case 1: return 'text-green-600'; // Active
     case 2: return 'text-yellow-600'; // Suspended
-    case 3: return 'text-blue-600'; // Completed
+    case 3: return 'text-telegram-primary'; // Completed
     case 4: return 'text-red-600'; // Failed
-    case 6: return 'text-gray-600'; // Pending
-    default: return 'text-gray-500';
+    case 6: return 'text-telegram-gray'; // Pending
+    default: return 'text-telegram-gray';
   }
 };
 
@@ -60,16 +60,16 @@ export const JobCard: React.FC<JobCardProps> = ({
     : 0;
 
   return (
-    <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-4 space-y-3">
+    <div className="bg-telegram-white rounded-lg shadow-sm border border-telegram-secondary p-4 space-y-3">
       <div className="flex items-start justify-between">
         <div className="flex-1 min-w-0">
-          <h3 className="text-sm font-medium text-gray-900 truncate">
+          <h3 className="text-sm font-medium text-telegram-dark truncate">
             {job.Props.Name}
           </h3>
-          <p className="text-xs text-gray-500 mt-1">
+          <p className="text-xs text-telegram-gray mt-1">
             Батч: {job.Props.Batch}
           </p>
-          <p className="text-xs text-gray-500">
+          <p className="text-xs text-telegram-gray">
             Пользователь: {job.Props.User}
           </p>
         </div>
@@ -82,13 +82,13 @@ export const JobCard: React.FC<JobCardProps> = ({
       </div>
 
       <div className="space-y-2">
-        <div className="flex justify-between text-xs text-gray-600">
+        <div className="flex justify-between text-xs text-telegram-gray">
           <span>Прогресс</span>
           <span>{progress}% ({job.CompletedChunks}/{job.Props.Tasks})</span>
         </div>
-        <div className="w-full bg-gray-200 rounded-full h-2">
+        <div className="w-full bg-telegram-secondary rounded-full h-2">
           <div
-            className="bg-primary-600 h-2 rounded-full transition-all duration-300"
+            className="bg-telegram-primary h-2 rounded-full transition-all duration-300"
             style={{ width: `${progress}%` }}
           />
         </div>
@@ -97,7 +97,7 @@ export const JobCard: React.FC<JobCardProps> = ({
       <div className="flex space-x-2 pt-2">
         <button
           onClick={() => onViewDetails(job._id)}
-          className="flex-1 flex items-center justify-center px-3 py-2 text-xs font-medium text-gray-700 bg-gray-100 rounded-md hover:bg-gray-200 transition-colors"
+          className="flex-1 flex items-center justify-center px-3 py-2 text-xs font-medium text-telegram-dark bg-telegram-secondary rounded-md hover:bg-telegram-accent hover:text-telegram-white transition-colors"
         >
           <Eye className="w-4 h-4 mr-1" />
           Детали
@@ -125,7 +125,7 @@ export const JobCard: React.FC<JobCardProps> = ({
         
         <button
           onClick={() => onRequeue(job._id)}
-          className="flex-1 flex items-center justify-center px-3 py-2 text-xs font-medium text-blue-700 bg-blue-100 rounded-md hover:bg-blue-200 transition-colors"
+          className="flex-1 flex items-center justify-center px-3 py-2 text-xs font-medium text-telegram-primary bg-telegram-accent rounded-md hover:bg-telegram-primary hover:text-telegram-white transition-colors"
         >
           <RotateCcw className="w-4 h-4 mr-1" />
           Перезапустить
@@ -142,12 +142,12 @@ export const JobCard: React.FC<JobCardProps> = ({
 
       {/* Video Section */}
       {job.video_path && (
-        <div className="border-t border-gray-200 pt-3">
+        <div className="border-t border-telegram-secondary pt-3">
           <div className="flex items-center justify-between mb-2">
-            <h4 className="text-xs font-medium text-gray-700">Видео</h4>
+            <h4 className="text-xs font-medium text-telegram-dark">Видео</h4>
             <button
               onClick={() => setShowVideo(!showVideo)}
-              className="flex items-center px-2 py-1 text-xs font-medium text-purple-700 bg-purple-100 rounded-md hover:bg-purple-200 transition-colors"
+              className="flex items-center px-2 py-1 text-xs font-medium text-telegram-accent bg-telegram-secondary rounded-md hover:bg-telegram-accent hover:text-telegram-white transition-colors"
             >
               <Video className="w-3 h-3 mr-1" />
               {showVideo ? 'Скрыть' : 'Показать'}
@@ -155,7 +155,7 @@ export const JobCard: React.FC<JobCardProps> = ({
           </div>
           
           {showVideo && (
-            <div className="bg-gray-50 rounded-md p-3">
+            <div className="bg-telegram-white rounded-md p-3">
               <video
                 controls
                 className="w-full rounded-md"
@@ -165,7 +165,7 @@ export const JobCard: React.FC<JobCardProps> = ({
                 Ваш браузер не поддерживает видео.
               </video>
               {job.video_dropbox_path && (
-                <p className="text-xs text-gray-500 mt-2">
+                <p className="text-xs text-telegram-gray mt-2">
                   Путь в Dropbox: {job.video_dropbox_path}
                 </p>
               )}
