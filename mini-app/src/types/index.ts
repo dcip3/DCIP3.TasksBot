@@ -12,6 +12,8 @@ export interface Job {
   Date: string;
   video_path?: string;
   video_dropbox_path?: string;
+  batchSize?: number;
+  maxDate?: number;
 }
 
 export interface Worker {

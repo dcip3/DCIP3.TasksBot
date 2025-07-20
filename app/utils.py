@@ -16,7 +16,7 @@ import os
 import shutil
 from functools import wraps
 from pathlib import Path
-from typing import cast
+from typing import cast, Optional
 
 from aiogram.types import Message, KeyboardButton, ReplyKeyboardMarkup, InlineKeyboardButton, MenuButtonWebApp, WebAppInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -228,7 +228,7 @@ def cleanup_old_files(max_age_hours: int = 24) -> None:
         max_age_hours: Maximum age of files in hours before deletion
     """
     import time
-    from datetime import datetime, timedelta
+    from datetime import datetime, timezone, timedelta
     
     current_time = time.time()
     cutoff_time = current_time - (max_age_hours * 3600)
@@ -400,6 +400,31 @@ def get_worker_icon(stat: int) -> str:
         return "❓"  # Unknown
 
 
+def get_video_duration(video_path: Path) -> Optional[float]:
+    """
+    Get video duration in seconds using ffprobe.
+    
+    Args:
+        video_path (Path): Path to the video file
+        
+    Returns:
+        Optional[float]: Duration in seconds or None if failed
+    """
+    try:
+        cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(video_path)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return float(result.stdout.strip())
+    except Exception as e:
+        logger.error(f"Error getting video duration: {e}")
+        return None
+
+
 # ============================================================================
 # === INITIALIZATION FUNCTIONS ===
 # ============================================================================
@@ -499,7 +524,6 @@ async def job_progress_watcher(bot):
         logger.info(f"Job progress watcher: Found {len(users_with_notifications)} users with notifications enabled")
         
         for telegram_user_id, login, password in users_with_notifications:
-                
             try:
                 async with aiohttp.ClientSession() as session:
                     headers = aiohttp.BasicAuth(login, password)
@@ -510,10 +534,10 @@ async def job_progress_watcher(bot):
                                 job_id = job.get("_id", "")
                                 if not job_id:
                                     continue
-                                    
-                                progress = job.get("Props", {}).get("Progress", 0)
-                                
-                                if progress == 100 and (job_id, telegram_user_id) not in notified_jobs:
+
+                                # Проверяем статус задачи
+                                stat = job.get("Stat", 0)
+                                if stat == 3 and (job_id, telegram_user_id) not in notified_jobs:  # Completed
                                     date_comp_str = job.get("DateComp") or job.get("Props", {}).get("DateComp")
                                     if not date_comp_str or date_comp_str == "0001-01-01T00:00:00Z":
                                         continue
@@ -528,9 +552,10 @@ async def job_progress_watcher(bot):
                                         continue
                                         
                                     batch = job.get("Props", {}).get("Batch", "Untitled")
-                                    message_text = f"✅ Job '{batch}' completed (100%)."
+                                    name = job.get("Props", {}).get("Name", "").split("/")[-1]
+                                    message_text = f"✅ Job completed:\n• Batch: {batch}\n• Name: {name}"
                                     await bot.send_message(telegram_user_id, message_text)
-                                    logger.info(f"Notification sent to user {telegram_user_id} for job {job_id} ({batch})")
+                                    logger.info(f"Notification sent to user {telegram_user_id} for job {job_id} ({name})")
                                     notified_jobs.add((job_id, telegram_user_id))
                         else:
                             logger.error(f"Watcher: Error requesting jobs for user {telegram_user_id}: {resp.status}")

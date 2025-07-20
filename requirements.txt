@@ -13,6 +13,7 @@ numpy>=1.21.0
 OpenEXR>=1.3.2
 opencolorio>=2.1.0
 scipy>=1.9.0
+Pillow>=10.0.0
 
 # Scheduling
 APScheduler>=3.10.0

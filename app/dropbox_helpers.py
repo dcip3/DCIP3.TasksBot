@@ -9,6 +9,7 @@ import aiofiles
 import aiohttp
 import requests
 from aiohttp import ClientTimeout
+import gc
 
 from app.core.config import settings
 
@@ -57,14 +58,15 @@ async def fetch_dropbox_metadata(session_dbx: aiohttp.ClientSession, dropbox_pat
     """
     meta_url = "https://api.dropboxapi.com/2/files/get_metadata"
     
-    # Создаем копию заголовков и сериализуем Dropbox-API-Path-Root
-    headers_copy = headers_dbx.copy()
-    if "Dropbox-API-Path-Root" in headers_copy:
-        path_root = headers_copy["Dropbox-API-Path-Root"]
-        if not isinstance(path_root, str):
-            headers_copy["Dropbox-API-Path-Root"] = json.dumps(path_root)
+    # Create fresh headers for metadata request
+    headers = {
+        "Authorization": f"Bearer {get_fresh_access_token()}",
+        "Dropbox-API-Select-User": settings.dropbox_team_member_id,
+        "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
+        "Content-Type": "application/json"
+    }
     
-    async with session_dbx.post(meta_url, headers=headers_copy, json={"path": dropbox_path}) as resp:
+    async with session_dbx.post(meta_url, headers=headers, json={"path": dropbox_path}) as resp:
         if resp.status != 200:
             text = await resp.text()
             raise RuntimeError(f"Error getting metadata: {text}")
@@ -72,11 +74,11 @@ async def fetch_dropbox_metadata(session_dbx: aiohttp.ClientSession, dropbox_pat
 
 async def count_exr_files(session_dbx: aiohttp.ClientSession, path: str, headers_dbx: dict) -> int:
     """
-    Считает количество EXR-файлов (исключая cryptomatte) рекурсивно в папке Dropbox.
+    Counts EXR files recursively in a Dropbox folder (excluding cryptomatte and conflicted copies).
     """
     list_url = "https://api.dropboxapi.com/2/files/list_folder"
     
-    # Создаем копию заголовков и сериализуем Dropbox-API-Path-Root
+    # Create a copy of headers and serialize Dropbox-API-Path-Root
     headers_copy = headers_dbx.copy()
     if "Dropbox-API-Path-Root" in headers_copy:
         path_root = headers_copy["Dropbox-API-Path-Root"]
@@ -90,10 +92,11 @@ async def count_exr_files(session_dbx: aiohttp.ClientSession, path: str, headers
 
     count = 0
     for entry in result.get("entries", []):
-        name = entry["name"]
-        if "cryptomatte" in name.lower():
+        name = entry["name"].lower()
+        # Skip cryptomatte and conflicted copy files
+        if "cryptomatte" in name or "conflicted copy" in name:
             continue
-        if entry[".tag"] == "file" and name.lower().endswith(".exr"):
+        if entry[".tag"] == "file" and name.endswith(".exr"):
             count += 1
         elif entry[".tag"] == "folder":
             count += await count_exr_files(session_dbx, entry["path_display"], headers_dbx)
@@ -160,11 +163,23 @@ async def download_file_parallel(
     """
     async with semaphore:
         try:
-            async with session.post(download_url, headers=headers) as resp:
+            # Create fresh headers for each download
+            dl_headers = {
+                "Authorization": f"Bearer {get_fresh_access_token()}",
+                "Dropbox-API-Select-User": settings.dropbox_team_member_id,
+                "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
+                "Dropbox-API-Arg": headers["Dropbox-API-Arg"]
+            }
+            
+            async with session.post(download_url, headers=dl_headers) as resp:
                 if resp.status != 200:
+                    logger.error(f"Failed to download {local_file.name}: {resp.status}")
                     return False
                 
+                # Ensure parent directory exists
                 local_file.parent.mkdir(parents=True, exist_ok=True)
+                
+                # Write file in chunks
                 async with aiofiles.open(local_file, 'wb') as f:
                     async for chunk in resp.content.iter_chunked(8192):  # 8KB chunks
                         await f.write(chunk)
@@ -178,9 +193,10 @@ async def process_file_batch(
     download_url: str,
     file_queue: FileQueue,
     local_folder: Path,
-    conv_folder: Path,
-    semaphore: asyncio.Semaphore,
-    ocio_config_path: str
+    job_id: str,
+    download_states: dict,
+    stop_downloads: dict,
+    headers_dbx: dict
 ):
     """Process a batch of files - download and convert them."""
     from app.video_helpers import convert_single_exr_file_streaming
@@ -190,7 +206,13 @@ async def process_file_batch(
         return
 
     # Download files in parallel
+    semaphore = asyncio.Semaphore(5)  # Limit concurrent downloads
     download_tasks = []
+    
+    # Create conversion directory
+    conv_folder = Path("conv") / local_folder.name
+    conv_folder.mkdir(parents=True, exist_ok=True)
+    
     for file_info in batch:
         local_file = local_folder / file_info["name"]
         file_queue.mark_processing(str(local_file))
@@ -204,109 +226,34 @@ async def process_file_batch(
         task = download_file_parallel(session, download_url, dl_headers, local_file, semaphore)
         download_tasks.append((task, local_file))
 
-    # Wait for downloads to complete
+    # Wait for downloads to complete and convert
     for task, local_file in download_tasks:
         try:
             success = await task
             if success:
-                # Convert file immediately after download
-                args = (local_file, conv_folder, None, None, None, None, None)  # Simplified args
-                success, _, error = convert_single_exr_file_streaming(args)
-                if success:
-                    file_queue.mark_completed(str(local_file))
-                else:
+                try:
+                    # Convert file immediately after download
+                    success, _, error = convert_single_exr_file_streaming(
+                        (local_file, conv_folder, None, None, None, None, None)
+                    )
+                    if success:
+                        file_queue.mark_completed(str(local_file))
+                    else:
+                        file_queue.mark_failed(str(local_file))
+                        logger.error(f"Failed to convert {local_file}: {error}")
+                except Exception as conv_error:
                     file_queue.mark_failed(str(local_file))
-                    logger.error(f"Failed to convert {local_file}: {error}")
+                    logger.error(f"Error converting {local_file}: {conv_error}")
             else:
                 file_queue.mark_failed(str(local_file))
                 logger.error(f"Failed to download {local_file}")
         except Exception as e:
             file_queue.mark_failed(str(local_file))
             logger.error(f"Error processing {local_file}: {e}")
-
-async def download_exr_folder_parallel(
-    session_dbx: aiohttp.ClientSession,
-    download_url: str,
-    headers_dbx: dict,
-    path: str,
-    local_folder: Path,
-    conv_folder: Path,
-    job_id: str,
-    download_states: dict,
-    stop_downloads: dict,
-    max_concurrent: int = 5
-):
-    """
-    Recursively download and convert EXR files from Dropbox folder with parallel processing.
-    """
-    list_url = "https://api.dropboxapi.com/2/files/list_folder"
-    
-    headers_copy = headers_dbx.copy()
-    if "Dropbox-API-Path-Root" in headers_copy:
-        path_root = headers_copy["Dropbox-API-Path-Root"]
-        if not isinstance(path_root, str):
-            headers_copy["Dropbox-API-Path-Root"] = json.dumps(path_root)
-    
-    async with session_dbx.post(list_url, headers=headers_copy, json={"path": path}) as list_resp:
-        if list_resp.status not in (0, 200):
-            return
-        result = await list_resp.json()
-
-    state = download_states.get(job_id)
-    if state is None:
-        return
-
-    # Initialize file queue
-    file_queue = FileQueue(batch_size=3)
-    
-    # Collect all files
-    for entry in result.get("entries", []):
-        name = entry["name"]
-        if "cryptomatte" in name.lower():
-            continue
             
-        if entry[".tag"] == "file" and name.lower().endswith(".exr"):
-            await file_queue.add(entry)
-            
-        elif entry[".tag"] == "folder":
-            subfolder = local_folder / name
-            conv_subfolder = conv_folder / name
-            subfolder.mkdir(exist_ok=True)
-            conv_subfolder.mkdir(exist_ok=True)
-            
-            await download_exr_folder_parallel(
-                session_dbx,
-                download_url,
-                headers_dbx,
-                entry["path_display"],
-                subfolder,
-                conv_subfolder,
-                job_id,
-                download_states,
-                stop_downloads,
-                max_concurrent
-            )
-            if stop_downloads.get(job_id) and stop_downloads[job_id].is_set():
-                return
-
-    # Process files in batches
-    semaphore = asyncio.Semaphore(max_concurrent)
-    while not file_queue.is_empty:
-        if stop_downloads.get(job_id) and stop_downloads[job_id].is_set():
-            return
-            
-        await process_file_batch(
-            session_dbx,
-            download_url,
-            file_queue,
-            local_folder,
-            conv_folder,
-            semaphore,
-            "config.ocio"
-        )
-        
         # Update progress
         if job_id in download_states:
+            state = download_states[job_id]
             total_files = state.get("total_files", 0)
             downloaded_count = len(file_queue.completed)
             percent = int((downloaded_count / total_files) * 100) if total_files else 0
@@ -322,6 +269,77 @@ async def download_exr_folder_parallel(
             except Exception:
                 pass
 
+async def download_exr_folder_parallel(
+    session_dbx: aiohttp.ClientSession,
+    download_url: str,
+    headers_dbx: dict,
+    path: str,
+    local_folder: Path,
+    job_id: str,
+    download_states: dict,
+    stop_downloads: dict,
+    max_concurrent: int = 5
+):
+    """
+    Recursively downloads EXR files from Dropbox folder with parallel processing.
+    """
+    list_url = "https://api.dropboxapi.com/2/files/list_folder"
+    
+    headers_copy = headers_dbx.copy()
+    if "Dropbox-API-Path-Root" in headers_copy:
+        path_root = headers_copy["Dropbox-API-Path-Root"]
+        if not isinstance(path_root, str):
+            headers_copy["Dropbox-API-Path-Root"] = json.dumps(path_root)
+    
+    async with session_dbx.post(list_url, headers=headers_copy, json={"path": path}) as list_resp:
+        if list_resp.status not in (0, 200):
+            return
+        result = await list_resp.json()
+
+    file_queue = FileQueue(batch_size=max_concurrent)
+    
+    for entry in result.get("entries", []):
+        name = entry["name"].lower()
+        # Skip cryptomatte and conflicted copy files
+        if "cryptomatte" in name or "conflicted copy" in name:
+            continue
+        if entry[".tag"] == "file" and name.endswith(".exr"):
+            await file_queue.add(entry)
+        elif entry[".tag"] == "folder":
+            subfolder = local_folder / entry["name"]
+            subfolder.mkdir(exist_ok=True)
+            await download_exr_folder_parallel(
+                session_dbx,
+                download_url,
+                headers_dbx,
+                entry["path_display"],
+                subfolder,
+                job_id,
+                download_states,
+                stop_downloads,
+                max_concurrent
+            )
+            if stop_downloads.get(job_id) and stop_downloads[job_id].is_set():
+                return
+
+    # Process remaining files in the queue
+    while not file_queue.is_empty:
+        batch = await file_queue.get_batch()
+        if not batch:
+            break
+            
+        # Process batch
+        await process_file_batch(
+            session_dbx,
+            download_url,
+            file_queue,
+            local_folder,
+            job_id,
+            download_states,
+            stop_downloads,
+            headers_dbx
+        )
+
 async def download_exr_folder(
     session_dbx: aiohttp.ClientSession,
     download_url: str,
@@ -336,21 +354,144 @@ async def download_exr_folder(
     Download and convert EXR files from Dropbox folder.
     Uses parallel processing with batching for efficiency.
     """
+    list_url = "https://api.dropboxapi.com/2/files/list_folder"
+    
+    # Create fresh headers for folder listing
+    headers = {
+        "Authorization": f"Bearer {get_fresh_access_token()}",
+        "Dropbox-API-Select-User": settings.dropbox_team_member_id,
+        "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
+        "Content-Type": "application/json"
+    }
+    
+    # Get folder contents
+    async with session_dbx.post(list_url, headers=headers, json={"path": path}) as list_resp:
+        if list_resp.status != 200:
+            logger.error(f"Failed to list folder {path}: {list_resp.status}")
+            return
+        result = await list_resp.json()
+    
+    # Create file queue with larger batch size for parallel processing
+    file_queue = FileQueue(batch_size=5)  # Increased from 3 to 5
+    
+    # Create conversion directory
     conv_folder = Path("conv") / local_folder.name
     conv_folder.mkdir(parents=True, exist_ok=True)
     
-    await download_exr_folder_parallel(
-        session_dbx,
-        download_url,
-        headers_dbx,
-        path,
-        local_folder,
-        conv_folder,
-        job_id,
-        download_states,
-        stop_downloads,
-        max_concurrent=5
-    )
+    # Add files to queue
+    for entry in result.get("entries", []):
+        name = entry["name"].lower()
+        # Skip cryptomatte and conflicted copy files
+        if "cryptomatte" in name or "conflicted copy" in name:
+            continue
+            
+        if entry[".tag"] == "file" and name.endswith(".exr"):
+            await file_queue.add(entry)
+            
+        elif entry[".tag"] == "folder":
+            # Process subfolders recursively
+            subfolder = local_folder / entry["name"]
+            subfolder.mkdir(exist_ok=True)
+            await download_exr_folder(
+                session_dbx, download_url, headers_dbx,
+                entry["path_display"], subfolder, job_id,
+                download_states, stop_downloads
+            )
+            
+            if stop_downloads.get(job_id) and stop_downloads[job_id].is_set():
+                return
+    
+    # Process files in batches with parallel downloads and conversions
+    while not file_queue.is_empty and not (stop_downloads.get(job_id) and stop_downloads[job_id].is_set()):
+        batch = await file_queue.get_batch()
+        if not batch:
+            break
+            
+        # Download files in parallel
+        semaphore = asyncio.Semaphore(5)  # Allow 5 concurrent downloads
+        download_tasks = []
+        
+        for file_info in batch:
+            local_file = local_folder / file_info["name"]
+            file_queue.mark_processing(str(local_file))
+            
+            dl_headers = {
+                "Authorization": f"Bearer {get_fresh_access_token()}",
+                "Dropbox-API-Select-User": settings.dropbox_team_member_id,
+                "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
+                "Dropbox-API-Arg": json.dumps({"path": file_info["path_display"]})
+            }
+            
+            task = download_file_parallel(
+                session_dbx,
+                download_url,
+                dl_headers,
+                local_file,
+                semaphore
+            )
+            download_tasks.append((task, local_file, file_info))
+        
+        # Wait for all downloads in batch to complete
+        download_results = await asyncio.gather(*(task for task, _, _ in download_tasks))
+        
+        # Process downloaded files
+        conversion_tasks = []
+        from app.video_helpers import convert_single_exr_file_streaming
+        
+        for success, (_, local_file, file_info) in zip(download_results, download_tasks):
+            if success:
+                # Convert file immediately after successful download
+                conversion_tasks.append(
+                    asyncio.create_task(
+                        convert_single_exr_file_streaming((local_file, conv_folder, None, None, None, None, None))
+                    )
+                )
+            else:
+                file_queue.mark_failed(str(local_file))
+                logger.error(f"Failed to download {local_file.name}")
+        
+        # Wait for all conversions to complete
+        if conversion_tasks:
+            conversion_results = await asyncio.gather(*conversion_tasks, return_exceptions=True)
+            
+            # Process conversion results
+            for result, (_, local_file, _) in zip(conversion_results, download_tasks):
+                if isinstance(result, Exception):
+                    file_queue.mark_failed(str(local_file))
+                    logger.error(f"Error converting {local_file}: {result}")
+                else:
+                    success, _, error = result
+                    if success:
+                        file_queue.mark_completed(str(local_file))
+                        try:
+                            # Clean up original EXR file after successful conversion
+                            local_file.unlink()
+                        except Exception as e:
+                            logger.warning(f"Failed to delete original file {local_file}: {e}")
+                    else:
+                        file_queue.mark_failed(str(local_file))
+                        logger.error(f"Failed to convert {local_file}: {error}")
+        
+        # Update progress
+        if job_id in download_states:
+            state = download_states[job_id]
+            total_files = state.get("total_files", 0)
+            downloaded_count = len(file_queue.completed)
+            percent = int((downloaded_count / total_files) * 100) if total_files else 0
+            
+            progress_msg = state.get("progress_msg")
+            try:
+                if progress_msg:
+                    stop_kb = state.get("stop_kb")
+                    await progress_msg.edit_text(
+                        f"Step 1: Downloading and converting {percent}% ({downloaded_count}/{total_files})",
+                        reply_markup=stop_kb
+                    )
+            except Exception:
+                pass
+        
+        # Force memory cleanup after each batch
+        gc.collect()
 
 async def upload_video_to_dropbox(video_path: Path, metadata: dict, job_id: Optional[str] = None) -> str:
     """

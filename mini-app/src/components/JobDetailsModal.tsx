@@ -78,7 +78,7 @@ export const JobDetailsModal: React.FC<JobDetailsModalProps> = ({
         {/* Header */}
         <div className="flex items-center justify-between p-6 border-b border-telegram-secondary">
           <div>
-            <h2 className="text-xl font-semibold text-telegram-dark">{job.Props.Name}</h2>
+            <h2 className="text-xl font-semibold text-telegram-dark">{job.Props.Batch}</h2>
             <p className="text-sm text-telegram-gray mt-1">ID: {job._id}</p>
           </div>
           <button

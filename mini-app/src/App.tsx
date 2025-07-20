@@ -106,14 +106,79 @@ function App() {
       if (activeTab === 'jobs') {
         console.log('Loading jobs...');
         const response = await jobsApi.getJobs();
-        console.log('Jobs response:', response.data);
+        const jobs = response.data as Job[];
+        console.log('Jobs response:', jobs);
         
-        // Sort jobs by date
-        const sortedJobs = [...response.data].sort((a, b) => {
-          const dateA = a.Date ? new Date(a.Date).getTime() : 0;
-          const dateB = b.Date ? new Date(b.Date).getTime() : 0;
-          return dateB - dateA;  // Newest first
+        // Group jobs by batch name
+        const grouped: { [key: string]: Job[] } = {};
+        jobs.forEach((job: Job) => {
+          const batch = job.Props.Batch || 'Untitled';
+          if (!grouped[batch]) {
+            grouped[batch] = [];
+          }
+          grouped[batch].push(job);
         });
+
+        // Combine jobs by batch and find max date for each batch
+        const combinedJobs: (Job & { maxDate: number; batchSize: number })[] = [];
+        Object.entries(grouped).forEach(([batch, batchJobs]) => {
+          // Find the most recent date among jobs in this batch
+          const dates = batchJobs
+            .map(j => j.Date ? new Date(j.Date).getTime() : 0)
+            .filter(d => d > 0);
+          const maxDate = dates.length > 0 ? Math.max(...dates) : 0;
+
+          // Determine batch-level status with priority: Active > Pending > Suspended > Failed > Completed > Unknown
+          const statusList = batchJobs.map(j => j.Stat);
+          let batchStat = 0;
+
+          // Если хотя бы одна задача активна - весь batch активный
+          if (statusList.includes(1)) {
+            batchStat = 1;  // Active
+          }
+          // Если нет активных, но есть pending - batch pending
+          else if (statusList.includes(6)) {
+            batchStat = 6;  // Pending
+          }
+          // Если нет активных и pending, но есть suspended - batch suspended
+          else if (statusList.includes(2)) {
+            batchStat = 2;  // Suspended
+          }
+          // Если нет активных, pending и suspended, но есть failed - batch failed
+          else if (statusList.includes(4)) {
+            batchStat = 4;  // Failed
+          }
+          // Если все задачи completed - batch completed
+          else if (statusList.every(s => s === 3)) {
+            batchStat = 3;  // Completed
+          }
+          // В остальных случаях - unknown
+          else {
+            batchStat = 0;  // Unknown
+          }
+
+          // Calculate total tasks and completed chunks
+          const totalTasks = batchJobs.reduce((sum, j) => sum + (j.Props.Tasks || 0), 0);
+          const completedChunks = batchJobs.reduce((sum, j) => sum + (j.CompletedChunks || 0), 0);
+
+          // Use the first job as a base and update its properties
+          const combinedJob = { 
+            ...batchJobs[0],
+            maxDate,
+            batchSize: batchJobs.length,
+            Props: {
+              ...batchJobs[0].Props,
+              Tasks: totalTasks
+            },
+            CompletedChunks: completedChunks,
+            Stat: batchStat
+          };
+
+          combinedJobs.push(combinedJob);
+        });
+
+        // Sort by maxDate descending (newest first)
+        const sortedJobs = combinedJobs.sort((a, b) => b.maxDate - a.maxDate);
         
         setJobs(sortedJobs);
       } else if (activeTab === 'workers') {

@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { Job } from '../types';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'https://example.com/api';
 
@@ -55,9 +56,13 @@ api.interceptors.response.use(
 );
 
 export const jobsApi = {
-  getJobs: () => api.get('/jobs'),
+  getJobs: () => api.get<Job[]>('/jobs'),
   getJobInfo: (jobId: string) => api.get(`/jobs/${jobId}`),
   getJobTasks: (jobId: string) => api.get(`/jobs/${jobId}/tasks`),
+  getJobsByBatch: async (batchName: string): Promise<Job[]> => {
+    const response = await api.get<Job[]>('/jobs');
+    return response.data.filter(job => job.Props.Batch === batchName);
+  },
   requeueJob: (jobId: string) => api.put(`/jobs/${jobId}/requeue`),
   resumeJob: (jobId: string) => api.put(`/jobs/${jobId}/resume`),
   suspendJob: (jobId: string) => api.put(`/jobs/${jobId}/suspend`),
