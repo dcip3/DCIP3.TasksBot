@@ -181,23 +181,28 @@ export const JobCard: React.FC<JobCardProps> = ({
           </div>
         ) : (
           <div className="divide-y divide-tg-secondary-bg">
-            {batchJobs
-              .filter(batchJob => batchJob._id !== job._id)  // Фильтруем здесь, чтобы правильно определять hasBatchJobs
-              .map(batchJob => (
-                <div key={batchJob._id} className="p-4 space-y-3 bg-tg-secondary-bg/50">
-                  <div className="flex items-start justify-between">
-                    <div className="flex-1 min-w-0">
-                      <h3 className="text-sm font-medium text-tg-base truncate">
-                        {batchJob.Props.Name}
-                      </h3>
-                    </div>
-                    <div className="flex items-center space-x-1 ml-2">
-                      <span className="text-lg">{getStatusIcon(batchJob.Stat)}</span>
-                      <span className={`text-xs font-medium ${getStatusColor(batchJob.Stat)}`}>
-                        {getStatusText(batchJob.Stat)}
-                      </span>
-                    </div>
+            {batchJobs.map(batchJob => (
+              <div 
+                key={batchJob._id} 
+                className={`p-4 space-y-3 ${
+                  batchJob._id === job._id 
+                    ? 'bg-tg-secondary-bg/20' // lighter background for current job
+                    : 'bg-tg-secondary-bg/50'
+                }`}
+              >
+                <div className="flex items-start justify-between">
+                  <div className="flex-1 min-w-0">
+                    <h3 className="text-sm font-medium text-tg-base truncate">
+                      {batchJob.Props.Name.split('/').pop() || batchJob.Props.Name}
+                    </h3>
                   </div>
+                  <div className="flex items-center space-x-1 ml-2">
+                    <span className="text-lg">{getStatusIcon(batchJob.Stat)}</span>
+                    <span className={`text-xs font-medium ${getStatusColor(batchJob.Stat)}`}>
+                      {getStatusText(batchJob.Stat)}
+                    </span>
+                  </div>
+                </div>
 
                   <div className="space-y-2">
                     <div className="flex justify-between text-xs text-tg-subtitle">
