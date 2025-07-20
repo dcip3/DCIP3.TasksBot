@@ -213,6 +213,7 @@ async def process_file_batch(
     conv_folder = Path("conv") / local_folder.name
     conv_folder.mkdir(parents=True, exist_ok=True)
     
+    # Prepare download tasks for all files in batch
     for file_info in batch:
         local_file = local_folder / file_info["name"]
         file_queue.mark_processing(str(local_file))
@@ -226,32 +227,42 @@ async def process_file_batch(
         task = download_file_parallel(session, download_url, dl_headers, local_file, semaphore)
         download_tasks.append((task, local_file))
 
-    # Wait for downloads to complete and convert
-    for task, local_file in download_tasks:
+    # Wait for all downloads to complete
+    download_results = await asyncio.gather(*(task for task, _ in download_tasks), return_exceptions=True)
+    
+    # Process downloaded files
+    for i, (download_success, (_, local_file)) in enumerate(zip(download_results, download_tasks)):
         try:
-            success = await task
-            if success:
-                try:
-                    # Convert file immediately after download
-                    success, _, error = convert_single_exr_file_streaming(
-                        (local_file, conv_folder, None, None, None, None, None)
-                    )
-                    if success:
-                        file_queue.mark_completed(str(local_file))
-                    else:
-                        file_queue.mark_failed(str(local_file))
-                        logger.error(f"Failed to convert {local_file}: {error}")
-                except Exception as conv_error:
-                    file_queue.mark_failed(str(local_file))
-                    logger.error(f"Error converting {local_file}: {conv_error}")
-            else:
+            if isinstance(download_success, Exception):
+                logger.error(f"Failed to download {local_file}: {download_success}")
+                file_queue.mark_failed(str(local_file))
+                continue
+                
+            if not download_success:
                 file_queue.mark_failed(str(local_file))
                 logger.error(f"Failed to download {local_file}")
+                continue
+            
+            # Convert file after successful download
+            success, _, error = convert_single_exr_file_streaming(
+                (local_file, conv_folder, None, None, None, None, None)
+            )
+            if success:
+                file_queue.mark_completed(str(local_file))
+                # Remove original file after successful conversion
+                try:
+                    local_file.unlink()
+                except Exception as e:
+                    logger.error(f"Error removing original file {local_file}: {e}")
+            else:
+                file_queue.mark_failed(str(local_file))
+                logger.error(f"Failed to convert {local_file}: {error}")
+                
         except Exception as e:
             file_queue.mark_failed(str(local_file))
             logger.error(f"Error processing {local_file}: {e}")
             
-        # Update progress
+        # Update progress after each file is processed
         if job_id in download_states:
             state = download_states[job_id]
             total_files = state.get("total_files", 0)
