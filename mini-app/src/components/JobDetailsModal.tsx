@@ -123,9 +123,11 @@ export const JobDetailsModal: React.FC<JobDetailsModalProps> = ({
     : 0;
 
   return (
-    <div className="fixed inset-0 flex items-center justify-center z-50 p-4">
-      <div className="absolute inset-0 bg-tg-bg opacity-95" onClick={onClose} />
-      <div className="bg-tg-bg rounded-lg max-w-4xl w-full max-h-[90vh] overflow-y-auto relative border border-tg-secondary-bg shadow-lg">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      {/* Overlay */}
+      <div className="absolute inset-0 bg-black bg-opacity-50" onClick={onClose} />
+      {/* Modal */}
+      <div className="relative z-10 bg-tg-bg rounded-lg max-w-4xl w-full max-h-[90vh] overflow-y-auto border-2 border-tg-secondary-bg shadow-lg">
         {/* Header */}
         <div className="flex items-center justify-between p-6 border-b border-tg-secondary-bg bg-tg-secondary-bg/30">
           <div>
