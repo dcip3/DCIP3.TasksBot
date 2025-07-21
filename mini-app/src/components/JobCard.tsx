@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
-import { Job } from '../types';
+import { Job, Task } from '../types';
 import { Play, Pause, RotateCcw, Trash2, ChevronDown, ChevronUp } from 'lucide-react';
 import { jobsApi } from '../services/api';
+import { JobDetailsModal } from './JobDetailsModal';
 
 interface JobCardProps {
   job: Job;
@@ -64,6 +65,10 @@ export const JobCard: React.FC<JobCardProps> = ({
   const [isExpanded, setIsExpanded] = useState(false);
   const [batchJobs, setBatchJobs] = useState<Job[]>([]);
   const [loading, setLoading] = useState(false);
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [selectedJob, setSelectedJob] = useState<Job | null>(null);
+  const [jobTasks, setJobTasks] = useState<Task[]>([]);
+  const [loadingTasks, setLoadingTasks] = useState(false);
 
   const progress = job.Props.Tasks > 0 
     ? Math.round((job.CompletedChunks / job.Props.Tasks) * 100)
@@ -74,8 +79,9 @@ export const JobCard: React.FC<JobCardProps> = ({
       setLoading(true);
       try {
         const jobs = await jobsApi.getJobsByBatch(job.Props.Batch);
-        // Сохраняем все задачи из batch
-        setBatchJobs(jobs);
+        // Сортируем задачи по дате (от новых к старым)
+        const sortedJobs = jobs.sort((a, b) => new Date(b.Date).getTime() - new Date(a.Date).getTime());
+        setBatchJobs(sortedJobs);
       } catch (error) {
         console.error('Error loading batch jobs:', error);
       } finally {
@@ -85,124 +91,155 @@ export const JobCard: React.FC<JobCardProps> = ({
     setIsExpanded(!isExpanded);
   };
 
+  const handleShowTasks = async (selectedJob: Job) => {
+    setSelectedJob(selectedJob);
+    setLoadingTasks(true);
+    try {
+      const response = await jobsApi.getJobTasks(selectedJob._id);
+      setJobTasks(response.data);
+      setIsModalOpen(true);
+    } catch (error) {
+      console.error('Error loading tasks:', error);
+    } finally {
+      setLoadingTasks(false);
+    }
+  };
+
   // Проверяем, есть ли другие задачи в этом batch
   const hasBatchJobs = batchJobs.length > 1;
 
   return (
-    <div className="bg-tg-section rounded-lg shadow-sm border border-tg-secondary-bg overflow-hidden">
-      <div 
-        className={`p-4 space-y-3 ${job.batchSize && job.batchSize > 1 ? 'cursor-pointer hover:bg-tg-secondary-bg transition-colors' : ''}`}
-        onClick={job.batchSize && job.batchSize > 1 ? handleCardClick : undefined}
-      >
-        <div className="flex items-start justify-between">
-          <div className="flex-1 min-w-0">
-            <div className="flex items-center">
-              <h3 className="text-sm font-medium text-tg-base truncate mr-2">
-                {job.Props.Batch}
-              </h3>
-              {job.batchSize && job.batchSize > 1 && (
-                isExpanded ? (
-                  <ChevronUp className="w-4 h-4 text-tg-hint" />
-                ) : (
-                  <ChevronDown className="w-4 h-4 text-tg-hint" />
-                )
-              )}
+    <>
+      <div className="bg-tg-section rounded-lg shadow-sm border border-tg-secondary-bg overflow-hidden">
+        <div 
+          className="p-4 space-y-3 cursor-pointer hover:bg-tg-secondary-bg transition-colors"
+          onClick={() => {
+            if (job.batchSize && job.batchSize > 1) {
+              handleCardClick();
+            } else {
+              handleShowTasks(job);
+            }
+          }}
+        >
+          {/* Existing card content */}
+          <div className="flex items-start justify-between">
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center">
+                <h3 className="text-sm font-medium text-tg-base truncate mr-2">
+                  {job.Props.Batch}
+                </h3>
+                {job.batchSize && job.batchSize > 1 && (
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleCardClick();
+                    }}
+                    className="p-1 hover:bg-tg-secondary-bg rounded-full transition-colors"
+                  >
+                    {isExpanded ? (
+                      <ChevronUp className="w-4 h-4 text-tg-hint" />
+                    ) : (
+                      <ChevronDown className="w-4 h-4 text-tg-hint" />
+                    )}
+                  </button>
+                )}
+              </div>
+            </div>
+            <div className="flex items-center space-x-1 ml-2">
+              <span className="text-lg">{getStatusIcon(job.Stat)}</span>
+              <span className={`text-xs font-medium ${getStatusColor(job.Stat)}`}>
+                {getStatusText(job.Stat)}
+              </span>
             </div>
           </div>
-          <div className="flex items-center space-x-1 ml-2">
-            <span className="text-lg">{getStatusIcon(job.Stat)}</span>
-            <span className={`text-xs font-medium ${getStatusColor(job.Stat)}`}>
-              {getStatusText(job.Stat)}
-            </span>
-          </div>
-        </div>
 
-        <div className="space-y-2">
-          <div className="flex justify-between text-xs text-tg-subtitle">
-            <span>Progress</span>
-            <span>{progress}% ({job.CompletedChunks}/{job.Props.Tasks})</span>
+          <div className="space-y-2">
+            <div className="flex justify-between text-xs text-tg-subtitle">
+              <span>Progress</span>
+              <span>{progress}% ({job.CompletedChunks}/{job.Props.Tasks})</span>
+            </div>
+            <div className="w-full bg-tg-secondary-bg rounded-full h-2">
+              <div
+                className="bg-tg-button h-2 rounded-full transition-all duration-300"
+                style={{ width: `${progress}%` }}
+              />
+            </div>
           </div>
-          <div className="w-full bg-tg-secondary-bg rounded-full h-2">
-            <div
-              className="bg-tg-button h-2 rounded-full transition-all duration-300"
-              style={{ width: `${progress}%` }}
-            />
-          </div>
-        </div>
 
-        <div className="flex space-x-2 pt-2" onClick={e => e.stopPropagation()}>
-          {job.Stat === 2 && (
-            <button
-              onClick={() => onResume(job._id)}
-              className="flex-1 flex items-center justify-center px-3 py-2 text-xs font-medium text-tg-accent bg-tg-secondary-bg rounded-md hover:opacity-90 transition-opacity"
-            >
-              <Play className="w-4 h-4 mr-1" />
-              Resume
-            </button>
-          )}
-          
-          {job.Stat === 1 && (
-            <button
-              onClick={() => onSuspend(job._id)}
-              className="flex-1 flex items-center justify-center px-3 py-2 text-xs font-medium text-tg-hint bg-tg-secondary-bg rounded-md hover:opacity-90 transition-opacity"
-            >
-              <Pause className="w-4 h-4 mr-1" />
-              Suspend
-            </button>
-          )}
-          
-          <button
-            onClick={() => onRequeue(job._id)}
-            className="flex-1 flex items-center justify-center px-3 py-2 text-xs font-medium bg-tg-button text-tg-button-text rounded-md hover:opacity-90 transition-opacity"
-          >
-            <RotateCcw className="w-4 h-4 mr-1" />
-            Requeue
-          </button>
-          
-          <button
-            onClick={() => onDelete(job._id)}
-            className="flex-1 flex items-center justify-center px-3 py-2 text-xs font-medium text-tg-destructive bg-tg-secondary-bg rounded-md hover:opacity-90 transition-opacity"
-          >
-            <Trash2 className="w-4 h-4 mr-1" />
-            Delete
-          </button>
-        </div>
-      </div>
-
-      {/* Expanded content */}
-      <div 
-        className={`overflow-hidden transition-all duration-300 ${
-          isExpanded ? 'max-h-[1000px]' : 'max-h-0'
-        }`}
-      >
-        {loading ? (
-          <div className="flex justify-center py-4">
-            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-tg-button"></div>
-          </div>
-        ) : (
-          <div className="divide-y divide-tg-secondary-bg">
-            {batchJobs.map(batchJob => (
-              <div 
-                key={batchJob._id} 
-                className={`p-4 space-y-3 ${
-                  batchJob._id === job._id 
-                    ? 'bg-tg-secondary-bg/20' // lighter background for current job
-                    : 'bg-tg-secondary-bg/50'
-                }`}
+          <div className="flex space-x-2 pt-2" onClick={e => e.stopPropagation()}>
+            {job.Stat === 2 && (
+              <button
+                onClick={() => onResume(job._id)}
+                className="flex-1 flex items-center justify-center px-3 py-2 text-xs font-medium text-tg-accent bg-tg-secondary-bg rounded-md hover:opacity-90 transition-opacity"
               >
-                <div className="flex items-start justify-between">
-                  <div className="flex-1 min-w-0">
-                    <h3 className="text-sm font-medium text-tg-base truncate">
-                      {batchJob.Props.Name.split('/').pop() || batchJob.Props.Name}
-                    </h3>
+                <Play className="w-4 h-4 mr-1" />
+                Resume
+              </button>
+            )}
+            
+            {job.Stat === 1 && (
+              <button
+                onClick={() => onSuspend(job._id)}
+                className="flex-1 flex items-center justify-center px-3 py-2 text-xs font-medium text-tg-hint bg-tg-secondary-bg rounded-md hover:opacity-90 transition-opacity"
+              >
+                <Pause className="w-4 h-4 mr-1" />
+                Suspend
+              </button>
+            )}
+            
+            <button
+              onClick={() => onRequeue(job._id)}
+              className="flex-1 flex items-center justify-center px-3 py-2 text-xs font-medium bg-tg-button text-tg-button-text rounded-md hover:opacity-90 transition-opacity"
+            >
+              <RotateCcw className="w-4 h-4 mr-1" />
+              Requeue
+            </button>
+            
+            <button
+              onClick={() => onDelete(job._id)}
+              className="flex-1 flex items-center justify-center px-3 py-2 text-xs font-medium text-tg-destructive bg-tg-secondary-bg rounded-md hover:opacity-90 transition-opacity"
+            >
+              <Trash2 className="w-4 h-4 mr-1" />
+              Delete
+            </button>
+          </div>
+        </div>
+
+        {/* Expanded content */}
+        <div 
+          className={`overflow-hidden transition-all duration-300 ${
+            isExpanded ? 'max-h-[1000px]' : 'max-h-0'
+          }`}
+        >
+          {loading ? (
+            <div className="flex justify-center py-4">
+              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-tg-button"></div>
+            </div>
+          ) : (
+            <div className="divide-y divide-tg-secondary-bg bg-tg-secondary-bg/60">
+              {batchJobs.map(batchJob => (
+                <div 
+                  key={batchJob._id} 
+                  className={`p-4 space-y-3 cursor-pointer hover:bg-tg-secondary-bg transition-colors ${
+                    batchJob._id === job._id 
+                      ? 'bg-tg-secondary-bg/40'
+                      : 'bg-tg-secondary-bg/60'
+                  }`}
+                  onClick={() => handleShowTasks(batchJob)}
+                >
+                  <div className="flex items-start justify-between">
+                    <div className="flex-1 min-w-0">
+                      <h3 className="text-sm font-medium text-tg-base truncate">
+                        {batchJob.Props.Name.split('/').pop() || batchJob.Props.Name}
+                      </h3>
+                    </div>
+                    <div className="flex items-center space-x-1 ml-2">
+                      <span className="text-lg">{getStatusIcon(batchJob.Stat)}</span>
+                      <span className={`text-xs font-medium ${getStatusColor(batchJob.Stat)}`}>
+                        {getStatusText(batchJob.Stat)}
+                      </span>
+                    </div>
                   </div>
-                  <div className="flex items-center space-x-1 ml-2">
-                    <span className="text-lg">{getStatusIcon(batchJob.Stat)}</span>
-                    <span className={`text-xs font-medium ${getStatusColor(batchJob.Stat)}`}>
-                      {getStatusText(batchJob.Stat)}
-                    </span>
-                  </div>
-                </div>
 
                   <div className="space-y-2">
                     <div className="flex justify-between text-xs text-tg-subtitle">
@@ -226,7 +263,7 @@ export const JobCard: React.FC<JobCardProps> = ({
                     </div>
                   </div>
 
-                  <div className="flex space-x-2 pt-2">
+                  <div className="flex space-x-2 pt-2" onClick={e => e.stopPropagation()}>
                     {batchJob.Stat === 2 && (
                       <button
                         onClick={() => onResume(batchJob._id)}
@@ -265,9 +302,26 @@ export const JobCard: React.FC<JobCardProps> = ({
                   </div>
                 </div>
               ))}
-          </div>
-        )}
+            </div>
+          )}
+        </div>
       </div>
-    </div>
+
+      <JobDetailsModal
+        job={selectedJob}
+        tasks={jobTasks}
+        isOpen={isModalOpen}
+        onClose={() => {
+          setIsModalOpen(false);
+          setSelectedJob(null);
+          setJobTasks([]);
+        }}
+        onRequeue={onRequeue}
+        onResume={onResume}
+        onSuspend={onSuspend}
+        onDelete={onDelete}
+        loading={loadingTasks}
+      />
+    </>
   );
 }; 

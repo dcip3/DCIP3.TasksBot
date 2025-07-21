@@ -47,9 +47,14 @@ export interface Task {
   Props: {
     Name: string;
     Status: number;
+    Progress?: string;
   };
   Stat: number;
   Date: string;
+  Frames?: string;
+  Prog?: string;
+  StartRen?: string;
+  Comp?: string;
 }
 
 export interface User {
