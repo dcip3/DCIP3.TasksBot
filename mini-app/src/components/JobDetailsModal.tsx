@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import { Job, Task } from '../types';
 import { X, Play, Pause, RotateCcw, Trash2, Eye } from 'lucide-react';
 
@@ -116,6 +116,18 @@ export const JobDetailsModal: React.FC<JobDetailsModalProps> = ({
   onDelete,
   loading = false,
 }) => {
+  // Prevent background scroll when modal is open
+  useEffect(() => {
+    if (isOpen) {
+      document.body.style.overflow = 'hidden';
+    } else {
+      document.body.style.overflow = '';
+    }
+    return () => {
+      document.body.style.overflow = '';
+    };
+  }, [isOpen]);
+
   if (!isOpen || !job) return null;
 
   const progress = job.Props.Tasks > 0 
