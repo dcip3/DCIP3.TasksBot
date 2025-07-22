@@ -10,6 +10,9 @@ import aiohttp
 import requests
 from aiohttp import ClientTimeout
 import gc
+import functools
+import threading
+from app.core.bot_core import aiosession
 
 from app.core.config import settings
 
@@ -52,25 +55,70 @@ def get_fresh_access_token():
     _dropbox_access_token_expires_at = now + expires_in
     return _dropbox_access_token
 
-async def fetch_dropbox_metadata(session_dbx: aiohttp.ClientSession, dropbox_path: str, headers_dbx: dict) -> dict:
-    """
-    Получает метаданные объекта в Dropbox по указанному пути.
-    """
+# In-memory кэш с TTL
+class TTLCache:
+    def __init__(self, ttl_seconds=180):
+        self.ttl = ttl_seconds
+        self._cache = {}
+        self._lock = threading.Lock()
+    def get(self, key):
+        with self._lock:
+            v = self._cache.get(key)
+            if not v:
+                return None
+            value, expires = v
+            if time.time() > expires:
+                del self._cache[key]
+                return None
+            return value
+    def set(self, key, value):
+        with self._lock:
+            self._cache[key] = (value, time.time() + self.ttl)
+    def clear(self):
+        with self._lock:
+            self._cache.clear()
+
+list_folder_cache = TTLCache(ttl_seconds=180)
+metadata_cache = TTLCache(ttl_seconds=180)
+
+def cache_key_list_folder(path):
+    return f"list_folder:{path}"
+
+def cache_key_metadata(path):
+    return f"metadata:{path}"
+
+async def fetch_dropbox_metadata(session_dbx, dropbox_path: str, headers_dbx: dict) -> dict:
+    key = cache_key_metadata(dropbox_path)
+    cached = metadata_cache.get(key)
+    if cached:
+        return cached
     meta_url = "https://api.dropboxapi.com/2/files/get_metadata"
-    
-    # Create fresh headers for metadata request
     headers = {
         "Authorization": f"Bearer {get_fresh_access_token()}",
         "Dropbox-API-Select-User": settings.dropbox_team_member_id,
         "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
         "Content-Type": "application/json"
     }
-    
     async with session_dbx.post(meta_url, headers=headers, json={"path": dropbox_path}) as resp:
         if resp.status != 200:
             text = await resp.text()
             raise RuntimeError(f"Error getting metadata: {text}")
-        return await resp.json()
+        result = await resp.json()
+        metadata_cache.set(key, result)
+        return result
+
+async def list_folder_cached(session_dbx, path, headers_dbx):
+    key = cache_key_list_folder(path)
+    cached = list_folder_cache.get(key)
+    if cached:
+        return cached
+    list_url = "https://api.dropboxapi.com/2/files/list_folder"
+    async with session_dbx.post(list_url, headers=headers_dbx, json={"path": path}) as list_resp:
+        if list_resp.status not in (0, 200):
+            return None
+        result = await list_resp.json()
+        list_folder_cache.set(key, result)
+        return result
 
 async def count_exr_files(session_dbx: aiohttp.ClientSession, path: str, headers_dbx: dict) -> int:
     """
@@ -102,8 +150,9 @@ async def count_exr_files(session_dbx: aiohttp.ClientSession, path: str, headers
             count += await count_exr_files(session_dbx, entry["path_display"], headers_dbx)
     return count
 
+# В FileQueue по умолчанию batch_size=8
 class FileQueue:
-    def __init__(self, batch_size: int = 3):
+    def __init__(self, batch_size: int = 8):
         self.queue: asyncio.Queue = asyncio.Queue()
         self.batch_size = batch_size
         self.processing: List[str] = []
@@ -244,14 +293,12 @@ async def process_file_batch(
                 continue
             
             # Convert file after successful download
-            success, _, error = convert_single_exr_file_streaming(
-                (local_file, conv_folder, None, None, None, None, None)
-            )
+            success, _, error = await asyncio.to_thread(convert_single_exr_file_streaming, (local_file, conv_folder, None, None, None, None, None))
             if success:
                 file_queue.mark_completed(str(local_file))
                 # Remove original file after successful conversion
                 try:
-                    local_file.unlink()
+                    await asyncio.to_thread(local_file.unlink)
                 except Exception as e:
                     logger.error(f"Error removing original file {local_file}: {e}")
             else:
@@ -289,23 +336,15 @@ async def download_exr_folder_parallel(
     job_id: str,
     download_states: dict,
     stop_downloads: dict,
-    max_concurrent: int = 5
+    max_concurrent: int = 8
 ):
     """
     Recursively downloads EXR files from Dropbox folder with parallel processing.
     """
-    list_url = "https://api.dropboxapi.com/2/files/list_folder"
-    
-    headers_copy = headers_dbx.copy()
-    if "Dropbox-API-Path-Root" in headers_copy:
-        path_root = headers_copy["Dropbox-API-Path-Root"]
-        if not isinstance(path_root, str):
-            headers_copy["Dropbox-API-Path-Root"] = json.dumps(path_root)
-    
-    async with session_dbx.post(list_url, headers=headers_copy, json={"path": path}) as list_resp:
-        if list_resp.status not in (0, 200):
-            return
-        result = await list_resp.json()
+    # Используем list_folder_cached вместо прямого запроса
+    result = await list_folder_cached(session_dbx, path, headers_dbx)
+    if not result:
+        return
 
     file_queue = FileQueue(batch_size=max_concurrent)
     
@@ -365,25 +404,13 @@ async def download_exr_folder(
     Download and convert EXR files from Dropbox folder.
     Uses parallel processing with batching for efficiency.
     """
-    list_url = "https://api.dropboxapi.com/2/files/list_folder"
-    
-    # Create fresh headers for folder listing
-    headers = {
-        "Authorization": f"Bearer {get_fresh_access_token()}",
-        "Dropbox-API-Select-User": settings.dropbox_team_member_id,
-        "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
-        "Content-Type": "application/json"
-    }
-    
-    # Get folder contents
-    async with session_dbx.post(list_url, headers=headers, json={"path": path}) as list_resp:
-        if list_resp.status != 200:
-            logger.error(f"Failed to list folder {path}: {list_resp.status}")
-            return
-        result = await list_resp.json()
+    # Используем list_folder_cached вместо прямого запроса
+    result = await list_folder_cached(session_dbx, path, headers_dbx)
+    if not result:
+        return
     
     # Create file queue with larger batch size for parallel processing
-    file_queue = FileQueue(batch_size=5)  # Increased from 3 to 5
+    file_queue = FileQueue(batch_size=8)  # Increased from 3 to 5
     
     # Create conversion directory
     conv_folder = Path("conv") / local_folder.name
@@ -454,7 +481,7 @@ async def download_exr_folder(
                 # Convert file immediately after successful download
                 conversion_tasks.append(
                     asyncio.create_task(
-                        convert_single_exr_file_streaming((local_file, conv_folder, None, None, None, None, None))
+                        asyncio.to_thread(convert_single_exr_file_streaming, (local_file, conv_folder, None, None, None, None, None))
                     )
                 )
             else:
@@ -476,7 +503,7 @@ async def download_exr_folder(
                         file_queue.mark_completed(str(local_file))
                         try:
                             # Clean up original EXR file after successful conversion
-                            local_file.unlink()
+                            await asyncio.to_thread(local_file.unlink)
                         except Exception as e:
                             logger.warning(f"Failed to delete original file {local_file}: {e}")
                     else:

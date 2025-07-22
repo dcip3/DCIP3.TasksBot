@@ -23,7 +23,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from app.core.config import settings
-from app.core.bot_core import bot, dp
+from app.core.bot_core import bot, dp, init_aiosession, close_aiosession
 from app.core.database import init_db, close_db
 
 logger = logging.getLogger(__name__)
@@ -482,6 +482,9 @@ async def on_startup(bot):
     asyncio.create_task(job_progress_watcher(bot))
     logger.info("Job progress watcher started")
 
+    await init_aiosession()
+    logger.info("aiohttp session initialized")
+
 
 async def on_shutdown(bot):
     """
@@ -503,6 +506,9 @@ async def on_shutdown(bot):
     # Cleanup temp files
     cleanup_temp_and_conv()
     logger.info("Temp files cleaned up")
+
+    await close_aiosession()
+    logger.info("aiohttp session closed")
 
 
 async def job_progress_watcher(bot):

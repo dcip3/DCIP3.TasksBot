@@ -11,6 +11,7 @@ from typing import Dict, Set, Any, Tuple
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 from app.core.config import settings
+import aiohttp
 
 # Bot and dispatcher instances
 bot = Bot(token=settings.tg_api_token)
@@ -23,4 +24,20 @@ stop_downloads: Dict[str, bool] = {}
 notified_jobs: Set[Tuple[str, int]] = set()  # Now stores (job_id, user_id) pairs
 active_realtime_tasks: Dict[str, asyncio.Task] = {}
 current_downloads: int = 0
-conversion_semaphore = asyncio.Semaphore(1) 
+conversion_semaphore = asyncio.Semaphore(1)
+
+# Глобальная aiohttp-сессия для Dropbox и других API
+aiosession: aiohttp.ClientSession | None = None
+
+async def init_aiosession():
+    global aiosession
+    if aiosession is None:
+        timeout = aiohttp.ClientTimeout(total=3600)
+        connector = aiohttp.TCPConnector(limit=100, limit_per_host=30)
+        aiosession = aiohttp.ClientSession(timeout=timeout, connector=connector)
+
+async def close_aiosession():
+    global aiosession
+    if aiosession:
+        await aiosession.close()
+        aiosession = None 

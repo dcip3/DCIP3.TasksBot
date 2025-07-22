@@ -44,48 +44,27 @@ async def process_batch(
     Processes a batch of files: downloads, converts, and removes source files.
     """
     converted_files = []
-    
-    # Download batch files
     async with semaphore:
         download_tasks = []
         for url, headers, local_path in batch:
             task = download_exr_file(session, url, headers, local_path)
             download_tasks.append((task, local_path))
-        
-        # Wait for all downloads in the batch to complete
         results = await asyncio.gather(*(task for task, _ in download_tasks))
-        
-        # Convert successfully downloaded files
+        # Асинхронная конвертация и удаление
+        conv_tasks = []
         for success, (_, local_path) in zip(results, download_tasks):
             if success:
-                try:
-                    # Get dimensions from the first file
-                    exr = OpenEXR.InputFile(str(local_path))
-                    header = exr.header()
-                    dw = header['dataWindow']
-                    width = dw.max.x - dw.min.x + 1
-                    height = dw.max.y - dw.min.y + 1
-                    exr.close()
-                    
-                    # Convert file
-                    success, _, error = convert_single_exr_file_streaming(
-                        (local_path, conv_root, cpu_processor, width, height, None, None)
-                    )
-                    if success:
-                        jpg_path = conv_root / f"{local_path.stem}.jpg"
-                        converted_files.append(jpg_path)
-                    else:
-                        logger.error(f"Failed to convert {local_path}: {error}")
-                except Exception as e:
-                    logger.error(f"Error processing {local_path}: {e}")
-                finally:
-                    # Delete source file regardless of conversion result
+                async def convert_and_cleanup(local_file=local_path):
                     try:
-                        if local_path.exists():
-                            local_path.unlink()
+                        # Конвертация через to_thread
+                        jpg_path = conv_root / f"{local_file.stem}.jpg"
+                        await asyncio.to_thread(convert_single_exr_file_streaming, (local_file, conv_root, cpu_processor, None, None, None, None))
+                        converted_files.append(jpg_path)
+                        await asyncio.to_thread(local_file.unlink)
                     except Exception as e:
-                        logger.warning(f"Failed to delete source file {local_path}: {e}")
-    
+                        logger.error(f"Error processing {local_file}: {e}")
+                conv_tasks.append(convert_and_cleanup())
+        await asyncio.gather(*conv_tasks)
     return converted_files
 
 def convert_single_exr_file_streaming(args):
@@ -319,7 +298,7 @@ async def convert_exr_folder_to_srgb_optimized(
     source: Union[List[Tuple[str, dict, Path]], Path],
     conv_root: Path,
     ocio_config_path: str,
-    batch_size: int = 5
+    batch_size: int = 8
 ) -> List[Path]:
     """
     Converts all EXR files from ACEScg to sRGB and saves them as JPG.
@@ -377,33 +356,28 @@ async def convert_exr_folder_to_srgb_optimized(
         for i in range(0, len(exr_files), batch_size):
             batch = exr_files[i:i + batch_size]
             logger.info(f"Processing batch {i//batch_size + 1}/{(len(exr_files) + batch_size - 1)//batch_size}")
-            
-            # Convert batch
+            conv_tasks = []
             for exr_file in batch:
-                try:
-                    # Get dimensions
-                    exr = OpenEXR.InputFile(str(exr_file))
-                    header = exr.header()
-                    dw = header['dataWindow']
-                    width = dw.max.x - dw.min.x + 1
-                    height = dw.max.y - dw.min.y + 1
-                    exr.close()
-                    
-                    # Convert file
-                    success, _, error = convert_single_exr_file_streaming(
-                        (exr_file, conv_root, cpu_processor, width, height, None, None)
-                    )
-                    if success:
-                        jpg_path = conv_root / f"{exr_file.stem}.jpg"
-                        converted_files.append(jpg_path)
-                    else:
-                        logger.error(f"Failed to convert {exr_file}: {error}")
-                except Exception as e:
-                    logger.error(f"Error processing {exr_file}: {e}")
-            
-            # Force memory cleanup after each batch
+                async def convert_and_cleanup(local_file=exr_file):
+                    try:
+                        exr = OpenEXR.InputFile(str(local_file))
+                        header = exr.header()
+                        dw = header['dataWindow']
+                        width = dw.max.x - dw.min.x + 1
+                        height = dw.max.y - dw.min.y + 1
+                        exr.close()
+                        success, _, error = await asyncio.to_thread(convert_single_exr_file_streaming, (local_file, conv_root, cpu_processor, width, height, None, None))
+                        if success:
+                            jpg_path = conv_root / f"{local_file.stem}.jpg"
+                            converted_files.append(jpg_path)
+                            await asyncio.to_thread(local_file.unlink)
+                        else:
+                            logger.error(f"Failed to convert {local_file}: {error}")
+                    except Exception as e:
+                        logger.error(f"Error processing {local_file}: {e}")
+                conv_tasks.append(convert_and_cleanup())
+            await asyncio.gather(*conv_tasks)
             gc.collect()
-                
         return converted_files
     
     # Handle remote file list case

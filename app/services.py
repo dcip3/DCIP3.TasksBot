@@ -22,6 +22,7 @@ from app.dropbox_helpers import (
     upload_video_to_dropbox
 )
 from app.video_helpers import convert_exr_folder_to_srgb_optimized, assemble_video_from_jpg
+from app.core.bot_core import aiosession
 
 logger = logging.getLogger(__name__)
 
@@ -450,6 +451,12 @@ async def delete_job_by_user_id(telegram_user_id: int, job_id: str) -> bool:
 # === DROPBOX INTEGRATION FUNCTIONS ===
 # ============================================================================
 
+# В download_job_folder и других функциях Dropbox используем глобальную сессию
+def get_dropbox_session():
+    if aiosession is None:
+        raise RuntimeError("aiosession is not initialized")
+    return aiosession
+
 async def download_job_folder(login: str, password: str, job_id: str) -> Optional[List[Tuple[str, dict, Path]]]:
     """
     Get list of files to download from Dropbox.
@@ -504,55 +511,55 @@ async def download_job_folder(login: str, password: str, job_id: str) -> Optiona
             "Content-Type": "application/json"
         }
         
-        async with aiohttp.ClientSession() as session_dbx:
-            # Get metadata
-            metadata = await fetch_dropbox_metadata(session_dbx, dropbox_path, headers_dbx)
+        session_dbx = get_dropbox_session()
+        # Get metadata
+        metadata = await fetch_dropbox_metadata(session_dbx, dropbox_path, headers_dbx)
             
-            if metadata.get(".tag") == "file":
-                logger.error("File download not supported for preview")
-                return None
-            elif metadata.get(".tag") != "folder":
-                logger.error("Unsupported metadata type")
-                return None
+        if metadata.get(".tag") == "file":
+            logger.error("File download not supported for preview")
+            return None
+        elif metadata.get(".tag") != "folder":
+            logger.error("Unsupported metadata type")
+            return None
                 
-            exr_folder_name = metadata["name"]
-            # Use job_id to make the path unique
-            local_root = temp_dir / f"{exr_folder_name}_{job_id}"
-            local_root.mkdir(exist_ok=True)
+        exr_folder_name = metadata["name"]
+        # Use job_id to make the path unique
+        local_root = temp_dir / f"{exr_folder_name}_{job_id}"
+        local_root.mkdir(exist_ok=True)
             
-            # List files in folder
-            list_url = "https://api.dropboxapi.com/2/files/list_folder"
-            async with session_dbx.post(list_url, headers=headers_dbx, json={"path": metadata["path_display"]}) as list_resp:
-                if list_resp.status != 200:
-                    logger.error(f"Failed to list folder: {list_resp.status}")
-                    return None
-                result = await list_resp.json()
-            
-            # Prepare file list for download
-            download_url = "https://content.dropboxapi.com/2/files/download"
-            file_list = []
-            
-            for entry in result.get("entries", []):
-                name = entry["name"].lower()
-                if "cryptomatte" in name or "conflicted copy" in name:
-                    continue
-                if entry[".tag"] == "file" and name.endswith(".exr"):
-                    api_args = {"path": entry["path_display"]}
-                    headers = {
-                        "Authorization": f"Bearer {get_fresh_access_token()}",
-                        "Dropbox-API-Select-User": settings.dropbox_team_member_id,
-                        "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
-                        "Dropbox-API-Arg": json.dumps(api_args)
-                    }
-                    local_path = local_root / entry["name"]
-                    file_list.append((download_url, headers, local_path))
-            
-            if not file_list:
-                logger.error("No valid EXR files found in folder")
+        # List files in folder
+        list_url = "https://api.dropboxapi.com/2/files/list_folder"
+        async with session_dbx.post(list_url, headers=headers_dbx, json={"path": metadata["path_display"]}) as list_resp:
+            if list_resp.status != 200:
+                logger.error(f"Failed to list folder: {list_resp.status}")
                 return None
+            result = await list_resp.json()
+        
+        # Prepare file list for download
+        download_url = "https://content.dropboxapi.com/2/files/download"
+        file_list = []
+            
+        for entry in result.get("entries", []):
+            name = entry["name"].lower()
+            if "cryptomatte" in name or "conflicted copy" in name:
+                continue
+            if entry[".tag"] == "file" and name.endswith(".exr"):
+                api_args = {"path": entry["path_display"]}
+                headers = {
+                    "Authorization": f"Bearer {get_fresh_access_token()}",
+                    "Dropbox-API-Select-User": settings.dropbox_team_member_id,
+                    "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
+                    "Dropbox-API-Arg": json.dumps(api_args)
+                }
+                local_path = local_root / entry["name"]
+                file_list.append((download_url, headers, local_path))
+        
+        if not file_list:
+            logger.error("No valid EXR files found in folder")
+            return None
                 
-            logger.info(f"Found {len(file_list)} valid EXR files to download")
-            return file_list
+        logger.info(f"Found {len(file_list)} valid EXR files to download")
+        return file_list
             
     except Exception as e:
         logger.error(f"Error preparing download list for job {job_id}: {e}")
@@ -631,16 +638,16 @@ async def create_video_from_job(login: str, password: str, job_id: str) -> Optio
             "Content-Type": "application/json"
         }
         
-        async with aiohttp.ClientSession() as session_dbx:
-            metadata = await fetch_dropbox_metadata(session_dbx, dropbox_path, headers_dbx)
-            if not metadata:
-                logger.error("Failed to get metadata for upload")
+        session_dbx = get_dropbox_session()
+        async with session_dbx.post(f"{settings.base_api_url}/files/upload", headers=headers_dbx, data=FSInputFile(Path(video_path))) as resp:
+            if resp.status != 200:
+                logger.error(f"Failed to upload video to Dropbox: {resp.status}")
                 return None
                 
-            # Upload video to Dropbox
-            dropbox_video_path = await upload_video_to_dropbox(Path(video_path), metadata, job_id)
+            # Get the final path from the response headers
+            dropbox_video_path = resp.headers.get("X-Dropbox-Path")
             if not dropbox_video_path:
-                logger.error("Failed to upload video to Dropbox")
+                logger.error("Dropbox upload response missing X-Dropbox-Path header")
                 return None
                 
             logger.info(f"Video uploaded to Dropbox: {dropbox_video_path}")
@@ -697,34 +704,34 @@ async def check_video_exists_in_dropbox(login: str, password: str, job_id: str) 
             "Content-Type": "application/json"
         }
         
-        async with aiohttp.ClientSession() as session_dbx:
-            # Get metadata for the folder
-            metadata = await fetch_dropbox_metadata(session_dbx, dropbox_path, headers_dbx)
+        session_dbx = get_dropbox_session()
+        # Get metadata for the folder
+        metadata = await fetch_dropbox_metadata(session_dbx, dropbox_path, headers_dbx)
             
-            if metadata.get(".tag") != "folder":
-                logger.error("Not a folder")
-                return None
-                
-            # Check if video exists in the same folder
-            exr_parent = str(PurePosixPath(metadata["path_display"]).parent)
-            video_filename = f"{metadata['name']}.mp4"
-            video_dropbox_path = f"{exr_parent}/{video_filename}"
-            
-            try:
-                # Try to get metadata for the video file
-                video_metadata = await fetch_dropbox_metadata(session_dbx, video_dropbox_path, headers_dbx)
-                if video_metadata.get(".tag") == "file":
-                    return {
-                        "exists": True,
-                        "filename": video_filename,
-                        "dropbox_path": video_dropbox_path,
-                        "metadata": video_metadata
-                    }
-            except Exception:
-                # Video doesn't exist
-                pass
-                
+        if metadata.get(".tag") != "folder":
+            logger.error("Not a folder")
             return None
+                
+        # Check if video exists in the same folder
+        exr_parent = str(PurePosixPath(metadata["path_display"]).parent)
+        video_filename = f"{metadata['name']}.mp4"
+        video_dropbox_path = f"{exr_parent}/{video_filename}"
+            
+        try:
+            # Try to get metadata for the video file
+            video_metadata = await fetch_dropbox_metadata(session_dbx, video_dropbox_path, headers_dbx)
+            if video_metadata.get(".tag") == "file":
+                return {
+                    "exists": True,
+                    "filename": video_filename,
+                    "dropbox_path": video_dropbox_path,
+                    "metadata": video_metadata
+                }
+        except Exception:
+            # Video doesn't exist
+            pass
+                
+        return None
             
     except Exception as e:
         logger.error(f"Error checking video existence for job {job_id}: {e}")
@@ -769,12 +776,12 @@ async def download_video_from_dropbox(login: str, password: str, job_id: str) ->
             "Dropbox-API-Arg": json.dumps({"path": video_info["dropbox_path"]})
         }
         
-        async with aiohttp.ClientSession() as session_dbx:
-            async with session_dbx.post(download_url, headers=dl_headers) as resp:
-                if resp.status != 200:
-                    text = await resp.text()
-                    logger.error(f"Error downloading video: {text}")
-                    return None
+        session_dbx = get_dropbox_session()
+        async with session_dbx.post(download_url, headers=dl_headers) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                logger.error(f"Error downloading video: {text}")
+                return None
                     
                 # Use the original filename for local storage
                 filename = video_info["filename"]
