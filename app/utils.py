@@ -425,6 +425,13 @@ def get_video_duration(video_path: Path) -> Optional[float]:
         return None
 
 
+def make_progress_bar(percent: int, width: int = 10) -> str:
+    """Return a simple unicode progress bar string."""
+    filled = int(width * percent / 100)
+    empty = width - filled
+    return '█' * filled + '░' * empty
+
+
 # ============================================================================
 # === INITIALIZATION FUNCTIONS ===
 # ============================================================================

@@ -792,18 +792,18 @@ async def download_video_from_dropbox(login: str, password: str, job_id: str) ->
                 text = await resp.text()
                 logger.error(f"Error downloading video: {text}")
                 return None
-                    
-                # Use the original filename for local storage
-                filename = video_info["filename"]
-                temp_path = temp_dir / filename
-                temp_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Use the original filename for local storage
+            filename = video_info["filename"]
+            temp_path = temp_dir / filename
+            temp_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            with open(temp_path, "wb") as f:
+                data = await resp.read()
+                f.write(data)
                 
-                with open(temp_path, "wb") as f:
-                    data = await resp.read()
-                    f.write(data)
-                    
-                logger.info(f"Video downloaded to {temp_path}")
-                return (str(temp_path), video_info["dropbox_path"])
+            logger.info(f"Video downloaded to {temp_path}")
+            return (str(temp_path), video_info["dropbox_path"])
                 
     except Exception as e:
         logger.error(f"Error downloading video for job {job_id}: {e}")

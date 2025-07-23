@@ -60,7 +60,6 @@ async def process_batch(
                         jpg_path = conv_root / f"{local_file.stem}.jpg"
                         await asyncio.to_thread(convert_single_exr_file_streaming, (local_file, conv_root, cpu_processor, None, None, None, None))
                         converted_files.append(jpg_path)
-                        await asyncio.to_thread(local_file.unlink)
                     except Exception as e:
                         logger.error(f"Error processing {local_file}: {e}")
                 conv_tasks.append(convert_and_cleanup())
@@ -370,7 +369,6 @@ async def convert_exr_folder_to_srgb_optimized(
                         if success:
                             jpg_path = conv_root / f"{local_file.stem}.jpg"
                             converted_files.append(jpg_path)
-                            await asyncio.to_thread(local_file.unlink)
                         else:
                             logger.error(f"Failed to convert {local_file}: {error}")
                     except Exception as e:
@@ -432,14 +430,6 @@ async def convert_exr_folder_to_srgb_optimized(
                         logger.error(f"Failed to convert {local_path}: {error}")
                 except Exception as e:
                     logger.error(f"Error processing {local_path}: {e}")
-                finally:
-                    # Always try to delete the source file after processing
-                    try:
-                        if local_path.exists():
-                            local_path.unlink()
-                            logger.debug(f"Deleted source file: {local_path}")
-                    except Exception as del_e:
-                        logger.warning(f"Failed to delete file {local_path}: {del_e}")
             
             # Force memory cleanup after each batch
             gc.collect()

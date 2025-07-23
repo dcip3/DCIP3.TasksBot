@@ -24,6 +24,11 @@ from app.services import (
     requeue_job_by_user_id, resume_job_by_user_id, suspend_job_by_user_id, delete_job_by_user_id,
     download_job_folder, create_video_from_job, check_video_exists_in_dropbox, download_video_from_dropbox
 )
+from app.dropbox_helpers import download_exr_folder, fetch_dropbox_metadata, upload_video_to_dropbox
+from app.core.bot_core import download_states, stop_downloads
+import json
+from app.video_helpers import assemble_video_from_jpg
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -915,34 +920,92 @@ async def create_new_video_process(callback_query: CallbackQuery, login: str, pa
         progress_msg = await callback_query.message.answer("🔍 Starting preview generation...")
         
         try:
-            # Step 1: Download files
+            # Step 1: Download files and convert with progress bar
             await progress_msg.edit_text("📥 Step 1: Downloading files from Dropbox...")
-            local_path = await download_job_folder(login, password, job_id)
-            
-            if not local_path:
-                await progress_msg.edit_text("❌ Failed to download job files")
+            # Prepare Dropbox session and headers
+            import aiohttp
+            from app.core.config import settings
+            from app.services import get_job_info, get_dropbox_session
+            job_info = await get_job_info(login, password, job_id)
+            if not job_info:
+                await progress_msg.edit_text("❌ Failed to get job info")
                 return
-            
-            # Step 2: Create video
+            outdirs = job_info.get("OutDir", [])
+            if not outdirs:
+                await progress_msg.edit_text("❌ No OutDir found for job")
+                return
+            fullpath = outdirs[0]
+            idx = fullpath.find(settings.dropbox_root_marker)
+            if idx == -1:
+                await progress_msg.edit_text("❌ Dropbox root marker not found in path")
+                return
+            trimmed = fullpath[idx:]
+            dropbox_path = "/" + trimmed.replace("\\", "/").lstrip("/")
+            from pathlib import Path
+            temp_dir = Path("temp")
+            temp_dir.mkdir(exist_ok=True)
+            exr_folder_name = Path(dropbox_path).parts[-1]
+            if not exr_folder_name:
+                exr_folder_name = job_id
+            local_root = temp_dir / f"{exr_folder_name}_{job_id}"
+            local_root.mkdir(exist_ok=True)
+            # Prepare Dropbox headers
+            from app.dropbox_helpers import get_fresh_access_token
+            headers_dbx = {
+                "Authorization": f"Bearer {get_fresh_access_token()}",
+                "Dropbox-API-Select-User": settings.dropbox_team_member_id,
+                "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
+                "Content-Type": "application/json"
+            }
+            session_dbx = await get_dropbox_session()
+            # List files to get total count
+            list_url = "https://api.dropboxapi.com/2/files/list_folder"
+            async with session_dbx.post(list_url, headers=headers_dbx, json={"path": dropbox_path}) as list_resp:
+                if list_resp.status != 200:
+                    await progress_msg.edit_text(f"❌ Failed to list folder: {list_resp.status}")
+                    return
+                result = await list_resp.json()
+            total_files = sum(1 for entry in result.get("entries", []) if entry[".tag"] == "file" and entry["name"].lower().endswith(".exr") and "cryptomatte" not in entry["name"].lower() and "conflicted copy" not in entry["name"].lower())
+            # Setup download_states for progress bar
+            download_states[job_id] = {
+                "progress_msg": progress_msg,
+                "total_files": total_files,
+                "stop_kb": None  # Add stop button if needed
+            }
+            stop_downloads[job_id] = None
+            # Start download and conversion with progress bar
+            await download_exr_folder(
+                session_dbx,
+                "https://content.dropboxapi.com/2/files/download",
+                headers_dbx,
+                dropbox_path,
+                local_root,
+                job_id,
+                download_states,
+                stop_downloads
+            )
+            # Step 2: Create video from already converted JPGs
             await progress_msg.edit_text("🎬 Step 2: Converting EXR files and creating video...")
-            video_result = await create_video_from_job(login, password, job_id)
-            
-            if not video_result:
+            conv_dir = Path("conv") / f"{exr_folder_name}_{job_id}"
+            video_path = assemble_video_from_jpg(conv_dir, str(exr_folder_name))
+            if not video_path:
                 await progress_msg.edit_text("❌ Failed to create video")
                 return
-            
-            # video_result is now a tuple: (video_path, dropbox_path)
-            video_path, dropbox_path = video_result
-            
+            # Upload video to Dropbox and get Dropbox path
+            try:
+                # Fetch EXR folder metadata for correct Dropbox path
+                metadata = await fetch_dropbox_metadata(session_dbx, dropbox_path, headers_dbx)
+                dropbox_video_path = await upload_video_to_dropbox(Path(video_path), metadata, job_id)
+            except Exception as e:
+                logger.error(f"Error uploading video to Dropbox: {e}")
+                dropbox_video_path = dropbox_path  # fallback for caption
             # Step 3: Check file size and compress if needed for Telegram (50MB limit)
             await progress_msg.edit_text("📏 Step 3: Checking file size...")
             from app.video_helpers import get_file_size_mb, compress_video_if_needed
             from pathlib import Path
-            
             video_path_obj = Path(video_path)
             video_size_mb = get_file_size_mb(video_path_obj)
             logger.info(f"Video size: {video_size_mb:.2f} MB")
-            
             # Compress video if it's larger than 45MB (safe margin for Telegram's 50MB limit)
             if video_size_mb > 45.0:
                 await progress_msg.edit_text(f"🗜️ Step 3.5: Compressing video ({video_size_mb:.1f} MB → target: <45 MB)...")
@@ -952,43 +1015,31 @@ async def create_new_video_process(callback_query: CallbackQuery, login: str, pa
             else:
                 final_video_path = video_path_obj
                 final_size_mb = video_size_mb
-            
             await progress_msg.edit_text(f"📤 Step 4: Sending video ({final_size_mb:.1f} MB)...")
-            
             try:
                 from aiogram.types import FSInputFile
-                # Send as video for better playback experience
-                # This provides native video controls and preview
                 video_filename = final_video_path.name
-                
                 # Extract project name from dropbox path
-                # Example: /Team Folder/Project/render/shot_v01/Redshift_ROP1.mp4
-                # We want to extract: shot_v01
                 project_name = video_filename.replace('.mp4', '')  # Default fallback
                 try:
-                    # Split path and look for the render folder
-                    path_parts = dropbox_path.split('/')
+                    path_parts = dropbox_video_path.split('/')
                     for i, part in enumerate(path_parts):
                         if part == 'render' and i + 1 < len(path_parts):
                             project_name = path_parts[i + 1]
                             break
                 except Exception:
                     pass  # Use default if parsing fails
-                
-                # Create caption with project name instead of filename
-                caption = f"📁 {project_name}\n<code>{dropbox_path}</code>"
-                
+                # Create caption with project name and dropbox path (avoid None)
+                caption = f"📁 {project_name}\n<code>{dropbox_video_path or ''}</code>"
                 await callback_query.message.answer_video(
                     video=FSInputFile(str(final_video_path)),
                     caption=caption,
                     parse_mode="HTML"
                 )
-                
                 # Clean up compressed files if they were created
                 if final_video_path != video_path_obj:
                     from app.video_helpers import cleanup_compressed_files
                     cleanup_compressed_files(video_path_obj)
-                    
             except Exception as send_error:
                 logger.error(f"Error sending video: {send_error}")
                 error_msg = str(send_error)

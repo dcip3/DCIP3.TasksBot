@@ -14,6 +14,7 @@ import functools
 import threading
 
 from app.core.config import settings
+from app.utils import make_progress_bar
 
 logger = logging.getLogger(__name__)
 
@@ -295,11 +296,6 @@ async def process_file_batch(
             success, _, error = await asyncio.to_thread(convert_single_exr_file_streaming, (local_file, conv_folder, None, None, None, None, None))
             if success:
                 file_queue.mark_completed(str(local_file))
-                # Remove original file after successful conversion
-                try:
-                    await asyncio.to_thread(local_file.unlink)
-                except Exception as e:
-                    logger.error(f"Error removing original file {local_file}: {e}")
             else:
                 file_queue.mark_failed(str(local_file))
                 logger.error(f"Failed to convert {local_file}: {error}")
@@ -319,8 +315,9 @@ async def process_file_batch(
             try:
                 if progress_msg:
                     stop_kb = state.get("stop_kb")
+                    bar = make_progress_bar(percent)
                     await progress_msg.edit_text(
-                        f"Step 1: Downloading and converting {percent}% ({downloaded_count}/{total_files})",
+                        f"Step 1: Downloading and converting {percent}% ({downloaded_count}/{total_files})\n{bar}",
                         reply_markup=stop_kb
                     )
             except Exception:
@@ -500,11 +497,6 @@ async def download_exr_folder(
                     success, _, error = result
                     if success:
                         file_queue.mark_completed(str(local_file))
-                        try:
-                            # Clean up original EXR file after successful conversion
-                            await asyncio.to_thread(local_file.unlink)
-                        except Exception as e:
-                            logger.warning(f"Failed to delete original file {local_file}: {e}")
                     else:
                         file_queue.mark_failed(str(local_file))
                         logger.error(f"Failed to convert {local_file}: {error}")
@@ -520,8 +512,9 @@ async def download_exr_folder(
             try:
                 if progress_msg:
                     stop_kb = state.get("stop_kb")
+                    bar = make_progress_bar(percent)
                     await progress_msg.edit_text(
-                        f"Step 1: Downloading and converting {percent}% ({downloaded_count}/{total_files})",
+                        f"Step 1: Downloading and converting {percent}% ({downloaded_count}/{total_files})\n{bar}",
                         reply_markup=stop_kb
                     )
             except Exception:
