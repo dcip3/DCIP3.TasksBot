@@ -22,7 +22,7 @@ from app.dropbox_helpers import (
     upload_video_to_dropbox
 )
 from app.video_helpers import convert_exr_folder_to_srgb_optimized, assemble_video_from_jpg
-from app.core.bot_core import aiosession, init_aiosession
+from app.core.bot_core import get_aiosession
 
 logger = logging.getLogger(__name__)
 
@@ -451,11 +451,21 @@ async def delete_job_by_user_id(telegram_user_id: int, job_id: str) -> bool:
 # === DROPBOX INTEGRATION FUNCTIONS ===
 # ============================================================================
 
-async def get_dropbox_session():
-    global aiosession
-    if aiosession is None:
-        await init_aiosession()
-    return aiosession
+async def get_dropbox_session() -> aiohttp.ClientSession:
+    """
+    Get an active aiohttp session for Dropbox API calls.
+    
+    Returns:
+        aiohttp.ClientSession: Active session instance
+        
+    Raises:
+        RuntimeError: If unable to get a valid session
+    """
+    try:
+        return await get_aiosession()
+    except Exception as e:
+        logger.error(f"Error getting Dropbox session: {e}")
+        raise RuntimeError(f"Failed to get Dropbox session: {e}")
 
 async def download_job_folder(login: str, password: str, job_id: str) -> Optional[List[Tuple[str, dict, Path]]]:
     """
