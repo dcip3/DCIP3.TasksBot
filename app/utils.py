@@ -438,6 +438,9 @@ async def on_startup(bot):
     """
     logger.info("Starting TasksBot...")
     
+    await init_aiosession()
+    logger.info("aiohttp session initialized")
+    
     # Initialize database
     await init_db()
     logger.info("Database initialized")
@@ -481,9 +484,6 @@ async def on_startup(bot):
     # Start job progress watcher
     asyncio.create_task(job_progress_watcher(bot))
     logger.info("Job progress watcher started")
-
-    await init_aiosession()
-    logger.info("aiohttp session initialized")
 
 
 async def on_shutdown(bot):

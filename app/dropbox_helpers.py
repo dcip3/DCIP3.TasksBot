@@ -12,7 +12,6 @@ from aiohttp import ClientTimeout
 import gc
 import functools
 import threading
-from app.core.bot_core import aiosession
 
 from app.core.config import settings
 

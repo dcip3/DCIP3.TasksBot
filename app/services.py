@@ -22,7 +22,7 @@ from app.dropbox_helpers import (
     upload_video_to_dropbox
 )
 from app.video_helpers import convert_exr_folder_to_srgb_optimized, assemble_video_from_jpg
-from app.core.bot_core import aiosession
+from app.core.bot_core import aiosession, init_aiosession
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 # === UTILITY FUNCTIONS ===
 # ============================================================================
 
-def create_optimized_session() -> aiohttp.ClientSession:
+async def create_optimized_session() -> aiohttp.ClientSession:
     """
     Create an optimized aiohttp session for better performance.
     
@@ -451,10 +451,10 @@ async def delete_job_by_user_id(telegram_user_id: int, job_id: str) -> bool:
 # === DROPBOX INTEGRATION FUNCTIONS ===
 # ============================================================================
 
-# В download_job_folder и других функциях Dropbox используем глобальную сессию
-def get_dropbox_session():
+async def get_dropbox_session():
+    global aiosession
     if aiosession is None:
-        raise RuntimeError("aiosession is not initialized")
+        await init_aiosession()
     return aiosession
 
 async def download_job_folder(login: str, password: str, job_id: str) -> Optional[List[Tuple[str, dict, Path]]]:
@@ -511,7 +511,7 @@ async def download_job_folder(login: str, password: str, job_id: str) -> Optiona
             "Content-Type": "application/json"
         }
         
-        session_dbx = get_dropbox_session()
+        session_dbx = await get_dropbox_session()
         # Get metadata
         metadata = await fetch_dropbox_metadata(session_dbx, dropbox_path, headers_dbx)
             
@@ -638,7 +638,7 @@ async def create_video_from_job(login: str, password: str, job_id: str) -> Optio
             "Content-Type": "application/json"
         }
         
-        session_dbx = get_dropbox_session()
+        session_dbx = await get_dropbox_session()
         async with session_dbx.post(f"{settings.base_api_url}/files/upload", headers=headers_dbx, data=FSInputFile(Path(video_path))) as resp:
             if resp.status != 200:
                 logger.error(f"Failed to upload video to Dropbox: {resp.status}")
@@ -704,7 +704,7 @@ async def check_video_exists_in_dropbox(login: str, password: str, job_id: str) 
             "Content-Type": "application/json"
         }
         
-        session_dbx = get_dropbox_session()
+        session_dbx = await get_dropbox_session()
         # Get metadata for the folder
         metadata = await fetch_dropbox_metadata(session_dbx, dropbox_path, headers_dbx)
             
@@ -776,7 +776,7 @@ async def download_video_from_dropbox(login: str, password: str, job_id: str) ->
             "Dropbox-API-Arg": json.dumps({"path": video_info["dropbox_path"]})
         }
         
-        session_dbx = get_dropbox_session()
+        session_dbx = await get_dropbox_session()
         async with session_dbx.post(download_url, headers=dl_headers) as resp:
             if resp.status != 200:
                 text = await resp.text()
