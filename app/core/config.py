@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional
 from pydantic_settings import BaseSettings
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import SettingsConfigDict
 
 
@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     tg_api_token: str
     
     # Deadline API Configuration
-    base_api_url: str = "https://renderfarm.local:4434/api"
+    base_api_url: str = Field(..., description="Base URL for the Deadline API")
     
     # Dropbox API Configuration
     dropbox_app_key: str
@@ -37,18 +37,21 @@ class Settings(BaseSettings):
     dropbox_root_marker: str = "Team Folder"
     
     # Local Application Settings
-    db_path: str = "tasks_bot.db"
-    credentials_file: str = "credentials.json"
-    temp_dir: str = "temp"
-    conv_dir: str = "conv"
-    http_timeout: int = 30
-    
+    db_path: str = Field("tasks_bot.db", description="SQLite database file path")
+    credentials_file: str = Field("credentials.json", description="Fallback credentials storage file")
+    temp_dir: str = Field("temp", description="Temp directory for intermediate files")
+    conv_dir: str = Field("conv", description="Directory for converted files")
+    http_timeout: int = Field(30, description="HTTP timeout for external requests in seconds")
+
     # Security Settings
-    password_salt: str = "default_salt"
-    
+    password_salt: str = Field(..., description="Salt for password hashing")
+
     # Application Limits
-    max_concurrent_downloads: int = 2
-    min_free_space_bytes: int = 10 * 1024 * 1024 * 1024  # 10GB
+    max_concurrent_downloads: int = Field(2, ge=1, description="Max parallel Dropbox downloads")
+    min_free_space_bytes: int = Field(10 * 1024 * 1024 * 1024, description="Minimum required free disk space in bytes")
+
+    # Mini App Configuration
+    mini_app_url: str = Field("https://example.com", description="URL for the Telegram mini app")
     
     # Worker and Job Status Mappings
     worker_status_map: Dict[int, str] = {

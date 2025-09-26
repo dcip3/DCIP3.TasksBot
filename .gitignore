@@ -8,6 +8,7 @@ env/
 venv/
 .venv/
 ENV/
+pyrightconfig.json
 
 # Environment variables
 # .env
@@ -21,11 +22,11 @@ credentials.json
 # Temporary directories
 conv/
 temp/
-old/
+typings/
+
 
 # Old version
-DCIP3.TasksBot_old_version/
-
+old/
 
 # Node.js
 node_modules/

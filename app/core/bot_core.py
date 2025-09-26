@@ -27,7 +27,7 @@ active_realtime_tasks: Dict[str, asyncio.Task] = {}
 current_downloads: int = 0
 conversion_semaphore = asyncio.Semaphore(1)
 
-# Глобальная aiohttp-сессия для Dropbox и других API
+# Global aiohttp session shared across Dropbox and other APIs
 aiosession: aiohttp.ClientSession | None = None
 
 async def init_aiosession():

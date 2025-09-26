@@ -15,7 +15,7 @@ const DEV_MODE = true;
 
 console.log('DEV_MODE:', DEV_MODE);
 
-// Request interceptor для добавления Telegram WebApp данных
+// Request interceptor that injects Telegram WebApp data
 api.interceptors.request.use((config) => {
   console.log('API Request:', {
     method: config.method,
@@ -34,7 +34,7 @@ api.interceptors.request.use((config) => {
   return config;
 });
 
-// Response interceptor для логирования ответов
+// Response interceptor that logs responses
 api.interceptors.response.use(
   (response) => {
     console.log('API Response:', {

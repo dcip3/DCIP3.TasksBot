@@ -26,22 +26,22 @@ function App() {
     const applyTheme = (themeParams: any) => {
       if (!themeParams) return;
       const root = document.documentElement;
-      // Применяем все параметры как CSS custom properties
+      // Apply each theme parameter as a CSS custom property
       Object.entries(themeParams).forEach(([key, value]) => {
-        // Преобразуем accent_text_color -> --tg-theme-accent-text-color
+        // Transform accent_text_color -> --tg-theme-accent-text-color
         const cssVar = '--tg-theme-' + key.replace(/_/g, '-');
         root.style.setProperty(cssVar, value);
       });
 
-      // Устанавливаем фон для body
+      // Update body background color
       document.body.style.backgroundColor = themeParams.bg_color || '#ffffff';
     };
-    // Применяем тему при запуске
+    // Apply theme on startup
     const themeParams = getTelegramThemeParams();
     if (themeParams) {
       applyTheme(themeParams);
     }
-    // Подписываемся на смену темы
+    // Subscribe to theme change events
     subscribeThemeChanged(applyTheme);
     // --- END THEME INIT ---
   }, []);
@@ -132,27 +132,27 @@ function App() {
           const statusList = batchJobs.map(j => j.Stat);
           let batchStat = 0;
 
-          // Если хотя бы одна задача активна - весь batch активный
+          // If any task is active, treat the entire batch as active
           if (statusList.includes(1)) {
             batchStat = 1;  // Active
           }
-          // Если нет активных, но есть pending - batch pending
+          // If nothing is active but at least one pending task exists, mark batch as pending
           else if (statusList.includes(6)) {
             batchStat = 6;  // Pending
           }
-          // Если нет активных и pending, но есть suspended - batch suspended
+          // If no active or pending tasks but a suspended one exists, mark batch as suspended
           else if (statusList.includes(2)) {
             batchStat = 2;  // Suspended
           }
-          // Если нет активных, pending и suspended, но есть failed - batch failed
+          // If none are active, pending, or suspended but at least one failed, mark batch as failed
           else if (statusList.includes(4)) {
             batchStat = 4;  // Failed
           }
-          // Если все задачи completed - batch completed
+          // If all tasks are completed, mark batch as completed
           else if (statusList.every(s => s === 3)) {
             batchStat = 3;  // Completed
           }
-          // В остальных случаях - unknown
+          // In every other scenario mark as unknown
           else {
             batchStat = 0;  // Unknown
           }

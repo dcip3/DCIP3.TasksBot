@@ -18,14 +18,13 @@ from app.utils import make_progress_bar
 
 logger = logging.getLogger(__name__)
 
-# Переменные для кеширования access_token
+# Cached Dropbox access token details
 _dropbox_access_token = None
 _dropbox_access_token_expires_at = 0
 
 def get_fresh_access_token():
     """
-    Возвращает действующий Dropbox access_token. Если текущий ещё не истёк,
-    возвращает кешированный. Иначе обновляет по refresh_token.
+    Return a valid Dropbox access token, refreshing it via the refresh token when expired.
     """
     global _dropbox_access_token, _dropbox_access_token_expires_at
     now = int(time.time())
@@ -55,7 +54,7 @@ def get_fresh_access_token():
     _dropbox_access_token_expires_at = now + expires_in
     return _dropbox_access_token
 
-# In-memory кэш с TTL
+# Simple in-memory cache with TTL support
 class TTLCache:
     def __init__(self, ttl_seconds=180):
         self.ttl = ttl_seconds
@@ -150,7 +149,7 @@ async def count_exr_files(session_dbx: aiohttp.ClientSession, path: str, headers
             count += await count_exr_files(session_dbx, entry["path_display"], headers_dbx)
     return count
 
-# В FileQueue по умолчанию batch_size=8
+# FileQueue defaults to batch_size=8
 class FileQueue:
     def __init__(self, batch_size: int = 8):
         self.queue: asyncio.Queue = asyncio.Queue()
@@ -337,7 +336,7 @@ async def download_exr_folder_parallel(
     """
     Recursively downloads EXR files from Dropbox folder with parallel processing.
     """
-    # Используем list_folder_cached вместо прямого запроса
+    # Use cached list-folder response instead of direct request
     result = await list_folder_cached(session_dbx, path, headers_dbx)
     if not result:
         return
@@ -400,7 +399,7 @@ async def download_exr_folder(
     Download and convert EXR files from Dropbox folder.
     Uses parallel processing with batching for efficiency.
     """
-    # Используем list_folder_cached вместо прямого запроса
+    # Use cached list-folder response instead of direct request
     result = await list_folder_cached(session_dbx, path, headers_dbx)
     if not result:
         return
@@ -525,7 +524,7 @@ async def download_exr_folder(
 
 async def upload_video_to_dropbox(video_path: Path, metadata: dict, job_id: Optional[str] = None) -> str:
     """
-    Загружает видео-файл на Dropbox в ту же директорию, что и исходные EXR.
+    Upload a rendered video file back to the Dropbox folder containing the source EXRs.
     """
     filename = video_path.name
     exr_parent = str(PurePosixPath(metadata["path_display"]).parent)

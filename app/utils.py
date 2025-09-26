@@ -103,14 +103,13 @@ async def setup_menu_button():
     This creates a button in the chat menu that opens the Mini App.
     """
     try:
-        # URL для Mini App - для разработки используем localhost
-        # В продакшене замените на ваш домен с HTTPS
-        # mini_app_url = "http://localhost:3000"  # Для разработки
-        mini_app_url = "https://example.com"  # Для продакшена
+        # Mini App URL: use localhost for development, HTTPS domain for production
+        # mini_app_url defaults to the value provided in settings
+        mini_app_url = settings.mini_app_url
         
         logger.info(f"Setting up menu button with URL: {mini_app_url}")
         
-        # Используем правильный метод для aiogram 3.x
+        # Use the default aiogram 3.x method
         await bot.set_chat_menu_button(
             menu_button=MenuButtonWebApp(
                 text="Tasks",
@@ -120,7 +119,7 @@ async def setup_menu_button():
         logger.info("Menu button setup successfully")
     except Exception as e:
         logger.error(f"Failed to setup menu button: {e}")
-        # Попробуем альтернативный способ
+        # Try an alternative approach
         try:
             logger.info("Trying alternative method...")
             await bot.set_chat_menu_button(
@@ -128,21 +127,21 @@ async def setup_menu_button():
                     text="Tasks",
                     web_app=WebAppInfo(url=mini_app_url)
                 ),
-                chat_id=None  # Для всех пользователей
+                chat_id=None  # Apply for all users
             )
             logger.info("Menu button setup successfully (alternative method)")
         except Exception as e2:
             logger.error(f"Alternative method also failed: {e2}")
-            # Попробуем третий способ - через BotFather API
+            # Try a third approach using the BotFather API
             try:
                 logger.info("Trying BotFather API method...")
-                # Этот метод может не работать в aiogram 3.x, но попробуем
+                # This method might not work in aiogram 3.x, but it is worth a try
                 await bot.set_chat_menu_button(
                     menu_button=MenuButtonWebApp(
                         text="Tasks",
                         web_app=WebAppInfo(url=mini_app_url)
                     ),
-                    chat_id=0  # Глобальная настройка
+                    chat_id=0  # Global setting
                 )
                 logger.info("Menu button setup successfully (BotFather API method)")
             except Exception as e3:
@@ -548,7 +547,7 @@ async def job_progress_watcher(bot):
                                 if not job_id:
                                     continue
 
-                                # Проверяем статус задачи
+                                # Verify job status
                                 stat = job.get("Stat", 0)
                                 if stat == 3 and (job_id, telegram_user_id) not in notified_jobs:  # Completed
                                     date_comp_str = job.get("DateComp") or job.get("Props", {}).get("DateComp")

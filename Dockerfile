@@ -1,34 +1,34 @@
 FROM python:3.11-slim
 
-# Установка системных зависимостей
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     libopenexr-dev \
     libopencolorio-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Установка рабочей директории
+# Set working directory
 WORKDIR /app
 
-# Копирование файлов зависимостей
+# Copy dependency manifests
 COPY requirements.txt .
 
-# Установка Python зависимостей
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копирование исходного кода
+# Copy application source code
 COPY app/ ./app/
 COPY main_api.py .
 COPY config.ocio .
 
-# Создание необходимых директорий
+# Create required directories
 RUN mkdir -p conv temp
 
-# Установка прав доступа
+# Ensure entrypoint is executable
 RUN chmod +x main_api.py
 
-# Открытие порта
+# Expose API port
 EXPOSE 8000
 
-# Команда запуска
+# Application entrypoint
 CMD ["python", "main_api.py"] 

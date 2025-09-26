@@ -188,7 +188,7 @@ async def cmd_menu_status(message: Message):
         message: Telegram message object
     """
     try:
-        # Попробуем получить текущую кнопку меню
+        # Attempt to fetch the current menu button
         current_button = await bot.get_chat_menu_button()
         await message.answer(f"📋 Current menu button: {current_button}")
     except Exception as e:
@@ -1276,12 +1276,12 @@ async def handle_realtime(message: Message):
     chat_id = message.chat.id
     user_id = message.from_user.id
     
-    # Глобальный словарь для хранения задач
+    # Global dictionary used to store active realtime tasks
     if not hasattr(handle_realtime, "active_realtime_tasks"):
         handle_realtime.active_realtime_tasks = {}
     active_realtime_tasks = handle_realtime.active_realtime_tasks
     
-    # Остановить предыдущий realtime, если есть
+    # Stop a previous realtime job if it exists
     if chat_id in active_realtime_tasks:
         active_realtime_tasks[chat_id].cancel()
         del active_realtime_tasks[chat_id]
@@ -1296,7 +1296,7 @@ async def handle_realtime(message: Message):
             last_text = None
             while True:
                 jobs = await get_jobs_list(user_id)
-                # Группировка и форматирование как в handle_jobs
+                # Group and format jobs the same way as handle_jobs
                 grouped_jobs = defaultdict(list)
                 for job in jobs:
                     batch = job.get("Props", {}).get("Batch", "Untitled")
@@ -1509,9 +1509,9 @@ async def tasks_job_callback(callback_query: CallbackQuery):
                 return "⏸️"
             elif stat == 6: # Failed
                 return "❌"
-            elif stat in (2, 8): # Queued или Pending
+            elif stat in (2, 8): # Queued or Pending
                 return "⏳"
-            else:           # Unknown и другие
+            else:           # Unknown or other states
                 return "❓"
 
         from datetime import datetime, timezone

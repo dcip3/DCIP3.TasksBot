@@ -208,7 +208,7 @@ async def get_job_tasks(login: str, password: str, job_id: str) -> List[Dict[str
             async with session.get(f"{settings.base_api_url}/tasks?JobID={job_id}", auth=headers, ssl=False) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    # API возвращает {"Tasks": [...]} или просто список
+                    # API may return {"Tasks": [...]} or a plain list
                     if isinstance(data, dict):
                         return data.get("Tasks", [])
                     return data

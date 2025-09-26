@@ -72,13 +72,13 @@ async def process_batch(
             task = download_exr_file(session, url, headers, local_path)
             download_tasks.append((task, local_path))
         results = await asyncio.gather(*(task for task, _ in download_tasks))
-        # Асинхронная конвертация и удаление
+        # Async conversion and source cleanup
         conv_tasks = []
         for success, (_, local_path) in zip(results, download_tasks):
             if success:
                 async def convert_and_cleanup(local_file=local_path):
                     try:
-                        # Конвертация через to_thread
+                        # Run conversion via to_thread
                         jpg_path = conv_root / f"{local_file.stem}.jpg"
                         await asyncio.to_thread(convert_single_exr_file_streaming, (local_file, conv_root, cpu_processor, None, None, None, None))
                         converted_files.append(jpg_path)

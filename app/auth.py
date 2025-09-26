@@ -187,7 +187,7 @@ async def logout_user(telegram_user_id: int) -> bool:
 async def save_deadline_credentials(telegram_user_id: int, deadline_login: str, deadline_password: str) -> bool:
     """
     Save Deadline credentials for a user.
-    (Используется для хранения логина/пароля Deadline, чтобы не спрашивать их каждый раз)
+    (Used to persist login/password so we do not ask on each request.)
     
     Args:
         telegram_user_id: Telegram user ID

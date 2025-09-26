@@ -45,7 +45,7 @@ const getStatusColor = (stat: number) => {
   }
 };
 
-// Определяем приоритет статусов как в боте
+// Match batch status priority with the bot implementation
 const getBatchStatus = (statusList: number[]): number => {
   if (statusList.includes(1)) return 1;      // Active
   if (statusList.includes(6)) return 6;      // Pending
@@ -79,7 +79,7 @@ export const JobCard: React.FC<JobCardProps> = ({
       setLoading(true);
       try {
         const jobs = await jobsApi.getJobsByBatch(job.Props.Batch);
-        // Сортируем задачи по дате (от новых к старым)
+        // Sort jobs by date (newest first)
         const sortedJobs = jobs.sort((a, b) => new Date(b.Date).getTime() - new Date(a.Date).getTime());
         setBatchJobs(sortedJobs);
       } catch (error) {
@@ -105,7 +105,7 @@ export const JobCard: React.FC<JobCardProps> = ({
     }
   };
 
-  // Проверяем, есть ли другие задачи в этом batch
+  // Check if this batch contains other jobs
   const hasBatchJobs = batchJobs.length > 1;
 
   return (

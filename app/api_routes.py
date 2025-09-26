@@ -337,7 +337,7 @@ async def create_job_video(job_id: str, current_user: int = Depends(get_current_
         video_path = await create_video_from_job(login, password, job_id)
         
         if video_path:
-            # Получаем информацию о задаче для формирования Dropbox ссылки
+            # Fetch job info to build the Dropbox link
             job_info = await get_job_info(login, password, job_id)
             if job_info:
                 outdirs = job_info.get("OutDir", [])

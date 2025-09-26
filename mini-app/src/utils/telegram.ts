@@ -56,12 +56,12 @@ export const closeTelegramApp = () => {
 };
 
 export const getTelegramThemeParams = () => {
-  // themeParams могут быть в window.Telegram.WebApp.themeParams
+  // themeParams may live under window.Telegram.WebApp.themeParams
   return window.Telegram?.WebApp?.themeParams || null;
 };
 
 export const subscribeThemeChanged = (callback: (themeParams: any) => void) => {
-  // Telegram WebApp поддерживает событие theme_changed через window.Telegram.WebApp.onEvent
+  // Telegram WebApp exposes a theme_changed event via window.Telegram.WebApp.onEvent
   const tg = window.Telegram?.WebApp;
   if (tg && typeof tg.onEvent === 'function') {
     tg.onEvent('themeChanged', () => {

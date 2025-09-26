@@ -1,28 +1,28 @@
 FROM node:18-alpine
 
-# Установка рабочей директории
+# Set working directory
 WORKDIR /app
 
-# Копирование package.json и package-lock.json
+# Copy package manifest files
 COPY package*.json ./
 
-# Установка всех зависимостей (включая dev-зависимости для сборки)
+# Install dependencies (including dev packages for build)
 RUN npm ci
 
-# Копирование исходного кода
+# Copy source code
 COPY . .
 
-# Сборка приложения
+# Build production assets
 RUN npm run build
 
-# Установка serve для раздачи статических файлов
+# Install serve for static hosting
 RUN npm install -g serve
 
-# Удаление dev-зависимостей для уменьшения размера образа
+# Remove dev dependencies to shrink image size
 RUN npm prune --production
 
-# Открытие порта
+# Expose web app port
 EXPOSE 3000
 
-# Команда запуска
+# Container entrypoint
 CMD ["serve", "-s", "dist", "-l", "3000"] 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Local bot runner - запуск только Telegram бота без FastAPI и miniapp
+Local bot runner that starts only the Telegram bot without FastAPI or the mini app.
 """
 
 import asyncio
@@ -8,7 +8,7 @@ import logging
 import sys
 from pathlib import Path
 
-# Настройка логирования
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -19,46 +19,46 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Добавляем путь к модулям приложения
+# Add project root to module path
 sys.path.insert(0, str(Path(__file__).parent))
 
 async def main():
-    """Основная функция запуска бота"""
+    """Main entry point for starting the bot."""
     try:
-        # Импортируем модули бота
+        # Import bot modules lazily to avoid side effects during startup
         from app.core.bot_core import dp, bot
         from app.utils import on_startup, on_shutdown
         from app.handlers import register_handlers
         
-        logger.info("🚀 Запуск TasksBot в локальном режиме...")
+        logger.info("🚀 Starting TasksBot in local mode...")
         
-        # Регистрируем обработчики
+        # Register handlers
         register_handlers()
-        logger.info("✅ Обработчики зарегистрированы")
+        logger.info("✅ Handlers registered")
         
-        # Настраиваем события запуска и остановки
+        # Attach startup and shutdown hooks
         dp.startup.register(on_startup)
         dp.shutdown.register(on_shutdown)
         
-        logger.info("🤖 Бот готов к работе!")
-        logger.info("📱 Отправьте /start в Telegram для начала работы")
+        logger.info("🤖 Bot is ready!")
+        logger.info("📱 Send /start in Telegram to begin")
         
-        # Запускаем бота
+        # Start polling
         await dp.start_polling(bot, skip_updates=True)
         
     except ImportError as e:
-        logger.error(f"❌ Ошибка импорта: {e}")
-        logger.error("Убедитесь, что все зависимости установлены: pip install -r requirements.txt")
+        logger.error(f"❌ Import error: {e}")
+        logger.error("Ensure all dependencies are installed: pip install -r requirements.txt")
         return 1
     except Exception as e:
-        logger.error(f"❌ Ошибка запуска бота: {e}")
+        logger.error(f"❌ Bot startup error: {e}")
         return 1
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("🛑 Бот остановлен пользователем")
+        logger.info("🛑 Bot stopped by user")
     except Exception as e:
-        logger.error(f"❌ Критическая ошибка: {e}")
+        logger.error(f"❌ Critical error: {e}")
         sys.exit(1) 
