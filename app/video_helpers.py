@@ -14,8 +14,30 @@ import aiohttp
 import aiofiles
 import shutil
 import time
+from functools import lru_cache
 
 logger = logging.getLogger(__name__)
+
+@lru_cache(maxsize=1)
+def _get_default_cpu_processor() -> ocio.CPUProcessor:
+    """Return a cached OCIO CPU processor built from the default config."""
+    config_path = Path("config.ocio")
+    if not config_path.exists():
+        raise RuntimeError(f"OCIO config not found: {config_path}")
+
+    config = ocio.Config.CreateFromFile(str(config_path))
+    transform = ocio.DisplayViewTransform()
+    transform.setSrc("ACEScg")
+    transform.setDisplay("sRGB")
+    transform.setView("ACES 1.0 SDR-video")
+    transform.setDirection(ocio.TRANSFORM_DIR_FORWARD)
+
+    processor = config.getProcessor(transform)
+    cpu_processor = processor.getDefaultCPUProcessor()
+    if cpu_processor is None:
+        raise RuntimeError("Failed to create OCIO CPU processor from config.ocio")
+    return cpu_processor
+
 
 async def download_exr_file(session: aiohttp.ClientSession, url: str, headers: dict, local_path: Path) -> bool:
     """
@@ -108,10 +130,11 @@ def convert_single_exr_file_streaming(args):
             rgb_chunk = np.stack([r_chunk, g_chunk, b_chunk], axis=-1)
             flat_chunk = rgb_chunk.reshape(-1, 3).astype(np.float32)
             
-            # Apply color transform
-            if cpu_processor:
-                img_desc = ocio.PackedImageDesc(flat_chunk, width, chunk_height, 3)
-                cpu_processor.apply(img_desc)
+            # Apply color transform (load default if processor not supplied)
+            if cpu_processor is None:
+                cpu_processor = _get_default_cpu_processor()
+            img_desc = ocio.PackedImageDesc(flat_chunk, width, chunk_height, 3)
+            cpu_processor.apply(img_desc)
             processed_chunk = flat_chunk.reshape(chunk_height, width, 3)
             
             processed_chunks.append(processed_chunk)
