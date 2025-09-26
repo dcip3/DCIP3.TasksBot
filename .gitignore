@@ -21,6 +21,7 @@ credentials.json
 # Temporary directories
 conv/
 temp/
+old/
 
 # Old version
 DCIP3.TasksBot_old_version/
