@@ -544,7 +544,10 @@ async def job_progress_watcher(bot):
     """
     import aiohttp
     from datetime import datetime, timezone, timedelta
-    from app.auth import get_all_users_with_notifications
+    from app.auth import (
+        get_all_users_with_notifications,
+        disable_notifications_for_user,
+    )
     from app.core.bot_core import notified_jobs
     
     while True:
@@ -603,6 +606,16 @@ async def job_progress_watcher(bot):
                                     )
                                     logger.info(f"Notification sent to user {telegram_user_id} for job {job_id} ({name})")
                                     notified_jobs.add((job_id, telegram_user_id))
+                        elif resp.status == 401:
+                            logger.warning(
+                                "Watcher: Unauthorized for user %s. Disabling notifications and requesting re-login.",
+                                telegram_user_id
+                            )
+                            await disable_notifications_for_user(telegram_user_id)
+                            await bot.send_message(
+                                telegram_user_id,
+                                "⚠️ Авторизация истекла. Пожалуйста, выполните /login заново, чтобы продолжить получать уведомления."
+                            )
                         else:
                             logger.error(f"Watcher: Error requesting jobs for user {telegram_user_id}: {resp.status}")
             except Exception as e:

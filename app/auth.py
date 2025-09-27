@@ -357,3 +357,21 @@ async def get_all_users_with_notifications() -> list[Tuple[int, str, str]]:
     except Exception as e:
         logger.error(f"Failed to get users with notifications: {e}")
         return [] 
+
+
+async def disable_notifications_for_user(telegram_user_id: int) -> None:
+    """Disable notifications for a given user."""
+    conn = get_db_connection()
+    if conn is None:
+        logger.error("Database connection not available for disable_notifications_for_user")
+        return
+
+    try:
+        await conn.execute(
+            "UPDATE user_sessions SET notifications_enabled = 0 WHERE telegram_user_id = ?",
+            (telegram_user_id,)
+        )
+        await conn.commit()
+        logger.info(f"Notifications disabled for user {telegram_user_id}")
+    except Exception as e:
+        logger.error(f"Failed to disable notifications for user {telegram_user_id}: {e}")
