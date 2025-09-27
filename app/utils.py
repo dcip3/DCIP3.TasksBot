@@ -18,7 +18,15 @@ from functools import wraps
 from pathlib import Path
 from typing import cast, Optional
 
-from aiogram.types import Message, KeyboardButton, ReplyKeyboardMarkup, InlineKeyboardButton, MenuButtonWebApp, WebAppInfo
+from aiogram.types import (
+    Message,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    MenuButtonWebApp,
+    WebAppInfo,
+)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -576,7 +584,23 @@ async def job_progress_watcher(bot):
                                     batch = job.get("Props", {}).get("Batch", "Untitled")
                                     name = job.get("Props", {}).get("Name", "").split("/")[-1]
                                     message_text = f"✅ Job completed:\n• Batch: {batch}\n• Name: {name}"
-                                    await bot.send_message(telegram_user_id, message_text)
+
+                                    preview_markup = InlineKeyboardMarkup(
+                                        inline_keyboard=[
+                                            [
+                                                InlineKeyboardButton(
+                                                    text="🔍 Preview",
+                                                    callback_data=f"preview_job:{job_id}"
+                                                )
+                                            ]
+                                        ]
+                                    )
+
+                                    await bot.send_message(
+                                        telegram_user_id,
+                                        message_text,
+                                        reply_markup=preview_markup
+                                    )
                                     logger.info(f"Notification sent to user {telegram_user_id} for job {job_id} ({name})")
                                     notified_jobs.add((job_id, telegram_user_id))
                         else:
