@@ -258,7 +258,7 @@ async def process_file_batch(
     download_tasks = []
     
     # Create conversion directory
-    conv_folder = Path("conv") / local_folder.name
+    conv_folder = Path(settings.conv_dir) / local_folder.name
     conv_folder.mkdir(parents=True, exist_ok=True)
     
     # Prepare download tasks for all files in batch
@@ -408,7 +408,7 @@ async def download_exr_folder(
     file_queue = FileQueue(batch_size=8)  # Increased from 3 to 5
     
     # Create conversion directory
-    conv_folder = Path("conv") / local_folder.name
+    conv_folder = Path(settings.conv_dir) / local_folder.name
     conv_folder.mkdir(parents=True, exist_ok=True)
     
     # Add files to queue

@@ -20,8 +20,11 @@ tasks_bot.db
 credentials.json
 
 # Temporary directories
-conv/
-temp/
+storage/conv/
+storage/temp/
+storage/tasks_bot.db
+storage/tasks_bot.db-*
+storage/*.db
 typings/
 
 

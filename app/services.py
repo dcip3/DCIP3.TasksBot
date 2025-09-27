@@ -510,7 +510,7 @@ async def download_job_folder(login: str, password: str, job_id: str) -> Optiona
         dropbox_path = "/" + trimmed.replace("\\", "/").lstrip("/")
         
         # Create temp directory
-        temp_dir = Path("temp")
+        temp_dir = Path(settings.temp_dir)
         temp_dir.mkdir(exist_ok=True)
         
         # Prepare Dropbox headers
@@ -610,8 +610,8 @@ async def create_video_from_job(login: str, password: str, job_id: str) -> Optio
             
         # Create temp directory for job
         from pathlib import Path
-        temp_root = Path("temp")
-        conv_root = Path("conv")
+        temp_root = Path(settings.temp_dir)
+        conv_root = Path(settings.conv_dir)
         temp_root.mkdir(exist_ok=True)
         conv_root.mkdir(exist_ok=True)
         
@@ -632,7 +632,7 @@ async def create_video_from_job(login: str, password: str, job_id: str) -> Optio
             return None
         
         # Convert files
-        await convert_exr_folder_to_srgb_optimized(file_list, job_conv_dir, "config.ocio")
+        await convert_exr_folder_to_srgb_optimized(file_list, job_conv_dir, settings.ocio_config_path)
         
         # Create video from converted files
         video_path = assemble_video_from_jpg(job_conv_dir, str(exr_folder_name))  # Convert exr_folder_name to string
@@ -774,7 +774,7 @@ async def download_video_from_dropbox(login: str, password: str, job_id: str) ->
             return None
             
         # Create temp directory
-        temp_dir = Path("temp")
+        temp_dir = Path(settings.temp_dir)
         temp_dir.mkdir(exist_ok=True)
         
         # Download video

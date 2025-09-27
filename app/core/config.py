@@ -37,11 +37,13 @@ class Settings(BaseSettings):
     dropbox_root_marker: str = "Team Folder"
     
     # Local Application Settings
-    db_path: str = Field("tasks_bot.db", description="SQLite database file path")
+    db_path: str = Field("storage/tasks_bot.db", description="SQLite database file path")
     credentials_file: str = Field("credentials.json", description="Fallback credentials storage file")
-    temp_dir: str = Field("temp", description="Temp directory for intermediate files")
-    conv_dir: str = Field("conv", description="Directory for converted files")
+    temp_dir: str = Field("storage/temp", description="Temp directory for intermediate files")
+    conv_dir: str = Field("storage/conv", description="Directory for converted files")
     http_timeout: int = Field(30, description="HTTP timeout for external requests in seconds")
+
+    ocio_config_path: str = Field("storage/config.ocio", description="Path to OCIO configuration file")
 
     # Security Settings
     password_salt: str = Field(..., description="Salt for password hashing")
@@ -51,7 +53,7 @@ class Settings(BaseSettings):
     min_free_space_bytes: int = Field(10 * 1024 * 1024 * 1024, description="Minimum required free disk space in bytes")
 
     # Mini App Configuration
-    mini_app_url: str = Field("https://example.com", description="URL for the Telegram mini app")
+    mini_app_url: str = Field("http://localhost:3000", description="URL for the Telegram mini app")
     
     # Worker and Job Status Mappings
     worker_status_map: Dict[int, str] = {

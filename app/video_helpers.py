@@ -16,12 +16,14 @@ import shutil
 import time
 from functools import lru_cache
 
+from app.core.config import settings
+
 logger = logging.getLogger(__name__)
 
 @lru_cache(maxsize=1)
 def _get_default_cpu_processor() -> ocio.CPUProcessor:
     """Return a cached OCIO CPU processor built from the default config."""
-    config_path = Path("config.ocio")
+    config_path = Path(settings.ocio_config_path)
     if not config_path.exists():
         raise RuntimeError(f"OCIO config not found: {config_path}")
 
@@ -258,8 +260,8 @@ def cleanup_job_files(job_id: str):
         job_id (str): Job ID to clean up files for
     """
     try:
-        temp_root = Path("temp")
-        conv_root = Path("conv")
+        temp_root = Path(settings.temp_dir)
+        conv_root = Path(settings.conv_dir)
         
         # Clean up temp directory
         if temp_root.exists():
@@ -291,7 +293,7 @@ def cleanup_old_files(max_age_hours: int = 6):
         current_time = time.time()
         max_age_seconds = max_age_hours * 3600
         
-        for directory in [Path("temp"), Path("conv")]:
+        for directory in [Path(settings.temp_dir), Path(settings.conv_dir)]:
             if not directory.exists():
                 continue
                 

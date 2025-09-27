@@ -106,6 +106,16 @@ async def setup_menu_button():
         # Mini App URL: use localhost for development, HTTPS domain for production
         # mini_app_url defaults to the value provided in settings
         mini_app_url = settings.mini_app_url
+
+        # Skip setup if URL is not HTTPS (Telegram requires HTTPS for menu buttons)
+        from urllib.parse import urlparse
+        parsed_url = urlparse(mini_app_url)
+        if parsed_url.scheme.lower() != "https":
+            logger.warning(
+                "Skipping menu button setup because MINI_APP_URL is not HTTPS: %s",
+                mini_app_url,
+            )
+            return
         
         logger.info(f"Setting up menu button with URL: {mini_app_url}")
         
@@ -146,7 +156,7 @@ async def setup_menu_button():
                 logger.info("Menu button setup successfully (BotFather API method)")
             except Exception as e3:
                 logger.error(f"All methods failed: {e3}")
-                raise e3
+                return
 
 # ============================================================================
 # === UTILITY FUNCTIONS ===

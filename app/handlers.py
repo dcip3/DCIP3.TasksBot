@@ -942,7 +942,7 @@ async def create_new_video_process(callback_query: CallbackQuery, login: str, pa
             trimmed = fullpath[idx:]
             dropbox_path = "/" + trimmed.replace("\\", "/").lstrip("/")
             from pathlib import Path
-            temp_dir = Path("temp")
+            temp_dir = Path(settings.temp_dir)
             temp_dir.mkdir(exist_ok=True)
             exr_folder_name = Path(dropbox_path).parts[-1]
             if not exr_folder_name:
@@ -986,7 +986,7 @@ async def create_new_video_process(callback_query: CallbackQuery, login: str, pa
             )
             # Step 2: Create video from already converted JPGs
             await progress_msg.edit_text("🎬 Step 2: Converting EXR files and creating video...")
-            conv_dir = Path("conv") / f"{exr_folder_name}_{job_id}"
+            conv_dir = Path(settings.conv_dir) / f"{exr_folder_name}_{job_id}"
             video_path = assemble_video_from_jpg(conv_dir, str(exr_folder_name))
             if not video_path:
                 await progress_msg.edit_text("❌ Failed to create video")

@@ -19,10 +19,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application source code
 COPY app/ ./app/
 COPY main_api.py .
-COPY config.ocio .
+COPY storage/config.ocio ./storage/config.ocio
 
 # Create required directories
-RUN mkdir -p conv temp
+RUN mkdir -p storage/conv storage/temp
 
 # Ensure entrypoint is executable
 RUN chmod +x main_api.py

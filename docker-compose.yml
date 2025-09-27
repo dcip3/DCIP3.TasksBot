@@ -1,6 +1,10 @@
 services:
   backend:
-    build: .
+    build:
+      context: .
+      dockerfile: infra/backend/Dockerfile
+    env_file:
+      - .env
     environment:
       - TG_API_TOKEN=${TG_API_TOKEN}
       - DROPBOX_APP_KEY=${DROPBOX_APP_KEY}
@@ -10,30 +14,36 @@ services:
       - DROPBOX_ROOT_NAMESPACE_ID=${DROPBOX_ROOT_NAMESPACE_ID}
       - DROPBOX_ROOT_MARKER=${DROPBOX_ROOT_MARKER}
     volumes:
-      - ./conv:/app/conv
-      - ./temp:/app/temp
-      - ./tasks_bot.db:/app/tasks_bot.db
+      - ./storage/conv:/app/storage/conv
+      - ./storage/temp:/app/storage/temp
+      - ./storage/tasks_bot.db:/app/storage/tasks_bot.db
+      - ./storage/config.ocio:/app/storage/config.ocio:ro
     restart: unless-stopped
     networks:
       - app-network
 
   frontend:
-    build: ./mini-app
+    build:
+      context: ./mini-app
     environment:
-      - VITE_API_URL=https://example.com/api
+      - VITE_API_URL=https://${APP_DOMAIN}/api
     restart: unless-stopped
     networks:
       - app-network
 
   nginx:
     image: nginx:alpine
+    env_file:
+      - .env
+    environment:
+      - APP_DOMAIN=${APP_DOMAIN}
     ports:
       - "80:80"
       - "443:443"
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-      - /etc/letsencrypt/live/example.com/fullchain.pem:/etc/nginx/ssl/certificate.crt:ro
-      - /etc/letsencrypt/live/example.com/privkey.pem:/etc/nginx/ssl/private.key:ro
+      - ./infra/nginx/nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
+      - /etc/letsencrypt/live/${APP_DOMAIN}/fullchain.pem:/etc/nginx/ssl/certificate.crt:ro
+      - /etc/letsencrypt/live/${APP_DOMAIN}/privkey.pem:/etc/nginx/ssl/private.key:ro
     depends_on:
       - backend
       - frontend

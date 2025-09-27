@@ -1,7 +1,7 @@
 import axios from 'axios';
 import { Job } from '../types';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'https://example.com/api';
+const API_BASE_URL = import.meta.env.VITE_API_URL || `${window.location.origin}/api`;
 
 console.log('API_BASE_URL:', API_BASE_URL);
 
