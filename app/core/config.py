@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     http_timeout: int = Field(30, description="HTTP timeout for external requests in seconds")
 
     ocio_config_path: str = Field("storage/config.ocio", description="Path to OCIO configuration file")
+    ffmpeg_path: str = Field("ffmpeg", description="Path to ffmpeg executable on Deadline workers")
 
     # Security Settings
     password_salt: str = Field(..., description="Salt for password hashing")

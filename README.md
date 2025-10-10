@@ -50,6 +50,7 @@ Use `.env.example` as a template:
 - `TG_API_TOKEN` — Telegram bot token.
 - `DROPBOX_*` — Dropbox App credentials and namespace details.
 - `DB_PATH`, `CREDENTIALS_FILE`, `TEMP_DIR`, `CONV_DIR`, `OCIO_CONFIG_PATH` — local storage paths.
+- `FFMPEG_PATH` — path to the `ffmpeg` executable on Deadline workers (if it isn't in `PATH`).
 - `MAX_CONCURRENT_DOWNLOADS`, `MIN_FREE_SPACE_BYTES` — background download limits.
 - `PASSWORD_SALT` — PBKDF2 salt for user credentials stored in SQLite.
 

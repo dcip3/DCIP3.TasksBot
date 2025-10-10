@@ -26,6 +26,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     MenuButtonWebApp,
     WebAppInfo,
+    FSInputFile,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -33,6 +34,7 @@ from apscheduler.triggers.cron import CronTrigger
 from app.core.config import settings
 from app.core.bot_core import bot, dp, init_aiosession, close_aiosession
 from app.core.database import init_db, close_db
+from app.integrations.video_helpers import compress_video_if_needed, get_file_size_mb
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,121 @@ scheduler = AsyncIOScheduler(timezone="Europe/Moscow", job_defaults={'coalesce':
 
 # Track jobs that have been notified about
 notified_jobs = set()
+
+# ============================================================================
+# === PREVIEW HELPERS ===
+# ============================================================================
+
+
+async def _notify_preview_job_completion(
+    telegram_user_id: int,
+    job: dict,
+    job_name: str,
+    login: str,
+    password: str,
+) -> None:
+    """Send ready preview video to the user when the ffmpeg job finishes."""
+    props = job.get("Props", {})
+    job_id = job.get("_id", "")
+
+    local_path_hint = props.get("Ex0") or ""
+    dropbox_path_hint = props.get("Ex1") or ""
+
+    extra_dict = props.get("ExDic") or {}
+    if not isinstance(extra_dict, dict):
+        extra_dict = {}
+    local_path_hint = extra_dict.get("PreviewLocal", local_path_hint)
+    dropbox_path_hint = extra_dict.get("PreviewDropbox", dropbox_path_hint)
+
+    for key in ("ExtraInfoKeyValue0", "ExtraInfoKeyValue1", "ExtraInfoKeyValue2"):
+        value = props.get(key)
+        if not value or "=" not in value:
+            continue
+        prefix, payload = value.split("=", 1)
+        if prefix == "PreviewLocal":
+            local_path_hint = payload
+        elif prefix == "PreviewDropbox":
+            dropbox_path_hint = payload
+
+    final_path: Optional[Path] = None
+    dropbox_path = dropbox_path_hint
+    downloaded_temp = False
+
+    if dropbox_path_hint:
+        try:
+            from app.services import download_video_from_dropbox
+
+            result = await download_video_from_dropbox(
+                login,
+                password,
+                job_id,
+                dropbox_path_hint=dropbox_path_hint,
+            )
+            if result:
+                final_path = Path(result[0])
+                dropbox_path = result[1]
+                downloaded_temp = True
+        except Exception as download_error:
+            logger.warning(
+                "Failed to download preview video from Dropbox for job %s: %s",
+                job_id,
+                download_error,
+            )
+
+    if final_path is None:
+        local_path = Path(local_path_hint) if local_path_hint else None
+        if local_path is None:
+            await bot.send_message(
+                telegram_user_id,
+                f"⚠️ Превью для задачи {job_name} создано, но путь к файлу не указан.",
+            )
+            logger.warning("Preview job %s has no recorded paths", job_id)
+            return
+
+        for _ in range(6):
+            if local_path.exists():
+                break
+            await asyncio.sleep(5)
+
+        if not local_path.exists():
+            await bot.send_message(
+                telegram_user_id,
+                (
+                    f"⚠️ Превью для задачи {job_name} завершено, но файл пока не найден по пути:\n"
+                    f"{local_path}"
+                ),
+            )
+            logger.warning("Preview file %s not found after job %s", local_path, job_id)
+            return
+
+        final_path = local_path
+        dropbox_path = dropbox_path or dropbox_path_hint
+
+    size_mb = get_file_size_mb(final_path)
+    if size_mb > 45.0:
+        final_path = await asyncio.to_thread(compress_video_if_needed, final_path, 45.0)
+        size_mb = get_file_size_mb(final_path)
+
+    caption_parts = [f"📁 {final_path.name}"]
+    if dropbox_path:
+        caption_parts.append(f"<code>{dropbox_path}</code>")
+    caption = "\n".join(caption_parts)
+
+    await bot.send_message(
+        telegram_user_id,
+        f"🎬 Превью для задачи {job_name} готово.",
+    )
+    await bot.send_video(
+        telegram_user_id,
+        FSInputFile(str(final_path)),
+        caption=caption,
+        parse_mode="HTML",
+    )
+
+    if downloaded_temp:
+        await asyncio.to_thread(final_path.unlink, missing_ok=True)
+
+    logger.info("Preview video sent to user %s for job %s", telegram_user_id, job_id)
 
 # ============================================================================
 # === DECORATORS ===
@@ -583,16 +700,41 @@ async def job_progress_watcher(bot):
                                             continue
                                     except Exception:
                                         continue
-                                        
-                                    batch = job.get("Props", {}).get("Batch", "Untitled")
-                                    name = job.get("Props", {}).get("Name", "").split("/")[-1]
-                                    message_text = f"✅ Job completed:\n• Batch: {batch}\n• Name: {name}"
+                                    props = job.get("Props", {})
+                                    name = props.get("Name", "").split("/")[-1]
+                                    comment = props.get("Cmmt", "")
+                                    extra_dict = props.get("ExDic") or {}
+                                    if not isinstance(extra_dict, dict):
+                                        extra_dict = {}
+                                    is_preview_job = (
+                                        "Preview job generated by TasksBot" in comment
+                                        or name.endswith(" - Preview")
+                                        or extra_dict.get("PreviewJob") == "1"
+                                    )
+
+                                    if is_preview_job:
+                                        await _notify_preview_job_completion(
+                                            telegram_user_id,
+                                            job,
+                                            name,
+                                            login,
+                                            password,
+                                        )
+                                        notified_jobs.add((job_id, telegram_user_id))
+                                        continue
+
+                                    batch = props.get("Batch", "Без серии")
+                                    message_text = (
+                                        "✅ Задача завершена:\n"
+                                        f"• Серия: {batch}\n"
+                                        f"• Имя: {name}"
+                                    )
 
                                     preview_markup = InlineKeyboardMarkup(
                                         inline_keyboard=[
                                             [
                                                 InlineKeyboardButton(
-                                                    text="🔍 Preview",
+                                                    text="🔍 Превью",
                                                     callback_data=f"preview_job:{job_id}"
                                                 )
                                             ]
@@ -604,7 +746,7 @@ async def job_progress_watcher(bot):
                                         message_text,
                                         reply_markup=preview_markup
                                     )
-                                    logger.info(f"Notification sent to user {telegram_user_id} for job {job_id} ({name})")
+                                    logger.info(f"Уведомление отправлено пользователю {telegram_user_id} по задаче {job_id} ({name})")
                                     notified_jobs.add((job_id, telegram_user_id))
                         elif resp.status == 401:
                             logger.warning(

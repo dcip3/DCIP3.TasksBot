@@ -8,12 +8,16 @@ and Dropbox API for job management, worker monitoring, and file operations.
 
 import json
 import logging
-from pathlib import Path
+import ntpath
+import posixpath
+import re
+import shlex
+from collections import Counter
+from datetime import datetime
+from pathlib import Path, PurePosixPath
 from typing import Optional, List, Dict, Any, Tuple, Union
 
 import aiohttp
-from aiogram.types import FSInputFile
-
 from app.core.config import settings
 from app.integrations.dropbox_helpers import (
     get_fresh_access_token,
@@ -21,10 +25,18 @@ from app.integrations.dropbox_helpers import (
     download_exr_folder,
     upload_video_to_dropbox
 )
-from app.integrations.video_helpers import convert_exr_folder_to_srgb_optimized, assemble_video_from_jpg
 from app.core.bot_core import get_aiosession
 
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# === EXCEPTIONS ===
+# ============================================================================
+
+
+class DeadlineSubmissionError(RuntimeError):
+    """Raised when a Deadline job submission fails."""
+
 
 # ============================================================================
 # === UTILITY FUNCTIONS ===
@@ -139,6 +151,7 @@ async def get_job_info(login: str, password: str, job_id: str) -> Optional[Dict[
         login: User login
         password: User password
         job_id: Job ID
+        dropbox_path_hint: Optional explicit Dropbox video path
         
     Returns:
         Job information dictionary or None if error
@@ -243,6 +256,136 @@ async def get_job_tasks_by_user_id(telegram_user_id: int, job_id: str) -> List[D
     except Exception as e:
         logger.error(f"Error getting job tasks for user {telegram_user_id}: {e}")
         return []
+
+
+async def submit_deadline_job(
+    telegram_user_id: int,
+    job_info: Dict[str, Any],
+    plugin_info: Dict[str, Any],
+    *,
+    aux_files: Optional[List[Union[str, Path, Tuple[Union[str, Path], str]]]] = None,
+    complete_submission: bool = True
+) -> Dict[str, Any]:
+    """
+    Submit a new job to Deadline on behalf of the specified Telegram user.
+
+    Args:
+        telegram_user_id: Telegram user ID whose Deadline credentials should be used.
+        job_info: Dictionary describing Deadline JobInfo settings (equivalent to .job file).
+        plugin_info: Dictionary with plugin-specific parameters (equivalent to .plugin file).
+        aux_files: Optional list of auxiliary files to upload. Each entry can be a path-like
+            object or a tuple (local_path, remote_name). The remote name defaults to the file
+            name if not provided.
+        complete_submission: Whether to finalize the submission by calling
+            ``/jobs/{job_id}/complete-submission`` after uploading aux files.
+
+    Returns:
+        Dictionary with submission response data including the new job id.
+
+    Raises:
+        DeadlineSubmissionError: If submission or aux upload fails.
+        FileNotFoundError: If any referenced auxiliary file is missing.
+    """
+    from app.auth import get_deadline_credentials
+
+    credentials = await get_deadline_credentials(telegram_user_id)
+    if not credentials:
+        error_msg = f"No Deadline credentials found for user {telegram_user_id}"
+        logger.error(error_msg)
+        raise DeadlineSubmissionError(error_msg)
+
+    login, password = credentials
+    payload: Dict[str, Any] = {
+        "JobInfo": job_info,
+        "PluginInfo": plugin_info,
+        "AuxFiles": []
+    }
+
+    resolved_aux: List[Tuple[Path, str]] = []
+    if aux_files:
+        for entry in aux_files:
+            remote_name: Optional[str]
+            if isinstance(entry, tuple):
+                local_path, remote_name = entry
+            else:
+                local_path, remote_name = entry, None
+
+            local_path = Path(local_path)
+            if not local_path.exists():
+                raise FileNotFoundError(f"Auxiliary file not found: {local_path}")
+
+            remote_name = remote_name or local_path.name
+            resolved_aux.append((local_path, remote_name))
+
+        if resolved_aux:
+            payload["AuxFiles"] = [remote for _, remote in resolved_aux]
+
+    submit_url = f"{settings.base_api_url}/jobs"
+    logger.info("Submitting Deadline job via %s", submit_url)
+
+    async with aiohttp.ClientSession() as session:
+        auth = aiohttp.BasicAuth(login, password)
+        async with session.post(submit_url, auth=auth, ssl=False, json=payload) as resp:
+            text = await resp.text()
+            if resp.status not in (200, 201, 202, 204):
+                logger.error("Deadline submission failed (%s): %s", resp.status, text)
+                raise DeadlineSubmissionError(f"Submission failed with status {resp.status}")
+            if text:
+                try:
+                    submission_response = json.loads(text)
+                except json.JSONDecodeError:
+                    logger.warning("Unexpected non-JSON response from Deadline: %s", text)
+                    submission_response = {}
+            else:
+                submission_response = {}
+
+    job_id = submission_response.get("job_id") or submission_response.get("_id")
+    if not job_id:
+        logger.warning("Deadline submission response missing job_id: %s", submission_response)
+    else:
+        logger.info("Deadline job submitted successfully: %s", job_id)
+
+    if resolved_aux and job_id:
+        async with aiohttp.ClientSession() as session:
+            auth = aiohttp.BasicAuth(login, password)
+            for local_path, remote_name in resolved_aux:
+                upload_url = f"{settings.base_api_url}/jobs/{job_id}/aux-files/{remote_name}"
+                logger.info("Uploading aux file %s -> %s", local_path, upload_url)
+                async with session.put(
+                    upload_url,
+                    auth=auth,
+                    ssl=False,
+                    data=local_path.read_bytes(),
+                    headers={"Content-Type": "application/octet-stream"}
+                ) as upload_resp:
+                    if upload_resp.status not in (200, 201, 204):
+                        text = await upload_resp.text()
+                        logger.error(
+                            "Failed to upload aux file %s (%s): %s",
+                            remote_name,
+                            upload_resp.status,
+                            text
+                        )
+                        raise DeadlineSubmissionError(
+                            f"Aux file upload failed for {remote_name} ({upload_resp.status})"
+                        )
+
+            if complete_submission:
+                complete_url = f"{settings.base_api_url}/jobs/{job_id}/complete-submission"
+                async with session.post(complete_url, auth=auth, ssl=False) as comp_resp:
+                    if comp_resp.status not in (200, 201, 204):
+                        text = await comp_resp.text()
+                        logger.error(
+                            "Failed to complete submission for job %s (%s): %s",
+                            job_id,
+                            comp_resp.status,
+                            text
+                        )
+                        raise DeadlineSubmissionError(
+                            f"Complete submission failed ({comp_resp.status})"
+                        )
+
+    return submission_response
 
 
 async def requeue_job(login: str, password: str, job_id: str) -> bool:
@@ -507,7 +650,10 @@ async def download_job_folder(login: str, password: str, job_id: str) -> Optiona
             return None
             
         trimmed = fullpath[idx:]
-        dropbox_path = "/" + trimmed.replace("\\", "/").lstrip("/")
+        dropbox_path = _normalize_dropbox_path(trimmed)
+        if not dropbox_path:
+            logger.error(f"Failed to normalize Dropbox path for job {job_id}: {trimmed}")
+            return None
         
         # Create temp directory
         temp_dir = Path(settings.temp_dir)
@@ -575,100 +721,212 @@ async def download_job_folder(login: str, password: str, job_id: str) -> Optiona
         logger.error(f"Error preparing download list for job {job_id}: {e}")
         return None
 
-async def create_video_from_job(login: str, password: str, job_id: str) -> Optional[Tuple[str, str]]:
+def _sanitize_windows_filename(name: str) -> str:
+    """Replace characters that are invalid in Windows file names."""
+    return re.sub(r'[\\/:*?"<>|]', "_", name)
+
+
+def _normalize_dropbox_path(path: Optional[str]) -> Optional[str]:
+    """Normalize Dropbox-style paths to start with a single leading slash."""
+    if not path:
+        return None
+    normalized = path.replace("\\", "/").strip()
+    if not normalized:
+        return None
+    return f"/{normalized.lstrip('/')}"
+
+
+
+
+
+async def create_video_from_job(telegram_user_id: int, job_id: str) -> Optional[Dict[str, Any]]:
     """
-    Create video from job's EXR files and upload it to Dropbox.
-    
+    Submit a Deadline CommandLine job that generates a preview video using ffmpeg.
+
     Returns:
-        Optional[Tuple[str, str]]: Tuple of (video_path, dropbox_path) if successful, None otherwise
+        Dict with submission details and expected paths, or None if unable to submit.
     """
-    try:
-        # Get job info from Deadline
-        job_info = await get_job_info(login, password, job_id)
-        if not job_info:
-            logger.error(f"Could not get job info for {job_id}")
-            return None
-            
-        # Get output path from job info
-        outdirs = job_info.get("OutDir", [])
-        if not outdirs:
-            logger.error(f"No OutDir found for job {job_id}")
-            return None
-            
-        # Get first output directory
-        output_path = outdirs[0]
-        
-        # Find root folder marker
-        from app.core.config import settings
-        idx = output_path.find(settings.dropbox_root_marker)
-        if idx == -1:
-            logger.error(f"Dropbox root marker not found in path: {output_path}")
-            return None
-            
-        trimmed = output_path[idx:]
-        dropbox_path = "/" + trimmed.replace("\\", "/").lstrip("/")
-            
-        # Create temp directory for job
-        from pathlib import Path
-        temp_root = Path(settings.temp_dir)
-        conv_root = Path(settings.conv_dir)
-        temp_root.mkdir(exist_ok=True)
-        conv_root.mkdir(exist_ok=True)
-        
-        # Get folder name from path
-        exr_folder_name = Path(dropbox_path).parts[-1]  # Use parts[-1] instead of name
-        if not exr_folder_name:
-            exr_folder_name = job_id  # Fallback to job ID
-            
-        # Create job-specific directories
-        job_temp_dir = temp_root / f"{exr_folder_name}_{job_id}"
-        job_conv_dir = conv_root / f"{exr_folder_name}_{job_id}"
-        job_conv_dir.mkdir(exist_ok=True)
-        
-        # Get list of files to download
-        file_list = await download_job_folder(login, password, job_id)
-        if not file_list:
-            logger.error(f"Failed to get file list for job {job_id}")
-            return None
-        
-        # Convert files
-        await convert_exr_folder_to_srgb_optimized(file_list, job_conv_dir, settings.ocio_config_path)
-        
-        # Create video from converted files
-        video_path = assemble_video_from_jpg(job_conv_dir, str(exr_folder_name))  # Convert exr_folder_name to string
-        if not video_path:
-            logger.error("Failed to create video")
-            return None
-            
-        # Get metadata for upload
-        headers_dbx = {
-            "Authorization": f"Bearer {get_fresh_access_token()}",
-            "Dropbox-API-Select-User": settings.dropbox_team_member_id,
-            "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
-            "Content-Type": "application/json"
-        }
-        
-        session_dbx = await get_dropbox_session()
-        async with session_dbx.post(f"{settings.base_api_url}/files/upload", headers=headers_dbx, data=FSInputFile(Path(video_path))) as resp:
-            if resp.status != 200:
-                logger.error(f"Failed to upload video to Dropbox: {resp.status}")
-                return None
-                
-            # Get the final path from the response headers
-            dropbox_video_path = resp.headers.get("X-Dropbox-Path")
-            if not dropbox_video_path:
-                logger.error("Dropbox upload response missing X-Dropbox-Path header")
-                return None
-                
-            logger.info(f"Video uploaded to Dropbox: {dropbox_video_path}")
-            return str(video_path), dropbox_video_path
-        
-    except Exception as e:
-        logger.error(f"Error creating video from job {job_id}: {e}")
+    from app.auth import get_deadline_credentials
+
+    credentials = await get_deadline_credentials(telegram_user_id)
+    if not credentials:
+        logger.error("No Deadline credentials found for user %s", telegram_user_id)
         return None
 
+    login, password = credentials
+    job_info = await get_job_info(login, password, job_id)
+    if not job_info:
+        logger.error("Could not get job info for %s", job_id)
+        return None
 
-async def check_video_exists_in_dropbox(login: str, password: str, job_id: str) -> Optional[Dict[str, Any]]:
+    props = job_info.get("Props", {})
+    outdirs = job_info.get("OutDir", [])
+    if not outdirs:
+        logger.error("No OutDir found for job %s", job_id)
+        return None
+
+    output_path = outdirs[0]
+    idx = output_path.find(settings.dropbox_root_marker)
+    if idx == -1:
+        logger.warning("Dropbox root marker not found in path: %s", output_path)
+        dropbox_folder = output_path.replace("\\", "/")
+    else:
+        trimmed = output_path[idx:]
+        dropbox_folder = "/" + trimmed.replace("\\", "/").lstrip("/")
+
+    out_files = job_info.get("OutFile", [])
+    template_name = out_files[0] if out_files else ""
+    pattern = template_name or "*.exr"
+
+    def replace_hashes(match: re.Match) -> str:
+        return f"%0{len(match.group(0))}d"
+
+    pattern_fmt = re.sub(r"#+", replace_hashes, pattern)
+
+    video_base = Path(template_name).stem if template_name else props.get("Name") or props.get("Batch") or job_id
+    video_base = re.sub(r'#+', '', video_base)
+    video_base = re.sub(r'%0\d+d', '', video_base)
+    video_base = video_base.rstrip('. _')
+    video_base = _sanitize_windows_filename(video_base or job_id)
+    video_filename = f"{video_base}.mp4"
+
+    output_path_clean = output_path.rstrip("\\/") or output_path
+    is_windows_path = "\\" in output_path_clean or ":" in output_path_clean
+
+    if is_windows_path:
+        render_output_dir = ntpath.dirname(output_path_clean) or output_path_clean
+        input_sequence_path = ntpath.join(output_path_clean, pattern_fmt)
+        video_output_path = ntpath.join(render_output_dir, video_filename)
+    else:
+        render_output_dir = posixpath.dirname(output_path_clean) or output_path_clean
+        input_sequence_path = posixpath.join(output_path_clean, pattern_fmt)
+        video_output_path = posixpath.join(render_output_dir, video_filename)
+
+    expected_local_path = video_output_path
+
+    dropbox_folder_normalized = _normalize_dropbox_path(dropbox_folder)
+    if dropbox_folder_normalized:
+        dropbox_parent = PurePosixPath(dropbox_folder_normalized).parent
+        if str(dropbox_parent) in {"", "."}:
+            expected_dropbox_video = video_filename
+        else:
+            expected_dropbox_video = str(dropbox_parent / video_filename)
+    else:
+        expected_dropbox_video = video_filename
+
+    frames_str = props.get("Frames", "")
+    start_match = re.search(r"-?\d+", frames_str)
+    start_frame = int(start_match.group()) if start_match else 0
+
+    fps_value = props.get("PlugInfo", {}).get("FPS")
+    try:
+        frame_rate = float(fps_value) if fps_value is not None else 25.0
+    except (TypeError, ValueError):
+        frame_rate = 25.0
+
+    arguments = (
+        f'-y -start_number {start_frame} -framerate {frame_rate:g} '
+        f'-i "{input_sequence_path}" '
+        f'-c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p '
+        f'"{video_output_path}"'
+    ).strip()
+
+    tasks = await get_job_tasks(login, password, job_id)
+    slave_counter: Counter[str] = Counter(
+        task.get("Slave") for task in tasks if isinstance(task, dict) and task.get("Slave")
+    )
+    preferred_slaves = [slave for slave, _ in slave_counter.most_common()]
+    if not preferred_slaves:
+        mach = job_info.get("Mach")
+        if mach:
+            preferred_slaves = [mach]
+
+    preview_job_info: Dict[str, Any] = {
+        "Name": f"{props.get('Name', job_id)} - Preview",
+        "Batch": props.get("Batch") or props.get("Name") or "Preview",
+        "Plugin": "CommandLine",
+        "UserName": props.get("User") or login,
+        "Comment": f"Preview job generated by TasksBot for {job_id}",
+        "Frames": "0-0",
+        "ChunkSize": 1,
+        "Priority": props.get("Pri", 50),
+        "MachineLimit": len(preferred_slaves) if preferred_slaves else 0,
+        "JobDependency0": job_id,
+        "ExtraInfo0": expected_local_path,
+        "ExtraInfo1": expected_dropbox_video,
+        "ExtraInfoKeyValue0": f"PreviewLocal={expected_local_path}",
+        "ExtraInfoKeyValue1": f"PreviewDropbox={expected_dropbox_video}",
+        "ExtraInfoKeyValue2": "PreviewJob=1",
+    }
+    if props.get("Pool"):
+        preview_job_info["Pool"] = props["Pool"]
+    if props.get("SecPool"):
+        preview_job_info["SecondaryPool"] = props["SecPool"]
+    if props.get("Grp"):
+        preview_job_info["Group"] = props["Grp"]
+    if preferred_slaves:
+        preview_job_info["Whitelist"] = ",".join(preferred_slaves)
+
+    ffmpeg_exec = settings.ffmpeg_path or "ffmpeg"
+    command_line = f"{ffmpeg_exec} {arguments}".strip()
+    if is_windows_path:
+        quoted_exec = ffmpeg_exec
+        if " " in quoted_exec and not quoted_exec.startswith('"'):
+            quoted_exec = f'"{quoted_exec}"'
+        command_line = f"{quoted_exec} {arguments}".strip()
+        plugin_info = {
+            "Executable": "cmd.exe",
+            "Arguments": f"/C {command_line}",
+            "Shell": "default",
+            "StartupDirectory": render_output_dir,
+        }
+    else:
+        quoted_exec = shlex.quote(ffmpeg_exec)
+        command_line = f"{quoted_exec} {arguments}".strip()
+        plugin_info = {
+            "Executable": "/bin/bash",
+            "Arguments": f"-lc {shlex.quote(command_line)}",
+            "Shell": "default",
+            "StartupDirectory": render_output_dir,
+        }
+
+    try:
+        submission_response = await submit_deadline_job(
+            telegram_user_id=telegram_user_id,
+            job_info=preview_job_info,
+            plugin_info=plugin_info,
+            aux_files=None,
+            complete_submission=False,
+        )
+    except DeadlineSubmissionError as exc:
+        logger.error("Failed to submit preview job for %s: %s", job_id, exc)
+        return None
+
+    preview_job_id = submission_response.get("job_id") or submission_response.get("_id")
+    logger.info(
+        "Submitted preview job %s for %s (command: %s, whitelist: %s)",
+        preview_job_id,
+        job_id,
+        command_line,
+        preferred_slaves,
+    )
+
+    return {
+        "preview_job_id": preview_job_id,
+        "expected_dropbox_path": expected_dropbox_video,
+        "expected_local_path": expected_local_path,
+        "command_line": command_line,
+        "preferred_slaves": preferred_slaves,
+        "submission": submission_response,
+    }
+
+
+async def check_video_exists_in_dropbox(
+    login: str,
+    password: str,
+    job_id: str,
+    dropbox_path_hint: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """
     Check if video already exists in Dropbox for a job.
     
@@ -676,6 +934,7 @@ async def check_video_exists_in_dropbox(login: str, password: str, job_id: str) 
         login: User login
         password: User password
         job_id: Job ID
+        dropbox_path_hint: Optional explicit Dropbox path to the expected video file
         
     Returns:
         Video info dict if exists, None otherwise
@@ -686,35 +945,57 @@ async def check_video_exists_in_dropbox(login: str, password: str, job_id: str) 
         from app.integrations.dropbox_helpers import get_fresh_access_token, fetch_dropbox_metadata
         from app.core.config import settings
         
-        # Get job info to find output directory
-        job_info = await get_job_info(login, password, job_id)
-        if not job_info:
-            logger.error(f"Could not get job info for {job_id}")
-            return None
-            
-        outdirs = job_info.get("OutDir", [])
-        if not outdirs:
-            logger.error(f"No OutDir found for job {job_id}")
-            return None
-            
-        fullpath = outdirs[0]
-        # Find root folder marker
-        idx = fullpath.find(settings.dropbox_root_marker)
-        if idx == -1:
-            logger.error(f"Dropbox root marker not found in path: {fullpath}")
-            return None
-            
-        trimmed = fullpath[idx:]
-        dropbox_path = "/" + trimmed.replace("\\", "/").lstrip("/")
-        
+        session_dbx = await get_dropbox_session()
         headers_dbx = {
             "Authorization": f"Bearer {get_fresh_access_token()}",
             "Dropbox-API-Select-User": settings.dropbox_team_member_id,
             "Dropbox-API-Path-Root": {".tag": "root", "root": settings.dropbox_root_namespace_id},
             "Content-Type": "application/json"
         }
-        
-        session_dbx = await get_dropbox_session()
+
+        normalized_hint = _normalize_dropbox_path(dropbox_path_hint)
+        if normalized_hint:
+            try:
+                video_metadata = await fetch_dropbox_metadata(session_dbx, normalized_hint, headers_dbx)
+                if video_metadata.get(".tag") == "file":
+                    video_filename = PurePosixPath(normalized_hint).name
+                    return {
+                        "exists": True,
+                        "filename": video_filename,
+                        "dropbox_path": normalized_hint,
+                        "metadata": video_metadata,
+                    }
+            except Exception as hint_error:
+                logger.debug(
+                    "Dropbox hint lookup failed for job %s at %s: %s",
+                    job_id,
+                    normalized_hint,
+                    hint_error,
+                )
+
+        # Fallback to resolving path through the Deadline job
+        job_info = await get_job_info(login, password, job_id)
+        if not job_info:
+            logger.error(f"Could not get job info for {job_id}")
+            return None
+
+        outdirs = job_info.get("OutDir", [])
+        if not outdirs:
+            logger.error(f"No OutDir found for job {job_id}")
+            return None
+
+        fullpath = outdirs[0]
+        idx = fullpath.find(settings.dropbox_root_marker)
+        if idx == -1:
+            logger.error(f"Dropbox root marker not found in path: {fullpath}")
+            return None
+
+        trimmed = fullpath[idx:]
+        dropbox_path = _normalize_dropbox_path(trimmed)
+        if not dropbox_path:
+            logger.error(f"Failed to normalize Dropbox path for job {job_id}: {trimmed}")
+            return None
+
         # Get metadata for the folder
         metadata = await fetch_dropbox_metadata(session_dbx, dropbox_path, headers_dbx)
             
@@ -748,7 +1029,12 @@ async def check_video_exists_in_dropbox(login: str, password: str, job_id: str) 
         return None
 
 
-async def download_video_from_dropbox(login: str, password: str, job_id: str) -> Optional[tuple[str, str]]:
+async def download_video_from_dropbox(
+    login: str,
+    password: str,
+    job_id: str,
+    dropbox_path_hint: Optional[str] = None,
+) -> Optional[tuple[str, str]]:
     """
     Download existing video from Dropbox.
     
@@ -768,7 +1054,12 @@ async def download_video_from_dropbox(login: str, password: str, job_id: str) ->
         from app.core.config import settings
         
         # Check if video exists
-        video_info = await check_video_exists_in_dropbox(login, password, job_id)
+        video_info = await check_video_exists_in_dropbox(
+            login,
+            password,
+            job_id,
+            dropbox_path_hint=dropbox_path_hint,
+        )
         if not video_info:
             logger.error(f"Video not found in Dropbox for job {job_id}")
             return None

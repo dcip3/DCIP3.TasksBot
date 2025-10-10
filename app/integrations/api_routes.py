@@ -14,7 +14,6 @@ import hashlib
 import hmac
 import json
 import urllib.parse
-from pathlib import Path
 
 from app.auth import authenticate_user, is_authorized, logout_user, get_deadline_credentials
 from app.core.config import settings
@@ -333,33 +332,15 @@ async def create_job_video(job_id: str, current_user: int = Depends(get_current_
         if not credentials:
             raise HTTPException(status_code=401, detail="No credentials found")
         
-        login, password = credentials
-        video_path = await create_video_from_job(login, password, job_id)
-        
-        if video_path:
-            # Fetch job info to build the Dropbox link
-            job_info = await get_job_info(login, password, job_id)
-            if job_info:
-                outdirs = job_info.get("OutDir", [])
-                if outdirs:
-                    fullpath = outdirs[0]
-                    idx = fullpath.find(settings.dropbox_root_marker)
-                    if idx != -1:
-                        trimmed = fullpath[idx:]
-                        dropbox_path = "/" + trimmed.replace("\\", "/").lstrip("/")
-                        video_filename = Path(video_path).name
-                        video_dropbox_path = f"{dropbox_path}/{video_filename}"
-                        
-                        return {
-                            "success": True, 
-                            "video_path": video_path, 
-                            "video_dropbox_path": video_dropbox_path,
-                            "message": "Video created successfully"
-                        }
-            
-            return {"success": True, "video_path": video_path, "message": "Video created successfully"}
-        else:
-            raise HTTPException(status_code=404, detail="Failed to create video")
+        result = await create_video_from_job(current_user, job_id)
+        if not result:
+            raise HTTPException(status_code=500, detail="Failed to submit preview job")
+
+        return {
+            "success": True,
+            "message": "Preview job submitted to Deadline",
+            **result,
+        }
     except HTTPException:
         raise
     except Exception as e:
