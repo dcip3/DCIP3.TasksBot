@@ -1,4 +1,4 @@
-# app/api_routes.py
+# app/integrations/api_routes.py
 """
 API routes for Telegram Mini App integration.
 

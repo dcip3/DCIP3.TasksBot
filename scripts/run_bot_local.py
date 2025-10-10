@@ -25,8 +25,8 @@ async def main():
     try:
         # Import bot modules lazily to avoid side effects during startup
         from app.core.bot_core import dp, bot
-        from app.utils import on_startup, on_shutdown
-        from app.handlers import register_handlers
+        from app.core.utils import on_startup, on_shutdown
+        from app.bot.handlers import register_handlers
         
         logger.info("🚀 Starting TasksBot in local mode...")
         

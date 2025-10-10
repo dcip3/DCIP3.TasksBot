@@ -1,4 +1,4 @@
-# app/services.py
+# app/services/__init__.py
 """
 API service functions for Deadline and Dropbox integration.
 
@@ -15,13 +15,13 @@ import aiohttp
 from aiogram.types import FSInputFile
 
 from app.core.config import settings
-from app.dropbox_helpers import (
+from app.integrations.dropbox_helpers import (
     get_fresh_access_token,
     fetch_dropbox_metadata,
     download_exr_folder,
     upload_video_to_dropbox
 )
-from app.video_helpers import convert_exr_folder_to_srgb_optimized, assemble_video_from_jpg
+from app.integrations.video_helpers import convert_exr_folder_to_srgb_optimized, assemble_video_from_jpg
 from app.core.bot_core import get_aiosession
 
 logger = logging.getLogger(__name__)
@@ -482,7 +482,7 @@ async def download_job_folder(login: str, password: str, job_id: str) -> Optiona
     try:
         import aiohttp
         from pathlib import Path
-        from app.dropbox_helpers import (
+        from app.integrations.dropbox_helpers import (
             get_fresh_access_token, 
             fetch_dropbox_metadata
         )
@@ -683,7 +683,7 @@ async def check_video_exists_in_dropbox(login: str, password: str, job_id: str) 
     try:
         import aiohttp
         from pathlib import PurePosixPath
-        from app.dropbox_helpers import get_fresh_access_token, fetch_dropbox_metadata
+        from app.integrations.dropbox_helpers import get_fresh_access_token, fetch_dropbox_metadata
         from app.core.config import settings
         
         # Get job info to find output directory
@@ -764,7 +764,7 @@ async def download_video_from_dropbox(login: str, password: str, job_id: str) ->
         import aiohttp
         import json
         from pathlib import Path
-        from app.dropbox_helpers import get_fresh_access_token
+        from app.integrations.dropbox_helpers import get_fresh_access_token
         from app.core.config import settings
         
         # Check if video exists

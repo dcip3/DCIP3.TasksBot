@@ -14,11 +14,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # Import bot modules
 from app.core.bot_core import dp, bot
-from app.utils import on_startup, on_shutdown
-from app.handlers import register_handlers
+from app.core.utils import on_startup, on_shutdown
+from app.bot.handlers import register_handlers
 
 # Import API routes
-from app.api_routes import router as api_router
+from app.integrations.api_routes import router as api_router
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)

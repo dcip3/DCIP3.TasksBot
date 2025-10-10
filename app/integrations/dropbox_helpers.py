@@ -14,7 +14,7 @@ import functools
 import threading
 
 from app.core.config import settings
-from app.utils import make_progress_bar
+from app.core.utils import make_progress_bar
 
 logger = logging.getLogger(__name__)
 
@@ -247,7 +247,7 @@ async def process_file_batch(
     headers_dbx: dict
 ):
     """Process a batch of files - download and convert them."""
-    from app.video_helpers import convert_single_exr_file_streaming
+    from app.integrations.video_helpers import convert_single_exr_file_streaming
     
     batch = await file_queue.get_batch()
     if not batch:
@@ -469,7 +469,7 @@ async def download_exr_folder(
         
         # Process downloaded files
         conversion_tasks = []
-        from app.video_helpers import convert_single_exr_file_streaming
+        from app.integrations.video_helpers import convert_single_exr_file_streaming
         
         for success, (_, local_file, file_info) in zip(download_results, download_tasks):
             if success:

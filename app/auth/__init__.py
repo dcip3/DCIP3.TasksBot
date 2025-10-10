@@ -1,4 +1,4 @@
-# app/auth.py
+# app/auth/__init__.py
 """
 User authentication and management system.
 

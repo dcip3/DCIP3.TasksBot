@@ -1,4 +1,4 @@
-# app/handlers_new.py
+# app/bot/handlers.py
 """
 Telegram bot command and state handlers for aiogram 3.x.
 
@@ -15,7 +15,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.filters import Command, StateFilter
 
-from app.utils import authorized_only, get_main_keyboard
+from app.core.utils import authorized_only, get_main_keyboard
 from app.core.bot_core import bot, dp
 from app.core.config import settings
 from app.auth import authenticate_user, logout_user, is_authorized, toggle_notifications, save_deadline_credentials
@@ -24,10 +24,10 @@ from app.services import (
     requeue_job_by_user_id, resume_job_by_user_id, suspend_job_by_user_id, delete_job_by_user_id,
     download_job_folder, create_video_from_job, check_video_exists_in_dropbox, download_video_from_dropbox
 )
-from app.dropbox_helpers import download_exr_folder, fetch_dropbox_metadata, upload_video_to_dropbox
+from app.integrations.dropbox_helpers import download_exr_folder, fetch_dropbox_metadata, upload_video_to_dropbox
 from app.core.bot_core import download_states, stop_downloads
 import json
-from app.video_helpers import assemble_video_from_jpg
+from app.integrations.video_helpers import assemble_video_from_jpg
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -169,7 +169,7 @@ async def cmd_setup_menu(message: Message):
     Args:
         message: Telegram message object
     """
-    from app.utils import setup_menu_button
+    from app.core.utils import setup_menu_button
     try:
         await message.answer("🔄 Setting up menu button...")
         await setup_menu_button()
@@ -950,7 +950,7 @@ async def create_new_video_process(callback_query: CallbackQuery, login: str, pa
             local_root = temp_dir / f"{exr_folder_name}_{job_id}"
             local_root.mkdir(exist_ok=True)
             # Prepare Dropbox headers
-            from app.dropbox_helpers import get_fresh_access_token
+            from app.integrations.dropbox_helpers import get_fresh_access_token
             headers_dbx = {
                 "Authorization": f"Bearer {get_fresh_access_token()}",
                 "Dropbox-API-Select-User": settings.dropbox_team_member_id,
@@ -1001,7 +1001,7 @@ async def create_new_video_process(callback_query: CallbackQuery, login: str, pa
                 dropbox_video_path = dropbox_path  # fallback for caption
             # Step 3: Check file size and compress if needed for Telegram (50MB limit)
             await progress_msg.edit_text("📏 Step 3: Checking file size...")
-            from app.video_helpers import get_file_size_mb, compress_video_if_needed
+            from app.integrations.video_helpers import get_file_size_mb, compress_video_if_needed
             from pathlib import Path
             video_path_obj = Path(video_path)
             video_size_mb = get_file_size_mb(video_path_obj)
@@ -1038,7 +1038,7 @@ async def create_new_video_process(callback_query: CallbackQuery, login: str, pa
                 )
                 # Clean up compressed files if they were created
                 if final_video_path != video_path_obj:
-                    from app.video_helpers import cleanup_compressed_files
+                    from app.integrations.video_helpers import cleanup_compressed_files
                     cleanup_compressed_files(video_path_obj)
             except Exception as send_error:
                 logger.error(f"Error sending video: {send_error}")
@@ -1061,7 +1061,7 @@ async def create_new_video_process(callback_query: CallbackQuery, login: str, pa
             # Clean up temp and conv directories after successful video creation and sending
             # This matches the behavior of the old version
             try:
-                from app.utils import cleanup_temp_and_conv
+                from app.core.utils import cleanup_temp_and_conv
                 cleanup_temp_and_conv()
                 logger.info(f"Cleaned up temp and conv directories after video creation for job {job_id}")
             except Exception as cleanup_error:
@@ -1083,8 +1083,8 @@ async def create_new_video_process(callback_query: CallbackQuery, login: str, pa
             
             # Clean up job files even on error
             try:
-                from app.video_helpers import cleanup_job_files, cleanup_old_files
-                from app.utils import cleanup_temp_and_conv
+                from app.integrations.video_helpers import cleanup_job_files, cleanup_old_files
+                from app.core.utils import cleanup_temp_and_conv
                 cleanup_job_files(job_id)
                 # Clean up temp and conv directories
                 cleanup_temp_and_conv()
@@ -1098,8 +1098,8 @@ async def create_new_video_process(callback_query: CallbackQuery, login: str, pa
         logger.error(f"Error in create_new_video_process: {e}")
         # Clean up files even on critical error
         try:
-            from app.utils import cleanup_temp_and_conv
-            from app.video_helpers import cleanup_job_files, cleanup_old_files
+            from app.core.utils import cleanup_temp_and_conv
+            from app.integrations.video_helpers import cleanup_job_files, cleanup_old_files
             cleanup_job_files(job_id)
             cleanup_temp_and_conv()
             cleanup_old_files(max_age_hours=6)
@@ -1589,7 +1589,7 @@ async def send_dbx_video_callback(callback_query: CallbackQuery):
             
             # Check file size (no compression needed for documents up to 2GB)
             await progress_msg.edit_text("📏 Checking file size...")
-            from app.video_helpers import get_file_size_mb
+            from app.integrations.video_helpers import get_file_size_mb
             from aiogram.types import FSInputFile
             from pathlib import Path
             
@@ -1632,7 +1632,7 @@ async def send_dbx_video_callback(callback_query: CallbackQuery):
             # No compression cleanup needed - we send original files
                 
             # Clean up job files after successful send
-            from app.video_helpers import cleanup_job_files, cleanup_old_files
+            from app.integrations.video_helpers import cleanup_job_files, cleanup_old_files
             cleanup_job_files(job_id)
             # Also clean up old files to save disk space
             cleanup_old_files(max_age_hours=6)  # Clean files older than 6 hours
@@ -1640,7 +1640,7 @@ async def send_dbx_video_callback(callback_query: CallbackQuery):
             # Clean up temp and conv directories after successful video send
             # This matches the behavior of the old version
             try:
-                from app.utils import cleanup_temp_and_conv
+                from app.core.utils import cleanup_temp_and_conv
                 cleanup_temp_and_conv()
                 logger.info(f"Cleaned up temp and conv directories after video send for job {job_id}")
             except Exception as cleanup_error:
