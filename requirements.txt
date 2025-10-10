@@ -1,7 +1,8 @@
 # Core dependencies
-aiogram>=2.25.1
+aiogram>=3.2.0
 aiohttp>=3.8.0
 pydantic-settings>=2.0.0
+pydantic>=2.0.0
 requests>=2.31.0
 
 # API dependencies
@@ -11,29 +12,18 @@ uvicorn[standard]>=0.24.0
 # Image and video processing
 numpy>=1.21.0
 OpenEXR>=1.3.2
-opencolorio>=2.1.0
-scipy>=1.9.0
+OpenColorIO>=2.3.0
 Pillow>=10.0.0
 
 # Scheduling
 APScheduler>=3.10.0
 
-# Environment management
-python-dotenv>=0.19.0
-
 # Async support
-asyncio-mqtt>=0.11.0
 aiosqlite>=0.19.0
 aiofiles>=23.0.0
-
-# File handling
-pathlib2>=2.3.0
-
-# System monitoring
-psutil>=5.9.0
 
 # Development dependencies (optional)
 pytest>=7.0.0
 pytest-asyncio>=0.21.0
 black>=22.0.0
-flake8>=5.0.0 
+flake8>=5.0.0

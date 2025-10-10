@@ -1,96 +1,104 @@
 # TasksBot
 
-TasksBot — это интеграция Telegram-бота, API и мини-приложения WebApp для управления очередями рендеринга Deadline и файлами в Dropbox.
+TasksBot combines a Telegram bot, a FastAPI backend, and a Telegram WebApp to help teams monitor Deadline render jobs and manage project files stored in Dropbox.
 
-## Возможности
-- Telegram-бот на базе aiogram с авторизацией пользователей Deadline и набором команд для мониторинга и управления рендерами.
-- REST API на FastAPI (`main_api.py`) для мини-приложения и внешних интеграций.
-- Реал-тайм уведомления и прогресс-бар по статусам задач, включая конвертацию EXR → видео.
-- Dropbox-интеграция для скачивания исходников и выгрузки результатов.
-- Мини-приложение на React/Vite (`mini-app/`), работающее внутри Telegram.
-- Docker-compose окружение с Nginx-прокси и HTTPS (через шаблон в `infra/nginx`).
+## Features
+- Telegram bot built on aiogram v3 with Deadline-aware authentication and a rich set of commands for render management.
+- REST API served by FastAPI (`main_api.py`) for the WebApp and external integrations.
+- Real-time notifications, progress updates, and automated EXR → video conversions.
+- Dropbox integration for downloading source plates and uploading rendered media.
+- Telegram WebApp built with React/Vite (`mini-app/`) to provide a modern UI inside Telegram.
+- Docker Compose environment with Nginx reverse proxy and HTTPS templates (`infra/nginx`).
 
-## Структура репозитория
+## Repository Structure
 ```
 .
-├── app/                    # Серверная логика бота и API
+├── app/
+│   ├── auth/               # Authentication helpers and session storage
+│   ├── bot/                # Aiogram handlers, FSM, and routers
+│   ├── core/               # Configuration, database, and shared utilities
+│   ├── integrations/       # REST routes, Dropbox helpers, media pipelines
+│   ├── services/           # Business logic and external API clients
+│   └── storage/            # Helpers for local storage directories
 ├── infra/
-│   ├── backend/            # Dockerfile backend-сервиса
-│   └── nginx/              # Шаблоны конфигурации для Nginx
-├── mini-app/               # Исходники Telegram WebApp (React)
+│   ├── backend/            # Backend Dockerfile
+│   └── nginx/              # Nginx configuration templates
+├── mini-app/               # Telegram WebApp (React + Vite)
 ├── scripts/
-│   └── run_bot_local.py    # Удобный запуск бота без FastAPI/mini-app
+│   └── run_bot_local.py    # Local bot runner without FastAPI/WebApp
 ├── storage/
-│   ├── config.ocio         # OCIO конфиг для конвертации
-│   ├── tasks_bot.db        # SQLite база (создается автоматически)
-│   ├── conv/               # Конвертированные медиафайлы (gitignored)
-│   └── temp/               # Временные данные скачиваний (gitignored)
-├── config.ocio             # Конфигурация OpenColorIO для конвертации
-├── docker-compose.yml      # Docker Compose окружение
-├── main_api.py             # Точка входа (bot + FastAPI)
-├── requirements.txt        # Python зависимости
+│   ├── config.ocio         # OCIO configuration for color conversion
+│   ├── tasks_bot.db        # SQLite database (created on first run)
+│   ├── conv/               # Converted media artifacts (gitignored)
+│   └── temp/               # Temporary download data (gitignored)
+├── docker-compose.yml      # Docker Compose environment
+├── main_api.py             # Entry point (bot + FastAPI app)
+├── requirements.txt        # Python dependencies
 └── README.md
 ```
 
-## Предварительные требования
+## Prerequisites
 - Python 3.11+
-- Node.js 18+ (для сборки мини-приложения)
-- Docker & Docker Compose (для контейнерного запуска)
-- Аккаунт Telegram Bot API, доступ к Deadline API и Dropbox App credentials
+- Node.js 18+ (for the WebApp)
+- Docker & Docker Compose (optional but recommended)
+- Credentials for Telegram Bot API, Deadline REST API, and Dropbox App
 
-## Конфигурация окружения
-Создайте файл `.env` (можно скопировать из `.env.example`, если появится) и задайте ключевые переменные:
+## Environment Configuration
+Use `.env.example` as a template:
 
-- `APP_DOMAIN` — домен, на котором будет работать фронт+API (нужен для Nginx и сертификатов).
-- `BASE_API_URL` — адрес Deadline RCS API.
-- `TG_API_TOKEN` — токен Telegram-бота.
-- `PASSWORD_SALT` — соль для PBKDF2-хеширования паролей.
-- Блок настроек Dropbox (`DROPBOX_*`).
-- Локальные пути и файлы (`DB_PATH`, `TEMP_DIR`, `CONV_DIR`, `OCIO_CONFIG_PATH`, `MINI_APP_URL` и т. д.).
+- `APP_DOMAIN`, `BASE_API_URL`, `HTTP_TIMEOUT` — public endpoints and Deadline connectivity.
+- `TG_API_TOKEN` — Telegram bot token.
+- `DROPBOX_*` — Dropbox App credentials and namespace details.
+- `DB_PATH`, `CREDENTIALS_FILE`, `TEMP_DIR`, `CONV_DIR`, `OCIO_CONFIG_PATH` — local storage paths.
+- `MAX_CONCURRENT_DOWNLOADS`, `MIN_FREE_SPACE_BYTES` — background download limits.
+- `PASSWORD_SALT` — PBKDF2 salt for user credentials stored in SQLite.
 
-Создайте структуру каталога `storage/` (при первом запуске Docker-compose она создастся автоматически, но для локального запуска удобнее подготовить вручную):
+Prepare the `storage/` directory before the first local launch:
 
 ```bash
 mkdir -p storage/conv storage/temp
-cp path/to/config.ocio storage/config.ocio   # если файл ещё не скопирован
+cp path/to/config.ocio storage/config.ocio  # Only if the file is not yet present
 ```
-База данных `storage/tasks_bot.db` появится автоматически при первом запуске приложения.
+The SQLite database (`storage/tasks_bot.db`) is created automatically the first time the app runs.
 
-## Локальный запуск (Python)
+## Local Run (Python)
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 python scripts/run_bot_local.py
 ```
-Бот стартует в Telegram-режиме (без FastAPI и мини-приложения).
+The bot runs in polling mode without starting FastAPI or the WebApp.
 
-## Локальный запуск (Docker Compose)
+## Local Run (Docker Compose)
 ```bash
 docker compose --env-file .env up --build
 ```
-Будут подняты три контейнера:
-- `backend` (бот + API)
-- `frontend` (мини-приложение на Vite)
-- `nginx` (reverse proxy, HTTPS, проксирование /api и фронта)
+Docker Compose launches three containers:
+- `backend` (Telegram bot + FastAPI)
+- `frontend` (Vite-based WebApp)
+- `nginx` (reverse proxy with HTTPS support)
 
-Убедитесь, что сертификаты Let’s Encrypt лежат по путям `/etc/letsencrypt/live/${APP_DOMAIN}/...` на хосте. `docker-compose.yml` загружает переменные из `.env`, так что файл должен находиться в корне репозитория при запуске.
+Make sure Let’s Encrypt certificates are available under `/etc/letsencrypt/live/${APP_DOMAIN}/...` on the host. `docker-compose.yml` reads `.env`, so keep that file in the project root.
 
-## Разработка мини-приложения
+## WebApp Development
 ```bash
 cd mini-app
 npm install
 npm run dev
 ```
-В `.env` мини-приложения задайте `VITE_API_URL`, либо позвольте приложению использовать `window.location.origin` (fallback уже реализован).
+Configure `VITE_API_URL` inside `mini-app/.env` or rely on the built-in fallback to `window.location.origin`.
 
-## Дополнительные скрипты и утилиты
-- `scripts/run_bot_local.py` — быстрый запуск телеграм-бота.
-- `infra/nginx/nginx.conf.template` — шаблон Nginx, переменная `${APP_DOMAIN}` подменяется через entrypoint контейнера.
-- `infra/backend/Dockerfile` — Dockerfile backend-сервиса.
+## Tooling & Scripts
+- `scripts/run_bot_local.py` — quick launcher for the Telegram bot.
+- `infra/nginx/nginx.conf.template` — Nginx template with `${APP_DOMAIN}` placeholders.
+- `infra/backend/Dockerfile` — backend Dockerfile used by Compose.
 
-## Полезные ссылки
-- [aiogram](https://docs.aiogram.dev/)
+## Dependencies
+All runtime dependencies live in `requirements.txt`: aiogram 3, FastAPI, APScheduler, aiosqlite, aiofiles, OpenEXR, OpenColorIO, numpy, Pillow, and more. Running `pip install -r requirements.txt` also installs recommended dev tools (`pytest`, `pytest-asyncio`, `black`, `flake8`).
+
+## Useful Links
+- [aiogram Documentation](https://docs.aiogram.dev/)
 - [Deadline REST API](https://docs.thinkboxsoftware.com/products/deadline/)
-- [Dropbox API](https://www.dropbox.com/developers/documentation/http/overview)
-- [Telegram WebApp](https://core.telegram.org/bots/webapps)
+- [Dropbox HTTP API](https://www.dropbox.com/developers/documentation/http/overview)
+- [Telegram WebApp Docs](https://core.telegram.org/bots/webapps)
