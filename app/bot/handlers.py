@@ -9,6 +9,7 @@ worker monitoring, and realtime operations.
 
 import logging
 import asyncio
+from datetime import datetime
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.fsm.context import FSMContext
@@ -34,6 +35,53 @@ logger = logging.getLogger(__name__)
 
 # Create router
 router = Router()
+
+# Column width constants for text tables
+BATCH_COLUMN_WIDTH = 22
+PAGE_SIZE = 6
+
+
+async def compute_batch_activity_timestamp(batch_jobs: list[dict]) -> datetime:
+    """Return the batch creation timestamp based on job-level metadata."""
+    for job in sorted(batch_jobs, key=lambda j: j.get('Date') or '', reverse=True):
+        date_value = job.get('Date') if isinstance(job, dict) else None
+        if not date_value:
+            continue
+        try:
+            return datetime.fromisoformat(date_value)
+        except ValueError:
+            continue
+    return datetime.min
+
+
+def truncate_cell(text: str, max_width: int = BATCH_COLUMN_WIDTH) -> str:
+    """
+    Ensure table cell content fits the allocated width.
+
+    Args:
+        text: Original string to display.
+        max_width: Maximum allowed characters for the column.
+
+    Returns:
+        Possibly truncated string with ellipsis if it exceeds the width.
+    """
+    text = str(text)
+    if len(text) <= max_width:
+        return text
+    if max_width <= 4:
+        return text[:max_width]
+
+    ellipsis = "..."
+    tail_len = min(3, len(text))
+    prefix_len = max_width - len(ellipsis) - tail_len
+
+    if prefix_len < 1:
+        tail_len = max_width - len(ellipsis) - 1
+        if tail_len < 1:
+            return text[:max_width]
+        prefix_len = 1
+
+    return text[:prefix_len] + ellipsis + text[-tail_len:]
 
 # ============================================================================
 # === STATE MACHINES ===
@@ -264,7 +312,6 @@ async def handle_jobs(message: Message, page: int = 0):
             grouped_jobs[batch].append(job)
         
         # Combine jobs by batch (like in old version)
-        from datetime import datetime
         combined_jobs = []
         for batch, batch_jobs in grouped_jobs.items():
             total_tasks = sum(j.get("Props", {}).get("Tasks", 0) for j in batch_jobs)
@@ -285,81 +332,47 @@ async def handle_jobs(message: Message, page: int = 0):
             else:
                 batch_stat = 0      # Unknown
                 
-            # Determine the most recent Date among jobs in this batch
-            dates = []
-            for j in batch_jobs:
-                date_str = j.get("Date")
-                if date_str:
-                    try:
-                        dates.append(datetime.fromisoformat(date_str))
-                    except Exception:
-                        pass
-            max_date = max(dates) if dates else datetime.min
+            latest_activity = await compute_batch_activity_timestamp(batch_jobs)
             
             combined_jobs.append({
                 "_id": batch_jobs[0].get("_id"),
                 "Props": {"Batch": batch, "Tasks": total_tasks},
                 "CompletedChunks": completed_chunks,
                 "Stat": batch_stat,
-                "DateParsed": max_date
+                "DateParsed": latest_activity
             })
         
         # Sort by DateParsed descending (newest first)
         combined_jobs.sort(key=lambda j: j["DateParsed"], reverse=True)
         
-        # Pagination: 4 jobs per page
-        jobs_slice = combined_jobs[page*4 : page*4+4]
-        normal_jobs = [job for job in jobs_slice if job.get("Stat", 0) != 2]
-        suspended_jobs = [job for job in jobs_slice if job.get("Stat", 0) == 2]
+        # Pagination by newest first
+        jobs_slice = combined_jobs[page * PAGE_SIZE : page * PAGE_SIZE + PAGE_SIZE]
         
         # Format message in old style with HTML pre tags
         messages = []
         buttons = []
         
-        for job in normal_jobs:
+        for job in jobs_slice:
             props = job.get("Props", {})
             batch = props.get("Batch", "Untitled")
+            display_batch = truncate_cell(batch)
             total_tasks = props.get("Tasks", 0)
             completed_chunks = job.get("CompletedChunks", 0)
             progress_str = format_progress_old(completed_chunks, total_tasks)
             stat = job.get("Stat", 0)
             
-            if stat == 3:
-                icon = "✅"
-            else:
-                icon = "▶️"
+            icon = "✅" if stat == 3 else "⏸️" if stat == 2 else "▶️"
                 
-            messages.append(f"{icon} {batch:<22} {progress_str:^16}\n{'-'*40}")
+            messages.append(
+                f"{icon} {display_batch:<{BATCH_COLUMN_WIDTH}} {progress_str:^16}\n{'-'*40}"
+            )
             
             # Add button for this job
             job_id = job.get("_id")
             if job_id:
                 buttons.append(InlineKeyboardButton(text=batch, callback_data=f"job_info:{job_id}"))
         
-        # Add suspended jobs section
-        if suspended_jobs:
-            messages.append("")
-            title = " suspended "
-            line_length = 40
-            dashes_each_side = (line_length - len(title)) // 2
-            separator = "-" * dashes_each_side + title + "-" * (line_length - dashes_each_side - len(title))
-            messages.append(separator)
-            
-            for job in suspended_jobs:
-                props = job.get("Props", {})
-                batch = props.get("Batch", "Untitled")
-                total_tasks = props.get("Tasks", 0)
-                completed_chunks = job.get("CompletedChunks", 0)
-                progress_str = format_progress_old(completed_chunks, total_tasks)
-                
-                messages.append(f"⏸️ {batch:<22} {progress_str:^16}\n{'-'*40}")
-                
-                # Add button for this suspended job
-                job_id = job.get("_id")
-                if job_id:
-                    buttons.append(InlineKeyboardButton(text=batch, callback_data=f"job_info:{job_id}"))
-        
-        header = f"{'Batch':<24} {'Progress':^16}"
+        header = f"{'Batch':<{BATCH_COLUMN_WIDTH + 2}} {'Progress':^16}"
         header += f"\n{'-'*40}"
         batch_text = "\n".join(messages) if messages else "No data"
         
@@ -377,7 +390,7 @@ async def handle_jobs(message: Message, page: int = 0):
             
             # Navigation buttons
             total_items = len(combined_jobs)
-            total_pages = (total_items + 3) // 4
+            total_pages = (total_items + PAGE_SIZE - 1) // PAGE_SIZE
             nav_buttons = []
             if page > 0:
                 nav_buttons.append(InlineKeyboardButton(text="⬅ Back", callback_data=f"jobs_page:{page-1}"))
@@ -584,7 +597,6 @@ async def jobs_page_callback(callback_query: CallbackQuery):
             grouped_jobs[batch].append(job)
         
         # Combine jobs by batch (like in old version)
-        from datetime import datetime
         combined_jobs = []
         for batch, batch_jobs in grouped_jobs.items():
             total_tasks = sum(j.get("Props", {}).get("Tasks", 0) for j in batch_jobs)
@@ -605,81 +617,47 @@ async def jobs_page_callback(callback_query: CallbackQuery):
             else:
                 batch_stat = 0      # Unknown
                 
-            # Determine the most recent Date among jobs in this batch
-            dates = []
-            for j in batch_jobs:
-                date_str = j.get("Date")
-                if date_str:
-                    try:
-                        dates.append(datetime.fromisoformat(date_str))
-                    except Exception:
-                        pass
-            max_date = max(dates) if dates else datetime.min
+            latest_activity = await compute_batch_activity_timestamp(batch_jobs)
             
             combined_jobs.append({
                 "_id": batch_jobs[0].get("_id"),
                 "Props": {"Batch": batch, "Tasks": total_tasks},
                 "CompletedChunks": completed_chunks,
                 "Stat": batch_stat,
-                "DateParsed": max_date
+                "DateParsed": latest_activity
             })
         
         # Sort by DateParsed descending (newest first)
         combined_jobs.sort(key=lambda j: j["DateParsed"], reverse=True)
         
         # Pagination: 4 jobs per page
-        jobs_slice = combined_jobs[page*4 : page*4+4]
-        normal_jobs = [job for job in jobs_slice if job.get("Stat", 0) != 2]
-        suspended_jobs = [job for job in jobs_slice if job.get("Stat", 0) == 2]
+        jobs_slice = combined_jobs[page * PAGE_SIZE : page * PAGE_SIZE + PAGE_SIZE]
         
         # Format message in old style with HTML pre tags
         messages = []
         buttons = []
         
-        for job in normal_jobs:
+        for job in jobs_slice:
             props = job.get("Props", {})
             batch = props.get("Batch", "Untitled")
+            display_batch = truncate_cell(batch)
             total_tasks = props.get("Tasks", 0)
             completed_chunks = job.get("CompletedChunks", 0)
             progress_str = format_progress_old(completed_chunks, total_tasks)
             stat = job.get("Stat", 0)
             
-            if stat == 3:
-                icon = "✅"
-            else:
-                icon = "▶️"
+            icon = "✅" if stat == 3 else "⏸️" if stat == 2 else "▶️"
                 
-            messages.append(f"{icon} {batch:<22} {progress_str:^16}\n{'-'*40}")
+            messages.append(
+                f"{icon} {display_batch:<{BATCH_COLUMN_WIDTH}} {progress_str:^16}\n{'-'*40}"
+            )
             
             # Add button for this job
             job_id = job.get("_id")
             if job_id:
                 buttons.append(InlineKeyboardButton(text=batch, callback_data=f"job_info:{job_id}"))
         
-        # Add suspended jobs section
-        if suspended_jobs:
-            messages.append("")
-            title = " suspended "
-            line_length = 40
-            dashes_each_side = (line_length - len(title)) // 2
-            separator = "-" * dashes_each_side + title + "-" * (line_length - dashes_each_side - len(title))
-            messages.append(separator)
-            
-            for job in suspended_jobs:
-                props = job.get("Props", {})
-                batch = props.get("Batch", "Untitled")
-                total_tasks = props.get("Tasks", 0)
-                completed_chunks = job.get("CompletedChunks", 0)
-                progress_str = format_progress_old(completed_chunks, total_tasks)
-                
-                messages.append(f"⏸️ {batch:<22} {progress_str:^16}\n{'-'*40}")
-                
-                # Add button for this suspended job
-                job_id = job.get("_id")
-                if job_id:
-                    buttons.append(InlineKeyboardButton(text=batch, callback_data=f"job_info:{job_id}"))
-        
-        header = f"{'Batch':<24} {'Progress':^16}"
+        header = f"{'Batch':<{BATCH_COLUMN_WIDTH + 2}} {'Progress':^16}"
         header += f"\n{'-'*40}"
         batch_text = "\n".join(messages) if messages else "No data"
         
@@ -697,7 +675,7 @@ async def jobs_page_callback(callback_query: CallbackQuery):
             
             # Navigation buttons
             total_items = len(combined_jobs)
-            total_pages = (total_items + 3) // 4
+            total_pages = (total_items + PAGE_SIZE - 1) // PAGE_SIZE
             nav_buttons = []
             if page > 0:
                 nav_buttons.append(InlineKeyboardButton(text="⬅ Back", callback_data=f"jobs_page:{page-1}"))
@@ -1151,81 +1129,47 @@ async def jobs_back_callback(callback_query: CallbackQuery):
                 else:
                     batch_stat = 0      # Unknown
                     
-                # Determine the most recent Date among jobs in this batch
-                dates = []
-                for j in batch_jobs:
-                    date_str = j.get("Date")
-                    if date_str:
-                        try:
-                            dates.append(datetime.fromisoformat(date_str))
-                        except Exception:
-                            pass
-                max_date = max(dates) if dates else datetime.min
+                latest_activity = await compute_batch_activity_timestamp(batch_jobs)
                 
                 combined_jobs.append({
                     "_id": batch_jobs[0].get("_id"),
                     "Props": {"Batch": batch, "Tasks": total_tasks},
                     "CompletedChunks": completed_chunks,
                     "Stat": batch_stat,
-                    "DateParsed": max_date
+                    "DateParsed": latest_activity
                 })
             
             # Sort by DateParsed descending (newest first)
             combined_jobs.sort(key=lambda j: j["DateParsed"], reverse=True)
             
-            # Pagination: 4 jobs per page
-            jobs_slice = combined_jobs[0*4 : 0*4+4]
-            normal_jobs = [job for job in jobs_slice if job.get("Stat", 0) != 2]
-            suspended_jobs = [job for job in jobs_slice if job.get("Stat", 0) == 2]
+            # Pagination: first page preview
+            jobs_slice = combined_jobs[:PAGE_SIZE]
             
             # Format message in old style with HTML pre tags
             messages = []
             buttons = []
             
-            for job in normal_jobs:
+            for job in jobs_slice:
                 props = job.get("Props", {})
                 batch = props.get("Batch", "Untitled")
+                display_batch = truncate_cell(batch)
                 total_tasks = props.get("Tasks", 0)
                 completed_chunks = job.get("CompletedChunks", 0)
                 progress_str = format_progress_old(completed_chunks, total_tasks)
                 stat = job.get("Stat", 0)
                 
-                if stat == 3:
-                    icon = "✅"
-                else:
-                    icon = "▶️"
+                icon = "✅" if stat == 3 else "⏸️" if stat == 2 else "▶️"
                     
-                messages.append(f"{icon} {batch:<22} {progress_str:^16}\n{'-'*40}")
+                messages.append(
+                    f"{icon} {display_batch:<{BATCH_COLUMN_WIDTH}} {progress_str:^16}\n{'-'*40}"
+                )
                 
                 # Add button for this job
                 job_id = job.get("_id")
                 if job_id:
                     buttons.append(InlineKeyboardButton(text=batch, callback_data=f"job_info:{job_id}"))
             
-            # Add suspended jobs section
-            if suspended_jobs:
-                messages.append("")
-                title = " suspended "
-                line_length = 40
-                dashes_each_side = (line_length - len(title)) // 2
-                separator = "-" * dashes_each_side + title + "-" * (line_length - dashes_each_side - len(title))
-                messages.append(separator)
-                
-                for job in suspended_jobs:
-                    props = job.get("Props", {})
-                    batch = props.get("Batch", "Untitled")
-                    total_tasks = props.get("Tasks", 0)
-                    completed_chunks = job.get("CompletedChunks", 0)
-                    progress_str = format_progress_old(completed_chunks, total_tasks)
-                    
-                    messages.append(f"⏸️ {batch:<22} {progress_str:^16}\n{'-'*40}")
-                    
-                    # Add button for this suspended job
-                    job_id = job.get("_id")
-                    if job_id:
-                        buttons.append(InlineKeyboardButton(text=batch, callback_data=f"job_info:{job_id}"))
-            
-            header = f"{'Batch':<24} {'Progress':^16}"
+            header = f"{'Batch':<{BATCH_COLUMN_WIDTH + 2}} {'Progress':^16}"
             header += f"\n{'-'*40}"
             batch_text = "\n".join(messages) if messages else "No data"
             
@@ -1243,7 +1187,7 @@ async def jobs_back_callback(callback_query: CallbackQuery):
                 
                 # Navigation buttons
                 total_items = len(combined_jobs)
-                total_pages = (total_items + 3) // 4
+                total_pages = (total_items + PAGE_SIZE - 1) // PAGE_SIZE
                 nav_buttons = []
                 if 0 > 0:
                     nav_buttons.append(InlineKeyboardButton(text="⬅ Back", callback_data=f"jobs_page:{0-1}"))
@@ -1290,7 +1234,6 @@ async def handle_realtime(message: Message):
 
     async def realtime_loop():
         from collections import defaultdict
-        from datetime import datetime
         try:
             msg = await message.answer("Loading...")
             last_text = None
@@ -1318,49 +1261,28 @@ async def handle_realtime(message: Message):
                         batch_stat = 3
                     else:
                         batch_stat = 0
-                    dates = []
-                    for j in batch_jobs:
-                        date_str = j.get("Date")
-                        if date_str:
-                            try:
-                                dates.append(datetime.fromisoformat(date_str))
-                            except Exception:
-                                pass
-                    max_date = max(dates) if dates else datetime.min
+                    latest_activity = await compute_batch_activity_timestamp(batch_jobs)
                     combined_jobs.append({
                         "Props": {"Batch": batch, "Tasks": total_tasks},
                         "CompletedChunks": completed_chunks,
                         "Stat": batch_stat,
-                        "DateParsed": max_date
+                        "DateParsed": latest_activity
                     })
                 combined_jobs.sort(key=lambda j: j["DateParsed"], reverse=True)
-                normal_jobs = [job for job in combined_jobs if job.get("Stat", 0) != 2]
-                suspended_jobs = [job for job in combined_jobs if job.get("Stat", 0) == 2]
                 messages = []
-                for job in normal_jobs:
+                for job in combined_jobs:
                     props = job.get("Props", {})
                     batch = props.get("Batch", "Untitled")
+                    display_batch = truncate_cell(batch)
                     total_tasks = props.get("Tasks", 0)
                     completed_chunks = job.get("CompletedChunks", 0)
                     progress_str = format_progress_old(completed_chunks, total_tasks)
                     stat = job.get("Stat", 0)
-                    icon = "✅" if stat == 3 else "▶️"
-                    messages.append(f"{icon} {batch:<22} {progress_str:^16}\n{'-'*40}")
-                if suspended_jobs:
-                    messages.append("")
-                    title = " suspended "
-                    line_length = 40
-                    dashes_each_side = (line_length - len(title)) // 2
-                    separator = "-" * dashes_each_side + title + "-" * (line_length - dashes_each_side - len(title))
-                    messages.append(separator)
-                    for job in suspended_jobs:
-                        props = job.get("Props", {})
-                        batch = props.get("Batch", "Untitled")
-                        total_tasks = props.get("Tasks", 0)
-                        completed_chunks = job.get("CompletedChunks", 0)
-                        progress_str = format_progress_old(completed_chunks, total_tasks)
-                        messages.append(f"⏸️ {batch:<22} {progress_str:^16}\n{'-'*40}")
-                header = f"{'Batch':<24} {'Progress':^16}"
+                    icon = "✅" if stat == 3 else "⏸️" if stat == 2 else "▶️"
+                    messages.append(
+                        f"{icon} {display_batch:<{BATCH_COLUMN_WIDTH}} {progress_str:^16}\n{'-'*40}"
+                    )
+                header = f"{'Batch':<{BATCH_COLUMN_WIDTH + 2}} {'Progress':^16}"
                 header += f"\n{'-'*40}"
                 batch_text = "\n".join(messages) if messages else "No data"
                 new_text = f"<pre>{header}\n{batch_text}</pre>"
@@ -1514,7 +1436,7 @@ async def tasks_job_callback(callback_query: CallbackQuery):
             else:           # Unknown or other states
                 return "❓"
 
-        from datetime import datetime, timezone
+        from datetime import datetime
         for task in tasks:
             frames = task.get("Frames", "")
             prog = task.get("Prog", "")
