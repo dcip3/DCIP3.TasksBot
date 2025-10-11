@@ -48,6 +48,67 @@ scheduler = AsyncIOScheduler(timezone="Europe/Moscow", job_defaults={'coalesce':
 # Track jobs that have been notified about
 notified_jobs = set()
 
+# Track preview submission progress messages (preview_job_id -> (chat_id, message_id))
+preview_message_registry: dict[str, tuple[int, int]] = {}
+preview_animation_tasks: dict[str, asyncio.Task] = {}
+
+# ============================================================================
+# === PREVIEW HELPERS ===
+# ============================================================================
+
+
+def register_preview_message(preview_job_id: str, chat_id: int, message_id: int) -> None:
+    """Store the progress message info for a preview job."""
+    preview_message_registry[preview_job_id] = (chat_id, message_id)
+    existing = preview_animation_tasks.get(preview_job_id)
+    if existing and not existing.done():
+        existing.cancel()
+    preview_animation_tasks[preview_job_id] = asyncio.create_task(
+        _run_preview_animation(preview_job_id, chat_id, message_id)
+    )
+
+
+def pop_preview_message(preview_job_id: str) -> Optional[tuple[int, int]]:
+    """Retrieve and remove stored progress message for a preview job."""
+    info = preview_message_registry.pop(preview_job_id, None)
+    task = preview_animation_tasks.pop(preview_job_id, None)
+    if task and not task.done():
+        task.cancel()
+    return info
+
+
+async def _run_preview_animation(preview_job_id: str, chat_id: int, message_id: int) -> None:
+    """Animate the preview queued message until the job finishes."""
+    frames = ["□ □ □", "■ □ □", "■ ■ □", "■ ■ ■"]
+    index = 1  # start from next frame to avoid "message is not modified"
+    try:
+        while preview_message_registry.get(preview_job_id) == (chat_id, message_id):
+            frame = frames[index % len(frames)]
+            text = f"✅ Preview job queued\n{frame}"
+            try:
+                await bot.edit_message_text(
+                    text,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                )
+            except Exception as edit_error:
+                message = str(edit_error).lower()
+                if "message is not modified" in message:
+                    index += 1
+                    await asyncio.sleep(1)
+                    continue
+                logger.debug(
+                    "Preview animation edit failed for job %s: %s",
+                    preview_job_id,
+                    edit_error,
+                )
+                return
+            index += 1
+            await asyncio.sleep(2)
+    except asyncio.CancelledError:
+        logger.debug("Preview animation task cancelled for job %s", preview_job_id)
+        return
+
 # ============================================================================
 # === PREVIEW HELPERS ===
 # ============================================================================
@@ -113,7 +174,7 @@ async def _notify_preview_job_completion(
         if local_path is None:
             await bot.send_message(
                 telegram_user_id,
-                f"⚠️ Превью для задачи {job_name} создано, но путь к файлу не указан.",
+                f"⚠️ Preview for {job_name} is ready, but the file path is missing.",
             )
             logger.warning("Preview job %s has no recorded paths", job_id)
             return
@@ -127,7 +188,7 @@ async def _notify_preview_job_completion(
             await bot.send_message(
                 telegram_user_id,
                 (
-                    f"⚠️ Превью для задачи {job_name} завершено, но файл пока не найден по пути:\n"
+                    f"⚠️ Preview for {job_name} finished, but the file is still not available at:\n"
                     f"{local_path}"
                 ),
             )
@@ -147,10 +208,28 @@ async def _notify_preview_job_completion(
         caption_parts.append(f"<code>{dropbox_path}</code>")
     caption = "\n".join(caption_parts)
 
-    await bot.send_message(
-        telegram_user_id,
-        f"🎬 Превью для задачи {job_name} готово.",
-    )
+    ready_text = f"🎬 Preview for {job_name} is ready."
+    stored_message = pop_preview_message(job_id)
+    if stored_message:
+        chat_id, message_id = stored_message
+        try:
+            await bot.edit_message_text(
+                ready_text,
+                chat_id=chat_id,
+                message_id=message_id,
+            )
+        except Exception as edit_error:
+            logger.warning(
+                "Failed to edit preview progress message for job %s: %s",
+                job_id,
+                edit_error,
+            )
+            await bot.send_message(telegram_user_id, ready_text)
+    else:
+        await bot.send_message(
+            telegram_user_id,
+            ready_text,
+        )
     await bot.send_video(
         telegram_user_id,
         FSInputFile(str(final_path)),
@@ -160,6 +239,21 @@ async def _notify_preview_job_completion(
 
     if downloaded_temp:
         await asyncio.to_thread(final_path.unlink, missing_ok=True)
+
+    try:
+        from app.services import delete_job
+
+        deleted = await delete_job(login, password, job_id)
+        if deleted:
+            logger.info("Preview job %s deleted from Deadline after completion", job_id)
+        else:
+            logger.warning("Failed to delete preview job %s from Deadline", job_id)
+    except Exception as delete_error:
+        logger.warning(
+            "Error deleting preview job %s from Deadline: %s",
+            job_id,
+            delete_error,
+        )
 
     logger.info("Preview video sent to user %s for job %s", telegram_user_id, job_id)
 
@@ -723,18 +817,18 @@ async def job_progress_watcher(bot):
                                         notified_jobs.add((job_id, telegram_user_id))
                                         continue
 
-                                    batch = props.get("Batch", "Без серии")
+                                    batch = props.get("Batch") or "No Batch"
                                     message_text = (
-                                        "✅ Задача завершена:\n"
-                                        f"• Серия: {batch}\n"
-                                        f"• Имя: {name}"
+                                        "✅ Job completed:\n"
+                                        f"• Batch: {batch}\n"
+                                        f"• Name: {name}"
                                     )
 
                                     preview_markup = InlineKeyboardMarkup(
                                         inline_keyboard=[
                                             [
                                                 InlineKeyboardButton(
-                                                    text="🔍 Превью",
+                                                    text="🔍 Preview",
                                                     callback_data=f"preview_job:{job_id}"
                                                 )
                                             ]
@@ -746,7 +840,12 @@ async def job_progress_watcher(bot):
                                         message_text,
                                         reply_markup=preview_markup
                                     )
-                                    logger.info(f"Уведомление отправлено пользователю {telegram_user_id} по задаче {job_id} ({name})")
+                                    logger.info(
+                                        "Completion notification sent to user %s for job %s (%s)",
+                                        telegram_user_id,
+                                        job_id,
+                                        name,
+                                    )
                                     notified_jobs.add((job_id, telegram_user_id))
                         elif resp.status == 401:
                             logger.warning(
@@ -756,7 +855,7 @@ async def job_progress_watcher(bot):
                             await disable_notifications_for_user(telegram_user_id)
                             await bot.send_message(
                                 telegram_user_id,
-                                "⚠️ Авторизация истекла. Пожалуйста, выполните /login заново, чтобы продолжить получать уведомления."
+                                "⚠️ Authorization expired. Please run /login again to keep receiving notifications."
                             )
                         else:
                             logger.error(f"Watcher: Error requesting jobs for user {telegram_user_id}: {resp.status}")

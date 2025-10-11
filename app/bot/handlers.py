@@ -10,20 +10,22 @@ worker monitoring, and realtime operations.
 import logging
 import asyncio
 from datetime import datetime
+from typing import Optional
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.filters import Command, StateFilter
 
-from app.core.utils import authorized_only, get_main_keyboard
+from app.core.utils import authorized_only, get_main_keyboard, register_preview_message
 from app.core.bot_core import bot, dp
 from app.core.config import settings
 from app.auth import authenticate_user, logout_user, is_authorized, toggle_notifications, save_deadline_credentials
 from app.services import (
     get_jobs_list, get_workers_list, get_job_info_by_user_id, get_job_tasks_by_user_id,
     requeue_job_by_user_id, resume_job_by_user_id, suspend_job_by_user_id, delete_job_by_user_id,
-    create_video_from_job, check_video_exists_in_dropbox, download_video_from_dropbox
+    create_video_from_job, check_video_exists_in_dropbox, download_video_from_dropbox,
+    WorkerStatusError
 )
 from pathlib import Path
 
@@ -887,43 +889,145 @@ async def preview_job_callback(callback_query: CallbackQuery):
         await callback_query.answer("Error occurred while generating preview.", show_alert=True)
 
 
-async def create_new_video_process(callback_query: CallbackQuery, job_id: str):
+async def create_new_video_process(
+    callback_query: CallbackQuery,
+    job_id: str,
+    *,
+    use_any_machine: bool = False,
+    skip_worker_validation: bool = False,
+    progress_message: Optional[Message] = None,
+) -> None:
     """Submit a Deadline job that generates a preview video via ffmpeg."""
-    progress_msg = await callback_query.message.answer(
-        "🧾 Отправляю задачу на создание превью в Deadline..."
+    if callback_query.from_user is None:
+        await callback_query.answer("Error: user not found.", show_alert=True)
+        return
+
+    initial_text = (
+        "🧾 Submitting preview job to Deadline..."
+        if not use_any_machine
+        else "🧾 Submitting preview job without machine restrictions..."
     )
+    progress_msg = progress_message
+    if progress_msg is None:
+        progress_msg = await callback_query.message.answer(initial_text)
+    else:
+        try:
+            await progress_msg.edit_text(initial_text, reply_markup=None)
+        except Exception:
+            progress_msg = await callback_query.message.answer(initial_text)
     try:
-        result = await create_video_from_job(callback_query.from_user.id, job_id)
+        result = await create_video_from_job(
+            callback_query.from_user.id,
+            job_id,
+            skip_worker_validation=skip_worker_validation,
+            use_any_machine=use_any_machine,
+        )
         if not result:
-            await progress_msg.edit_text("❌ Не удалось отправить задачу в Deadline.")
-            await callback_query.answer("Не удалось отправить задачу.", show_alert=True)
+            await progress_msg.edit_text("❌ Failed to submit the job to Deadline.")
+            await callback_query.answer("Failed to submit the job.", show_alert=True)
             return
 
         preview_id = result.get("preview_job_id")
         preferred_slaves = result.get("preferred_slaves") or []
         dropbox_path = result.get("expected_dropbox_path")
 
-        lines = [
-            "✅ Задача на создание превью отправлена в Deadline.",
-            f"🆔 Job ID: {preview_id}" if preview_id else None,
-            f"🖥️ Приоритетные машины: {', '.join(preferred_slaves)}" if preferred_slaves else "🖥️ Машины: любые",
-            f"📁 Видео появится в Dropbox: {dropbox_path}" if dropbox_path else None,
-            "⏳ Следи за выполнением через Deadline Monitor.",
-        ]
-        text_block = "\n".join(line for line in lines if line)
-        await progress_msg.edit_text(text_block)
-        await callback_query.answer("Задача на превью отправлена!", show_alert=False)
+        await progress_msg.edit_text("✅ Preview job queued\n□ □ □")
+        if preview_id:
+            register_preview_message(preview_id, progress_msg.chat.id, progress_msg.message_id)
+        await callback_query.answer("Preview job queued!", show_alert=False)
+    except WorkerStatusError as worker_error:
+        status_lines = []
+        for item in worker_error.invalid_workers:
+            name = item.get("name", "Unknown")
+            status_code = item.get("status_code")
+            status_text = item.get("status_text") or "Unknown"
+            if status_code is None:
+                status_lines.append(f"• {name}: {status_text}")
+            else:
+                status_lines.append(f"• {name}: {status_text} ({status_code})")
+
+        status_block = "\n".join(status_lines) if status_lines else "• No status information"
+        message_text = (
+            "⚠️ Preview job could not be queued: preferred workers are unavailable.\n"
+            f"{status_block}\n\n"
+            "Choose an action:"
+        )
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="🔄 Check again", callback_data=f"preview_retry:{job_id}"
+                    ),
+                    InlineKeyboardButton(
+                        text="☁️ Use any worker", callback_data=f"preview_force:{job_id}"
+                    ),
+                ],
+                [InlineKeyboardButton(text="✖️ Cancel", callback_data="preview_cancel")],
+            ]
+        )
+        await progress_msg.edit_text(message_text, reply_markup=keyboard)
+        await callback_query.answer("Preferred workers are unavailable.", show_alert=False)
     except Exception as e:
         logger.error(
             "Error submitting preview job for user %s: %s",
             callback_query.from_user.id if callback_query.from_user else "unknown",
             e,
         )
-        await progress_msg.edit_text("❌ Произошла ошибка при отправке задачи.")
+        await progress_msg.edit_text("❌ An error occurred while submitting the job.")
         try:
-            await callback_query.answer("Ошибка отправки задачи.", show_alert=True)
+            await callback_query.answer("Failed to submit the job.", show_alert=True)
         except Exception:
             pass
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("preview_retry:"))
+async def preview_retry_callback(callback_query: CallbackQuery):
+    """Retry worker status check before submitting preview."""
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    job_id = callback_query.data.split(":", 1)[1]
+    try:
+        await create_new_video_process(
+            callback_query,
+            job_id,
+            progress_message=callback_query.message,
+        )
+    except Exception as exc:
+        logger.error("Error retrying preview submission: %s", exc)
+        await callback_query.answer("Retry failed.", show_alert=True)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("preview_force:"))
+async def preview_force_callback(callback_query: CallbackQuery):
+    """Force preview submission without worker whitelist."""
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    job_id = callback_query.data.split(":", 1)[1]
+    try:
+        await create_new_video_process(
+            callback_query,
+            job_id,
+            use_any_machine=True,
+            skip_worker_validation=True,
+            progress_message=callback_query.message,
+        )
+    except Exception as exc:
+        logger.error("Error forcing preview submission: %s", exc)
+        await callback_query.answer("Failed to submit without restrictions.", show_alert=True)
+
+
+@router.callback_query(lambda c: c.data == "preview_cancel")
+async def preview_cancel_callback(callback_query: CallbackQuery):
+    """Cancel preview submission attempt."""
+    await callback_query.answer("Action cancelled.", show_alert=False)
+    try:
+        await callback_query.message.edit_text("Action cancelled.", reply_markup=None)
+    except Exception:
+        pass
 
 
 @router.callback_query(lambda c: c.data == "jobs_back")

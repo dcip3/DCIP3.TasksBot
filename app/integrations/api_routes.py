@@ -20,7 +20,7 @@ from app.core.config import settings
 from app.services import (
     get_jobs_list, get_workers_list, get_job_info, get_job_tasks,
     requeue_job, resume_job, suspend_job, delete_job,
-    download_job_folder, create_video_from_job
+    download_job_folder, create_video_from_job, WorkerStatusError
 )
 
 logger = logging.getLogger(__name__)
@@ -341,6 +341,13 @@ async def create_job_video(job_id: str, current_user: int = Depends(get_current_
             "message": "Preview job submitted to Deadline",
             **result,
         }
+    except WorkerStatusError as worker_error:
+        detail = {
+            "message": "Preferred workers are not ready",
+            "invalid_workers": worker_error.invalid_workers,
+            "preferred_workers": worker_error.preferred_workers,
+        }
+        raise HTTPException(status_code=409, detail=detail)
     except HTTPException:
         raise
     except Exception as e:

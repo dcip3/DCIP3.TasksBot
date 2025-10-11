@@ -29,6 +29,8 @@ from app.core.bot_core import get_aiosession
 
 logger = logging.getLogger(__name__)
 
+ALLOWED_WORKER_STATUSES = {0, 1, 2}
+
 # ============================================================================
 # === EXCEPTIONS ===
 # ============================================================================
@@ -36,6 +38,16 @@ logger = logging.getLogger(__name__)
 
 class DeadlineSubmissionError(RuntimeError):
     """Raised when a Deadline job submission fails."""
+
+
+class WorkerStatusError(RuntimeError):
+    """Raised when preferred workers are not in an allowed status."""
+
+    def __init__(self, invalid_workers: List[Dict[str, Any]], preferred_workers: List[str]):
+        message = "One or more preferred workers are not in an allowed status."
+        super().__init__(message)
+        self.invalid_workers = invalid_workers
+        self.preferred_workers = preferred_workers
 
 
 # ============================================================================
@@ -106,6 +118,25 @@ async def get_jobs_list(telegram_user_id: int) -> List[Dict[str, Any]]:
         return []
 
 
+async def _fetch_workers(login: str, password: str) -> List[Dict[str, Any]]:
+    """Fetch workers list using provided Deadline credentials."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = aiohttp.BasicAuth(login, password)
+            async with session.get(f"{settings.base_api_url}/slaves?Data=infosettings", auth=headers, ssl=False) as resp:
+                logger.info(f"Slaves API response status: {resp.status}")
+                if resp.status == 200:
+                    data = await resp.json()
+                    logger.info(f"Slaves API returned {len(data) if isinstance(data, list) else 'non-list'} items")
+                    return data
+                response_text = await resp.text()
+                logger.error(f"Failed to get slaves: {resp.status}, response: {response_text}")
+                return []
+    except Exception as e:
+        logger.error(f"Error getting slaves: {e}")
+        return []
+
+
 async def get_workers_list(telegram_user_id: int) -> List[Dict[str, Any]]:
     """
     Get list of workers (slaves) from Deadline API.
@@ -125,22 +156,15 @@ async def get_workers_list(telegram_user_id: int) -> List[Dict[str, Any]]:
         
         login, password = credentials
         logger.info(f"Requesting slaves for user {telegram_user_id} with login {login}")
-        
-        async with aiohttp.ClientSession() as session:
-            headers = aiohttp.BasicAuth(login, password)
-            async with session.get(f"{settings.base_api_url}/slaves?Data=infosettings", auth=headers, ssl=False) as resp:
-                logger.info(f"Slaves API response status: {resp.status}")
-                if resp.status == 200:
-                    data = await resp.json()
-                    logger.info(f"Slaves API returned {len(data) if isinstance(data, list) else 'non-list'} items")
-                    return data
-                else:
-                    response_text = await resp.text()
-                    logger.error(f"Failed to get slaves: {resp.status}, response: {response_text}")
-                    return []
+        return await _fetch_workers(login, password)
     except Exception as e:
         logger.error(f"Error getting slaves: {e}")
         return []
+
+
+async def get_workers_by_credentials(login: str, password: str) -> List[Dict[str, Any]]:
+    """Return list of workers using raw credentials."""
+    return await _fetch_workers(login, password)
 
 
 async def get_job_info(login: str, password: str, job_id: str) -> Optional[Dict[str, Any]]:
@@ -739,9 +763,21 @@ def _normalize_dropbox_path(path: Optional[str]) -> Optional[str]:
 
 
 
-async def create_video_from_job(telegram_user_id: int, job_id: str) -> Optional[Dict[str, Any]]:
+async def create_video_from_job(
+    telegram_user_id: int,
+    job_id: str,
+    *,
+    skip_worker_validation: bool = False,
+    use_any_machine: bool = False,
+) -> Optional[Dict[str, Any]]:
     """
     Submit a Deadline CommandLine job that generates a preview video using ffmpeg.
+
+    Args:
+        telegram_user_id: Telegram user whose credentials are used.
+        job_id: Source Deadline job identifier.
+        skip_worker_validation: Skip checking worker statuses before submission.
+        use_any_machine: Ignore preferred workers and allow Deadline to pick any machine.
 
     Returns:
         Dict with submission details and expected paths, or None if unable to submit.
@@ -760,6 +796,15 @@ async def create_video_from_job(telegram_user_id: int, job_id: str) -> Optional[
         return None
 
     props = job_info.get("Props", {})
+    status_value = job_info.get("Stat")
+    status_text = str(status_value).strip().lower() if status_value is not None else ""
+    completed_statuses = {"3", "complete", "completed", "finished", "done", "succeeded", "success"}
+    is_job_completed = False
+    if isinstance(status_value, int):
+        is_job_completed = status_value == 3
+    elif status_text:
+        is_job_completed = status_text in completed_statuses
+
     outdirs = job_info.get("OutDir", [])
     if not outdirs:
         logger.error("No OutDir found for job %s", job_id)
@@ -841,6 +886,42 @@ async def create_video_from_job(telegram_user_id: int, job_id: str) -> Optional[
         if mach:
             preferred_slaves = [mach]
 
+    if use_any_machine:
+        preferred_slaves = []
+
+    if preferred_slaves and not skip_worker_validation:
+        workers = await get_workers_by_credentials(login, password)
+        worker_map = {}
+        for worker in workers:
+            info = worker.get("Info", {})
+            name = info.get("Name")
+            if name:
+                worker_map[name] = info
+        invalid_workers: List[Dict[str, Any]] = []
+        for slave in preferred_slaves:
+            info = worker_map.get(slave)
+            if not info:
+                invalid_workers.append(
+                    {
+                        "name": slave,
+                        "status_code": None,
+                        "status_text": "Unknown worker",
+                    }
+                )
+                continue
+            status_code = info.get("Stat")
+            if status_code not in ALLOWED_WORKER_STATUSES:
+                status_text = settings.worker_status_map.get(status_code, f"Unknown ({status_code})")
+                invalid_workers.append(
+                    {
+                        "name": slave,
+                        "status_code": status_code,
+                        "status_text": status_text,
+                    }
+                )
+        if invalid_workers:
+            raise WorkerStatusError(invalid_workers, preferred_slaves)
+
     preview_job_info: Dict[str, Any] = {
         "Name": f"{props.get('Name', job_id)} - Preview",
         "Batch": props.get("Batch") or props.get("Name") or "Preview",
@@ -851,13 +932,14 @@ async def create_video_from_job(telegram_user_id: int, job_id: str) -> Optional[
         "ChunkSize": 1,
         "Priority": props.get("Pri", 50),
         "MachineLimit": len(preferred_slaves) if preferred_slaves else 0,
-        "JobDependency0": job_id,
         "ExtraInfo0": expected_local_path,
         "ExtraInfo1": expected_dropbox_video,
         "ExtraInfoKeyValue0": f"PreviewLocal={expected_local_path}",
         "ExtraInfoKeyValue1": f"PreviewDropbox={expected_dropbox_video}",
         "ExtraInfoKeyValue2": "PreviewJob=1",
     }
+    if not is_job_completed:
+        preview_job_info["JobDependency0"] = job_id
     if props.get("Pool"):
         preview_job_info["Pool"] = props["Pool"]
     if props.get("SecPool"):
