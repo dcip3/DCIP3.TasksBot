@@ -65,6 +65,7 @@ async def init_db():
             deadline_login TEXT,
             deadline_password TEXT,
             notifications_enabled INTEGER DEFAULT 0,
+            notification_scope TEXT DEFAULT 'all',
             last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (telegram_user_id) REFERENCES users(telegram_user_id)
         )
@@ -85,6 +86,21 @@ async def init_db():
         CREATE INDEX IF NOT EXISTS idx_user_sessions_telegram_id 
         ON user_sessions(telegram_user_id)
     """)
+
+    # Ensure notification_scope column exists for legacy databases
+    try:
+        await tasks_db_conn.execute(
+            "ALTER TABLE user_sessions ADD COLUMN notification_scope TEXT DEFAULT 'all'"
+        )
+        await tasks_db_conn.commit()
+        logger.info("Added notification_scope column to user_sessions table")
+    except aiosqlite.OperationalError as column_error:
+        message = str(column_error).lower()
+        if "duplicate column name" in message:
+            logger.debug("notification_scope column already exists on user_sessions table")
+        else:
+            logger.error("Failed to ensure notification_scope column: %s", column_error)
+            raise
     
     await tasks_db_conn.commit()
     logger.info("Database initialized successfully")

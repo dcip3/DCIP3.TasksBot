@@ -10,8 +10,9 @@ worker monitoring, and realtime operations.
 import logging
 import asyncio
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, cast
 from aiogram import Router, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -20,7 +21,16 @@ from aiogram.filters import Command, StateFilter
 from app.core.utils import authorized_only, get_main_keyboard, register_preview_message
 from app.core.bot_core import bot, dp
 from app.core.config import settings
-from app.auth import authenticate_user, logout_user, is_authorized, toggle_notifications, save_deadline_credentials
+from app.auth import (
+    authenticate_user,
+    logout_user,
+    is_authorized,
+    save_deadline_credentials,
+    get_notification_settings,
+    set_notification_enabled,
+    set_notification_scope,
+    NotificationScope,
+)
 from app.services import (
     get_jobs_list, get_workers_list, get_job_info_by_user_id, get_job_tasks_by_user_id,
     requeue_job_by_user_id, resume_job_by_user_id, suspend_job_by_user_id, delete_job_by_user_id,
@@ -42,6 +52,91 @@ router = Router()
 # Column width constants for text tables
 BATCH_COLUMN_WIDTH = 22
 PAGE_SIZE = 6
+
+
+def _render_settings_root_text() -> str:
+    """Return text for the root settings menu."""
+    return "Settings\nSelect a section to configure."
+
+
+def _build_settings_root_keyboard() -> InlineKeyboardMarkup:
+    """Create the root inline keyboard for settings."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔔 Notifications",
+                    callback_data="settings:notifications",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Close",
+                    callback_data="settings:close",
+                ),
+            ],
+        ]
+    )
+
+
+def _render_notification_settings_text(enabled: bool, scope: str) -> str:
+    """Return descriptive text for the notification settings submenu."""
+    status_text = "enabled" if enabled else "disabled"
+    scope_lower = scope.lower()
+    if scope_lower == "own":
+        scope_text = "My jobs only"
+    else:
+        scope_text = "All jobs"
+
+    details = [
+        "Notification Settings",
+        f"Status: {status_text}",
+        f"Scope: {scope_text}",
+        "",
+        "Choose how you would like to receive job alerts.",
+    ]
+    if not enabled:
+        details.append("Notifications are currently disabled.")
+    return "\n".join(details)
+
+
+def _build_notification_keyboard(enabled: bool, scope: str) -> InlineKeyboardMarkup:
+    """Create inline keyboard for notification options."""
+    scope_normalized = scope.lower()
+    enable_label = ("✅ " if enabled else "◻ ") + "Receive notifications"
+    all_jobs_label = ("✅ " if scope_normalized == "all" else "◻ ") + "All jobs"
+    own_jobs_label = ("✅ " if scope_normalized == "own" else "◻ ") + "My jobs only"
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=enable_label,
+                    callback_data="settings:notif:toggle",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=all_jobs_label,
+                    callback_data="settings:notif:scope:all",
+                ),
+                InlineKeyboardButton(
+                    text=own_jobs_label,
+                    callback_data="settings:notif:scope:own",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Back",
+                    callback_data="settings:back:root",
+                ),
+                InlineKeyboardButton(
+                    text="Close",
+                    callback_data="settings:close",
+                ),
+            ],
+        ]
+    )
 
 # ============================================================================
 # === STATE MACHINES ===
@@ -383,38 +478,27 @@ async def handle_workers(message: Message):
         logger.error(f"Error handling workers for user {message.from_user.id}: {e}")
         await message.answer("Error occurred while fetching workers.")
 
-# ============================================================================
-# === NOTIFICATION HANDLERS ===
-# ============================================================================
 
-@router.message(F.text == "🔔 Notifications")
+@router.message(F.text == "⚙️ Settings")
 @authorized_only
-async def toggle_notifications_handler(message: Message):
+async def handle_settings_menu(message: Message):
     """
-    Handle notifications toggle button.
-    
-    Args:
-        message: Telegram message object
+    Display the settings menu with inline navigation.
     """
-    # Stop realtime if it's running
     stop_realtime_for_chat(message.chat.id)
-    
+
     if message.from_user is None:
         await message.answer("Error: User information not available.")
         return
-        
-    try:
-        new_status = await toggle_notifications(message.from_user.id)
-        
-        status_text = "enabled" if new_status else "disabled"
-        await message.answer(f"Notifications {status_text}.")
-        
-    except Exception as e:
-        logger.error(f"Error toggling notifications for user {message.from_user.id}: {e}")
-        await message.answer("Error occurred while toggling notifications.")
 
+    await message.answer(
+        _render_settings_root_text(),
+        reply_markup=_build_settings_root_keyboard(),
+    )
 
-
+# ============================================================================
+# === NOTIFICATION HANDLERS ===
+# ============================================================================
 
 # ============================================================================
 # === HELPER FUNCTIONS ===
@@ -475,6 +559,94 @@ def stop_realtime_for_chat(chat_id: int):
 # ============================================================================
 # === CALLBACK HANDLERS ===
 # ============================================================================
+
+@router.callback_query(lambda c: c.data and c.data.startswith("settings:"))
+async def settings_callback_handler(callback_query: CallbackQuery):
+    """Handle inline settings navigation and updates."""
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    if callback_query.from_user is None:
+        await callback_query.answer("Error: User information not available.", show_alert=True)
+        return
+
+    if callback_query.message is None:
+        await callback_query.answer("Error: Message not available.", show_alert=True)
+        return
+
+    if not await is_authorized(callback_query.from_user.id):
+        await callback_query.answer("Please login first.", show_alert=True)
+        return
+
+    user_id = callback_query.from_user.id
+    parts = callback_query.data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    async def show_root():
+        try:
+            await callback_query.message.edit_text(
+                _render_settings_root_text(),
+                reply_markup=_build_settings_root_keyboard(),
+            )
+        except TelegramBadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                raise
+
+    async def show_notifications():
+        enabled, scope = await get_notification_settings(user_id)
+        try:
+            await callback_query.message.edit_text(
+                _render_notification_settings_text(enabled, scope),
+                reply_markup=_build_notification_keyboard(enabled, scope),
+            )
+        except TelegramBadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                raise
+
+    if action == "close":
+        await callback_query.message.edit_text("Settings closed.")
+        await callback_query.answer()
+        return
+
+    if action == "notifications":
+        await show_notifications()
+        await callback_query.answer()
+        return
+
+    if action == "notif" and len(parts) > 2:
+        sub_action = parts[2]
+        if sub_action == "toggle":
+            current_enabled, _ = await get_notification_settings(user_id)
+            enabled, scope = await set_notification_enabled(user_id, not current_enabled)
+            await show_notifications()
+            await callback_query.answer("Notifications enabled" if enabled else "Notifications disabled")
+            return
+        if sub_action == "scope" and len(parts) > 3:
+            scope_value = parts[3]
+            if scope_value not in {"all", "own"}:
+                await callback_query.answer("Unsupported option.", show_alert=True)
+                return
+            enabled, scope = await set_notification_scope(
+                user_id,
+                cast(NotificationScope, scope_value),
+            )
+            await show_notifications()
+            if scope == "own":
+                await callback_query.answer("Scope set to my jobs only")
+            else:
+                await callback_query.answer("Scope set to all jobs")
+            return
+
+    if action == "back":
+        target = parts[2] if len(parts) > 2 else "root"
+        if target == "root":
+            await show_root()
+            await callback_query.answer()
+            return
+
+    await callback_query.answer()
+
 
 @router.callback_query(lambda c: c.data and c.data.startswith("jobs_page:"))
 async def jobs_page_callback(callback_query: CallbackQuery):
@@ -687,8 +859,6 @@ async def job_info_callback(callback_query: CallbackQuery):
             info_text += f"Status: {stat_name}\n"
             info_text += f"Progress: {progress_str}\n"
             info_text += f"ETA: {eta_str}\n"
-            info_text += f"Total Tasks: {total_tasks}\n"
-            info_text += f"Completed: {completed_chunks}\n"
             info_text += f"{'-'*40}</pre>"
             
             # Create action buttons for this job

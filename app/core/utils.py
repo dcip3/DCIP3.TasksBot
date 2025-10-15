@@ -301,7 +301,7 @@ def get_main_keyboard():
         ],
         [
             KeyboardButton(text="Realtime", request_contact=False, request_location=False),
-            KeyboardButton(text="🔔 Notifications", request_contact=False, request_location=False),
+            KeyboardButton(text="⚙️ Settings", request_contact=False, request_location=False),
         ],
         [
             KeyboardButton(text="🧹 Clear", request_contact=False, request_location=False),
@@ -798,12 +798,18 @@ async def job_progress_watcher(bot):
         users_dict = {}
 
         # Add users with notifications
-        for user_id, login, password in users_with_notifications:
+        for user_id, login, password, scope in users_with_notifications:
             try:
                 decrypted_password = _decrypt_password(password)
             except Exception:
                 decrypted_password = password
-            users_dict[user_id] = (user_id, login, decrypted_password, True)  # True = has notifications
+            users_dict[user_id] = (
+                user_id,
+                login,
+                decrypted_password,
+                True,
+                scope,
+            )  # True = has notifications
 
         # Add all users for preview monitoring
         for user_id, login, password in all_users_for_preview:
@@ -812,11 +818,17 @@ async def job_progress_watcher(bot):
                     decrypted_password = _decrypt_password(password)
                 except Exception:
                     decrypted_password = password
-                users_dict[user_id] = (user_id, login, decrypted_password, False)  # False = no notifications
+                users_dict[user_id] = (
+                    user_id,
+                    login,
+                    decrypted_password,
+                    False,
+                    "all",
+                )  # False = no notifications
 
         logger.info(f"Job progress watcher: Monitoring {len(users_dict)} total users (notifications + preview)")
 
-        for telegram_user_id, login, decrypted_password, has_notifications in users_dict.values():
+        for telegram_user_id, login, decrypted_password, has_notifications, scope in users_dict.values():
 
             try:
                 session = await get_aiosession()
@@ -871,6 +883,23 @@ async def job_progress_watcher(bot):
                                     # Only send regular job notifications if user has notifications enabled
                                     if not has_notifications:
                                         continue
+
+                                    if scope == "own":
+                                        job_owner = (
+                                            props.get("User")
+                                            or job.get("UserName")
+                                            or ""
+                                        )
+                                        if not job_owner:
+                                            continue
+                                        normalized_login = (
+                                            str(login).split("\\")[-1].split("/")[-1].lower()
+                                        )
+                                        normalized_owner = (
+                                            str(job_owner).split("\\")[-1].split("/")[-1].lower()
+                                        )
+                                        if normalized_owner != normalized_login:
+                                            continue
 
                                     batch = props.get("Batch") or "No Batch"
                                     message_text = (

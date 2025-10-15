@@ -8,7 +8,7 @@ functions including login, logout, and session management for TasksBot.
 
 import hashlib
 import logging
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Literal
 from cryptography.fernet import Fernet
 from app.core.config import settings
 from app.core.database import get_db_connection
@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 
 # Initialize Fernet cipher for password encryption
 _cipher: Optional[Fernet] = None
+
+NotificationScope = Literal["all", "own"]
+DEFAULT_NOTIFICATION_SCOPE: NotificationScope = "all"
+VALID_NOTIFICATION_SCOPES = {"all", "own"}
 
 def _get_cipher() -> Fernet:
     """Get or create Fernet cipher for password encryption."""
@@ -316,44 +320,96 @@ async def get_deadline_credentials(telegram_user_id: int) -> Optional[Tuple[str,
         return None
 
 
-async def toggle_notifications(telegram_user_id: int) -> bool:
+def _normalize_scope(scope: Optional[str]) -> NotificationScope:
+    """Normalize notification scope to a known value."""
+    if not scope:
+        return DEFAULT_NOTIFICATION_SCOPE
+    scope_lower = scope.lower()
+    return scope_lower if scope_lower in VALID_NOTIFICATION_SCOPES else DEFAULT_NOTIFICATION_SCOPE
+
+
+async def get_notification_settings(telegram_user_id: int) -> Tuple[bool, NotificationScope]:
     """
-    Toggle notification settings for a user.
-    
-    Args:
-        telegram_user_id: Telegram user ID
-        
-    Returns:
-        New notification status
+    Fetch notification settings (enabled flag and scope) for a user.
     """
     conn = get_db_connection()
     if conn is None:
-        return False
-    
+        return False, DEFAULT_NOTIFICATION_SCOPE
+
     try:
-        # Get current status
         async with conn.execute(
-            "SELECT notifications_enabled FROM user_sessions WHERE telegram_user_id = ?",
-            (telegram_user_id,)
+            "SELECT notifications_enabled, notification_scope FROM user_sessions WHERE telegram_user_id = ?",
+            (telegram_user_id,),
         ) as cursor:
             row = await cursor.fetchone()
-            current_status = row[0] if row else 0
-        
-        # Toggle status
-        new_status = 1 if current_status == 0 else 0
-        
-        # Update status
+            if not row:
+                return False, DEFAULT_NOTIFICATION_SCOPE
+            enabled = bool(row[0])
+            scope = _normalize_scope(row[1] if len(row) > 1 else None)
+            return enabled, scope
+    except Exception as e:
+        logger.error(f"Failed to fetch notification settings for user {telegram_user_id}: {e}")
+        return False, DEFAULT_NOTIFICATION_SCOPE
+
+
+async def set_notification_enabled(telegram_user_id: int, enabled: bool) -> Tuple[bool, NotificationScope]:
+    """
+    Update the notification enabled flag for a user.
+    
+    Returns:
+        Tuple of (enabled, scope) after the update.
+    """
+    conn = get_db_connection()
+    if conn is None:
+        return False, DEFAULT_NOTIFICATION_SCOPE
+
+    try:
         await conn.execute(
-            "UPDATE user_sessions SET notifications_enabled = ? WHERE telegram_user_id = ?",
-            (new_status, telegram_user_id)
+            """
+            UPDATE user_sessions
+            SET notifications_enabled = ?
+            WHERE telegram_user_id = ?
+            """,
+            (1 if enabled else 0, telegram_user_id),
         )
         await conn.commit()
-        
-        logger.info(f"User {telegram_user_id} notifications toggled to: {new_status}")
-        return bool(new_status)
+        logger.info("User %s notification enabled flag set to %s", telegram_user_id, enabled)
     except Exception as e:
-        logger.error(f"Failed to toggle notifications for user {telegram_user_id}: {e}")
-        return False
+        logger.error("Failed to set notification flag for user %s: %s", telegram_user_id, e)
+        return False, DEFAULT_NOTIFICATION_SCOPE
+
+    return await get_notification_settings(telegram_user_id)
+
+
+async def set_notification_scope(telegram_user_id: int, scope: NotificationScope) -> Tuple[bool, NotificationScope]:
+    """
+    Update the notification scope for a user.
+    
+    Returns:
+        Tuple of (enabled, scope) after the update.
+    """
+    conn = get_db_connection()
+    if conn is None:
+        return False, DEFAULT_NOTIFICATION_SCOPE
+
+    normalized_scope = _normalize_scope(scope)
+
+    try:
+        await conn.execute(
+            """
+            UPDATE user_sessions
+            SET notification_scope = ?
+            WHERE telegram_user_id = ?
+            """,
+            (normalized_scope, telegram_user_id),
+        )
+        await conn.commit()
+        logger.info("User %s notification scope set to %s", telegram_user_id, normalized_scope)
+    except Exception as e:
+        logger.error("Failed to set notification scope for user %s: %s", telegram_user_id, e)
+        return False, DEFAULT_NOTIFICATION_SCOPE
+
+    return await get_notification_settings(telegram_user_id)
 
 
 async def get_notification_status(telegram_user_id: int) -> bool:
@@ -371,23 +427,19 @@ async def get_notification_status(telegram_user_id: int) -> bool:
         return False
     
     try:
-        async with conn.execute(
-            "SELECT notifications_enabled FROM user_sessions WHERE telegram_user_id = ?",
-            (telegram_user_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            return bool(row[0]) if row else False
+        enabled, _ = await get_notification_settings(telegram_user_id)
+        return enabled
     except Exception as e:
         logger.error(f"Failed to get notification status for user {telegram_user_id}: {e}")
         return False
 
 
-async def get_all_users_with_notifications() -> list[Tuple[int, str, str]]:
+async def get_all_users_with_notifications() -> list[Tuple[int, str, str, NotificationScope]]:
     """
     Get all users with enabled notifications and their Deadline credentials.
     
     Returns:
-        List of tuples containing (telegram_user_id, deadline_login, deadline_password)
+        List of tuples containing (telegram_user_id, deadline_login, deadline_password, notification_scope)
     """
     conn = get_db_connection()
     if conn is None:
@@ -396,13 +448,25 @@ async def get_all_users_with_notifications() -> list[Tuple[int, str, str]]:
     
     try:
         async with conn.execute("""
-            SELECT telegram_user_id, deadline_login, deadline_password 
+            SELECT telegram_user_id, deadline_login, deadline_password, notification_scope
             FROM user_sessions 
             WHERE notifications_enabled = 1
         """) as cursor:
             rows = await cursor.fetchall()
-            result = [(row[0], row[1], row[2]) for row in rows]
-            logger.info(f"Found {len(result)} users with notifications enabled: {[user_id for user_id, _, _ in result]}")
+            result = [
+                (
+                    row[0],
+                    row[1],
+                    row[2],
+                    _normalize_scope(row[3] if len(row) > 3 else None),
+                )
+                for row in rows
+            ]
+            logger.info(
+                "Found %s users with notifications enabled: %s",
+                len(result),
+                [user_id for user_id, _, _, _ in result],
+            )
             return result
     except Exception as e:
         logger.error(f"Failed to get users with notifications: {e}")
