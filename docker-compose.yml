@@ -6,10 +6,7 @@ services:
     env_file:
       - .env
     volumes:
-      - ./storage/conv:/app/storage/conv
-      - ./storage/temp:/app/storage/temp
-      - ./storage/tasks_bot.db:/app/storage/tasks_bot.db
-      - ./storage/config.ocio:/app/storage/config.ocio:ro
+      - ./storage:/app/storage
     restart: unless-stopped
     networks:
       - app-network

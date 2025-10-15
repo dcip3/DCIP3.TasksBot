@@ -7,6 +7,7 @@ and provides basic database operations for the application.
 """
 
 import logging
+from pathlib import Path
 import aiosqlite
 from app.core.config import settings
 
@@ -25,6 +26,22 @@ async def init_db():
     - user_sessions: Stores user session data and credentials
     """
     global tasks_db_conn
+    db_path = Path(settings.db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if db_path.exists() and db_path.is_dir():
+        error_message = (
+            f"Configured DB_PATH '{db_path}' points to a directory. "
+            "If you're running via Docker, ensure the bind mount targets a file "
+            "or mount the entire storage directory (e.g. ./storage:/app/storage)."
+        )
+        logger.error(error_message)
+        raise RuntimeError(error_message)
+
+    if not db_path.exists():
+        db_path.touch()
+        logger.info("Created new SQLite database file at %s", db_path)
+
     tasks_db_conn = await aiosqlite.connect(settings.db_path)
     
     # Create users table for authentication and user management

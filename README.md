@@ -61,6 +61,8 @@ mkdir -p storage/conv storage/temp
 cp path/to/config.ocio storage/config.ocio  # Only if the file is not yet present
 ```
 The SQLite database (`storage/tasks_bot.db`) is created automatically the first time the app runs.
+If you're deploying with Docker Compose, ensure the whole `storage/` directory exists on the host before
+starting the containers—the backend will create the SQLite file automatically during startup.
 
 ## Local Run (Python)
 ```bash
