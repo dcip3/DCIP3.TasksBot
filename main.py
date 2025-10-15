@@ -1,4 +1,4 @@
-# main_api.py
+# main.py
 """
 Main application entry point with FastAPI integration for Telegram Mini App.
 
@@ -89,7 +89,7 @@ async def health():
 if __name__ == "__main__":
     # Run with uvicorn
     uvicorn.run(
-        "main_api:app",
+        "main:app",
         host="0.0.0.0",
         port=8000,
         reload=True,

@@ -4,7 +4,7 @@ TasksBot combines a Telegram bot, a FastAPI backend, and a Telegram WebApp to he
 
 ## Features
 - Telegram bot built on aiogram v3 with Deadline-aware authentication and a rich set of commands for render management.
-- REST API served by FastAPI (`main_api.py`) for the WebApp and external integrations.
+- REST API served by FastAPI (`main.py`) for the WebApp and external integrations.
 - Real-time notifications, progress updates, and automated EXR → video conversions.
 - Dropbox integration for downloading source plates and uploading rendered media.
 - Telegram WebApp built with React/Vite (`mini-app/`) to provide a modern UI inside Telegram.
@@ -32,7 +32,7 @@ TasksBot combines a Telegram bot, a FastAPI backend, and a Telegram WebApp to he
 │   ├── conv/               # Converted media artifacts (gitignored)
 │   └── temp/               # Temporary download data (gitignored)
 ├── docker-compose.yml      # Docker Compose environment
-├── main_api.py             # Entry point (bot + FastAPI app)
+├── main.py                 # Entry point (bot + FastAPI app)
 ├── requirements.txt        # Python dependencies
 └── README.md
 ```
