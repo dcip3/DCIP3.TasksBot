@@ -9,17 +9,24 @@ worker monitoring, and realtime operations.
 
 import logging
 import asyncio
+import contextlib
+import json
 from datetime import datetime, timezone
 from typing import Optional, cast
 from aiogram import Router, F
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, FSInputFile
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.filters import Command, StateFilter
 
-from app.core.utils import authorized_only, get_main_keyboard, register_preview_message
-from app.core.bot_core import bot, dp
+from app.core.utils import (
+    authorized_only,
+    get_main_keyboard,
+    register_preview_message,
+    cleanup_temp_and_conv,
+)
+from app.core.bot_core import bot, dp, download_states, stop_downloads
 from app.core.config import settings
 from app.auth import (
     authenticate_user,
@@ -35,6 +42,7 @@ from app.services import (
     get_jobs_list, get_workers_list, get_job_info_by_user_id, get_job_tasks_by_user_id,
     requeue_job_by_user_id, resume_job_by_user_id, suspend_job_by_user_id, delete_job_by_user_id,
     create_video_from_job, check_video_exists_in_dropbox, download_video_from_dropbox,
+    get_dropbox_session,
     WorkerStatusError
 )
 from app.bot.job_helpers import (
@@ -43,6 +51,19 @@ from app.bot.job_helpers import (
     format_progress_old
 )
 from pathlib import Path
+from app.integrations.video_helpers import (
+    assemble_video_from_jpg,
+    cleanup_job_files,
+    cleanup_old_files,
+    compress_video_if_needed,
+    get_file_size_mb,
+)
+from app.integrations.dropbox_helpers import (
+    get_fresh_access_token,
+    fetch_dropbox_metadata,
+    download_exr_folder,
+    upload_video_to_dropbox,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +159,43 @@ def _build_notification_keyboard(enabled: bool, scope: str) -> InlineKeyboardMar
         ]
     )
 
+def _build_render_method_keyboard(job_id: str) -> InlineKeyboardMarkup:
+    """Inline keyboard offering render method choices."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="☁️ Deadline",
+                    callback_data=f"preview_render:deadline:{job_id}",
+                ),
+                InlineKeyboardButton(
+                    text="🖥 Server",
+                    callback_data=f"preview_render:server:{job_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✖️ Cancel",
+                    callback_data="preview_cancel",
+                )
+            ],
+        ]
+    )
+
+
+async def _prompt_render_method(
+    callback_query: CallbackQuery,
+    job_id: str,
+    message_text: Optional[str] = None,
+) -> None:
+    """Send a prompt asking the user to choose how to render the preview."""
+    text = message_text or "Choose how to create the preview."
+    keyboard = _build_render_method_keyboard(job_id)
+    target_message = callback_query.message
+    if target_message:
+        await target_message.answer(text, reply_markup=keyboard)
+    elif callback_query.from_user:
+        await bot.send_message(callback_query.from_user.id, text, reply_markup=keyboard)
 # ============================================================================
 # === STATE MACHINES ===
 # ============================================================================
@@ -937,8 +995,8 @@ async def preview_job_callback(callback_query: CallbackQuery):
                 callback_data=f"send_dbx_video:{job_id}"
             )
             recreate_button = InlineKeyboardButton(
-                text="🔄 Create new",
-                callback_data=f"create_new_video:{job_id}"
+                text="🔄 New render",
+                callback_data=f"preview_render_options:{job_id}"
             )
             keyboard = InlineKeyboardMarkup(
                 inline_keyboard=[[send_button, recreate_button]]
@@ -950,12 +1008,38 @@ async def preview_job_callback(callback_query: CallbackQuery):
             await callback_query.answer()
             return
         
-        # Video doesn't exist - create new one
-        await create_new_video_process(callback_query, job_id)
+        # Video doesn't exist - prompt user to choose render method
+        await _prompt_render_method(
+            callback_query,
+            job_id,
+            "No preview yet. Choose a render method:",
+        )
+        await callback_query.answer()
+        return
             
     except Exception as e:
         logger.error(f"Error handling preview for user {callback_query.from_user.id}: {e}")
         await callback_query.answer("Error occurred while generating preview.", show_alert=True)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("preview_render_options:"))
+async def preview_render_options_callback(callback_query: CallbackQuery):
+    """Show render method choices when user wants to create a new preview."""
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    job_id = callback_query.data.split(":", 1)[1]
+    await _prompt_render_method(
+        callback_query,
+        job_id,
+        "Select a preview render method:",
+    )
+    try:
+        await callback_query.answer()
+    except Exception:
+        # Callback may already be answered elsewhere; ignore
+        pass
 
 
 async def create_new_video_process(
@@ -1047,6 +1131,218 @@ async def create_new_video_process(
             await callback_query.answer("Failed to submit the job.", show_alert=True)
         except Exception:
             pass
+
+
+async def render_preview_via_server(callback_query: CallbackQuery, job_id: str) -> None:
+    """Replicate the optimized local render pipeline: download EXRs, convert, assemble, and deliver."""
+    if callback_query.from_user is None:
+        await callback_query.answer("Error: user not found.", show_alert=True)
+        return
+
+    progress_msg: Optional[Message] = None
+    try:
+        base_message = callback_query.message
+        if base_message:
+            progress_msg = await base_message.answer("🔍 Starting preview generation...")
+        else:
+            progress_msg = await bot.send_message(callback_query.from_user.id, "🔍 Starting preview generation...")
+
+        await progress_msg.edit_text("📥 Step 1: Downloading files from Dropbox...")
+
+        job_info = await get_job_info_by_user_id(callback_query.from_user.id, job_id)
+        if not job_info:
+            await progress_msg.edit_text("❌ Failed to get job info")
+            await callback_query.answer("Failed to get job info.", show_alert=True)
+            return
+
+        props = job_info.get("Props", {}) or {}
+        job_name = props.get("Name") or props.get("Batch") or job_id
+
+        outdirs = job_info.get("OutDir", [])
+        if not outdirs:
+            await progress_msg.edit_text("❌ No output directory found.")
+            await callback_query.answer("Render path is missing.", show_alert=True)
+            return
+
+        fullpath = outdirs[0]
+        idx = fullpath.find(settings.dropbox_root_marker)
+        if idx == -1:
+            await progress_msg.edit_text("❌ Dropbox root marker not found in path.")
+            await callback_query.answer("Could not determine Dropbox path.", show_alert=True)
+            return
+
+        trimmed = fullpath[idx:]
+        dropbox_path = "/" + trimmed.replace("\\", "/").lstrip("/")
+
+        temp_dir = Path(settings.temp_dir)
+        temp_dir.mkdir(exist_ok=True)
+        exr_folder_name = Path(dropbox_path).parts[-1] or job_id
+        local_root = temp_dir / f"{exr_folder_name}_{job_id}"
+        local_root.mkdir(parents=True, exist_ok=True)
+
+        headers_dbx = {
+            "Authorization": f"Bearer {get_fresh_access_token()}",
+            "Dropbox-API-Select-User": settings.dropbox_team_member_id,
+            "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
+            "Content-Type": "application/json",
+        }
+        session_dbx = await get_dropbox_session()
+
+        list_url = "https://api.dropboxapi.com/2/files/list_folder"
+        async with session_dbx.post(list_url, headers=headers_dbx, json={"path": dropbox_path}) as list_resp:
+            if list_resp.status != 200:
+                await progress_msg.edit_text(f"❌ Failed to list folder: {list_resp.status}")
+                await callback_query.answer("Could not list files in Dropbox.", show_alert=True)
+                return
+            list_result = await list_resp.json()
+
+        total_files = sum(
+            1
+            for entry in list_result.get("entries", [])
+            if entry.get(".tag") == "file"
+            and entry["name"].lower().endswith(".exr")
+            and "cryptomatte" not in entry["name"].lower()
+            and "conflicted copy" not in entry["name"].lower()
+        )
+        if total_files <= 0:
+            await progress_msg.edit_text("⚠️ No usable EXR files found for conversion.")
+            await callback_query.answer("No frames available for preview build.", show_alert=True)
+            return
+
+        download_states[job_id] = {
+            "progress_msg": progress_msg,
+            "total_files": total_files,
+            "stop_kb": None,
+        }
+        stop_downloads[job_id] = None
+
+        await download_exr_folder(
+            session_dbx,
+            "https://content.dropboxapi.com/2/files/download",
+            headers_dbx,
+            dropbox_path,
+            local_root,
+            job_id,
+            download_states,
+            stop_downloads,
+        )
+
+        conv_dir = Path(settings.conv_dir) / f"{exr_folder_name}_{job_id}"
+        await progress_msg.edit_text("🎬 Step 2: Converting EXR files and creating video...")
+        video_path = await asyncio.to_thread(assemble_video_from_jpg, conv_dir, str(exr_folder_name))
+
+        try:
+            metadata = await fetch_dropbox_metadata(session_dbx, dropbox_path, headers_dbx)
+            dropbox_video_path = await upload_video_to_dropbox(Path(video_path), metadata, job_id)
+        except Exception as upload_error:
+            logger.error(f"Error uploading video to Dropbox: {upload_error}")
+            dropbox_video_path = dropbox_path
+
+        await progress_msg.edit_text("📏 Step 3: Checking file size...")
+        video_path_obj = Path(video_path)
+        video_size_mb = get_file_size_mb(video_path_obj)
+
+        if video_size_mb > 45.0:
+            await progress_msg.edit_text(
+                f"🗜️ Step 3.5: Compressing video ({video_size_mb:.1f} MB → target <45 MB)..."
+            )
+            final_video_path = await asyncio.to_thread(compress_video_if_needed, video_path_obj, 45.0)
+            final_size_mb = get_file_size_mb(final_video_path)
+        else:
+            final_video_path = video_path_obj
+            final_size_mb = video_size_mb
+
+        await progress_msg.edit_text(f"📤 Step 4: Sending video ({final_size_mb:.1f} MB)...")
+
+        video_filename = final_video_path.name
+        project_name = video_filename.replace(".mp4", "")
+        try:
+            path_parts = (dropbox_video_path or "").split("/")
+            for idx_part, part in enumerate(path_parts):
+                if part == "render" and idx_part + 1 < len(path_parts):
+                    project_name = path_parts[idx_part + 1]
+                    break
+        except Exception:
+            pass
+
+        caption = f"📁 {project_name}\n<code>{dropbox_video_path or ''}</code>"
+        if callback_query.message:
+            await callback_query.message.answer_video(
+                video=FSInputFile(str(final_video_path)),
+                caption=caption,
+                parse_mode="HTML",
+            )
+        else:
+            await bot.send_video(
+                callback_query.from_user.id,
+                FSInputFile(str(final_video_path)),
+                caption=caption,
+                parse_mode="HTML",
+            )
+
+        with contextlib.suppress(Exception):
+            await progress_msg.delete()
+
+        try:
+            await callback_query.answer("Video created successfully!")
+        except Exception as answer_error:
+            logger.warning(f"Could not answer callback query (likely expired): {answer_error}")
+
+        try:
+            cleanup_temp_and_conv()
+            cleanup_old_files(max_age_hours=6)
+        except Exception as cleanup_error:
+            logger.error(f"Error cleaning up directories after video creation: {cleanup_error}")
+    except Exception as exc:
+        logger.error(
+            "Error in server-side preview generation for user %s job %s: %s",
+            callback_query.from_user.id if callback_query.from_user else "unknown",
+            job_id,
+            exc,
+        )
+        if progress_msg:
+            with contextlib.suppress(Exception):
+                await progress_msg.edit_text(f"❌ Error during preview generation: {exc}")
+        try:
+            await callback_query.answer("Error occurred while creating video.", show_alert=True)
+        except Exception as answer_error:
+            logger.warning(f"Could not answer callback query after failure: {answer_error}")
+            if callback_query.message:
+                await callback_query.message.answer("❌ Error occurred while creating video.")
+        try:
+            cleanup_job_files(job_id)
+            cleanup_temp_and_conv()
+            cleanup_old_files(max_age_hours=6)
+        except Exception as cleanup_error:
+            logger.error(f"Error cleaning up job files after failure: {cleanup_error}")
+    finally:
+        download_states.pop(job_id, None)
+        stop_downloads.pop(job_id, None)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("preview_render:"))
+async def preview_render_callback(callback_query: CallbackQuery):
+    """Handle render method choice for previews."""
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    parts = callback_query.data.split(":", 2)
+    if len(parts) != 3:
+        await callback_query.answer("Invalid selection.", show_alert=True)
+        return
+
+    _, mode, job_id = parts
+
+    if mode == "deadline":
+        await create_new_video_process(callback_query, job_id)
+        return
+
+    if mode == "server":
+        await render_preview_via_server(callback_query, job_id)
+        return
+
+    await callback_query.answer("Unknown action.", show_alert=True)
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("preview_retry:"))
@@ -1454,9 +1750,7 @@ async def send_dbx_video_callback(callback_query: CallbackQuery):
             
             # Check file size (no compression needed for documents up to 2GB)
             await progress_msg.edit_text("📏 Checking file size...")
-            from app.integrations.video_helpers import get_file_size_mb
             from aiogram.types import FSInputFile
-            from pathlib import Path
             
             video_path_obj = Path(video_path)
             video_size_mb = get_file_size_mb(video_path_obj)
@@ -1497,7 +1791,6 @@ async def send_dbx_video_callback(callback_query: CallbackQuery):
             # No compression cleanup needed - we send original files
                 
             # Clean up job files after successful send
-            from app.integrations.video_helpers import cleanup_job_files, cleanup_old_files
             cleanup_job_files(job_id)
             # Also clean up old files to save disk space
             cleanup_old_files(max_age_hours=6)  # Clean files older than 6 hours
@@ -1550,15 +1843,13 @@ async def create_new_video_callback(callback_query: CallbackQuery):
     job_id = callback_query.data.split(":", 1)[1]
     
     try:
-        await create_new_video_process(callback_query, job_id)
-        
-        # Answer callback to stop button animation (if not already answered in create_new_video_process)
-        try:
-            await callback_query.answer("Задача отправлена в Deadline!")
-        except Exception as answer_error:
-            logger.warning(f"Could not answer callback query in create_new_video_callback: {answer_error}")
-            # Already answered in create_new_video_process or the query is too old
-        
+        await _prompt_render_method(
+            callback_query,
+            job_id,
+            "Select a preview render method:",
+        )
+        with contextlib.suppress(Exception):
+            await callback_query.answer()
     except Exception as e:
         logger.error(f"Error handling create_new_video for user {callback_query.from_user.id}: {e}")
         await callback_query.answer("Error occurred while creating video.", show_alert=True)
