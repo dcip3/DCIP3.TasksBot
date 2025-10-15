@@ -44,6 +44,42 @@ class Settings(BaseSettings):
     http_timeout: int = Field(30, description="HTTP timeout for external requests in seconds")
 
     ocio_config_path: str = Field("storage/config.ocio", description="Path to OCIO configuration file")
+    preview_apply_color_transform: bool = Field(
+        True,
+        description="Apply OCIO color transform when generating preview videos",
+    )
+    preview_input_space: str = Field(
+        "ACEScg",
+        description="OCIO input color space for preview conversion",
+    )
+    preview_display: str = Field(
+        "sRGB",
+        description="OCIO display for preview conversion",
+    )
+    preview_view: str = Field(
+        "ACES 1.0 SDR-video",
+        description="OCIO view for preview conversion",
+    )
+    preview_lut_size: int = Field(
+        65,
+        description="Cube size to bake for preview LUT (only used on render nodes)",
+    )
+    preview_ocio_remote_config: Optional[str] = Field(
+        default=None,
+        description="Absolute path to OCIO config accessible from Deadline workers",
+    )
+    preview_attach_ocio_config: bool = Field(
+        False,
+        description="Upload the local OCIO config as an auxiliary file if workers cannot access it directly",
+    )
+    preview_python_executable: str = Field(
+        "python",
+        description="Python executable available on Deadline workers to run preview helper script",
+    )
+    preview_temp_dir: Optional[str] = Field(
+        default=None,
+        description="Optional temp directory on workers for preview helper script",
+    )
     ffmpeg_path: str = Field("ffmpeg", description="Path to ffmpeg executable on Deadline workers")
 
     # Security Settings

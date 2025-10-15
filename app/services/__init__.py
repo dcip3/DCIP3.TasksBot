@@ -12,6 +12,9 @@ import ntpath
 import posixpath
 import re
 import shlex
+import subprocess
+import base64
+import zlib
 from collections import Counter
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -343,6 +346,9 @@ async def submit_deadline_job(
 
         if resolved_aux:
             payload["AuxFiles"] = [remote for _, remote in resolved_aux]
+            for idx, (_, remote_name) in enumerate(resolved_aux):
+                payload["JobInfo"][f"AuxiliarySubmissionFile{idx}"] = remote_name
+            payload["JobInfo"]["CompleteSubmission"] = "False"
 
     submit_url = f"{settings.base_api_url}/jobs"
     logger.info("Submitting Deadline job via %s", submit_url)
@@ -365,7 +371,8 @@ async def submit_deadline_job(
 
     job_id = submission_response.get("job_id") or submission_response.get("_id")
     if not job_id:
-        logger.warning("Deadline submission response missing job_id: %s", submission_response)
+        logger.error("Deadline submission response missing job_id. Response: %s", submission_response)
+        raise DeadlineSubmissionError("Deadline submission did not return a job id")
     else:
         logger.info("Deadline job submitted successfully: %s", job_id)
 
@@ -869,12 +876,98 @@ async def create_video_from_job(
     except (TypeError, ValueError):
         frame_rate = 25.0
 
-    arguments = (
-        f'-y -start_number {start_frame} -framerate {frame_rate:g} '
-        f'-i "{input_sequence_path}" '
-        f'-c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p '
-        f'"{video_output_path}"'
-    ).strip()
+    helper_script = Path(__file__).resolve().parents[2] / "scripts" / "deadline_preview_worker.py"
+    if not helper_script.exists():
+        logger.error("Preview helper script not found: %s", helper_script)
+        return None
+
+    script_bytes = helper_script.read_bytes()
+    compressed_script = zlib.compress(script_bytes)
+    script_b64 = base64.b64encode(compressed_script).decode("ascii")
+
+    aux_files: List[Union[str, Path, Tuple[Union[str, Path], str]]] = []
+
+    python_exec = settings.preview_python_executable or "python"
+    ffmpeg_exec = settings.ffmpeg_path or "ffmpeg"
+
+    attach_config = settings.preview_attach_ocio_config
+    remote_config_path: Optional[str]
+    if attach_config:
+        local_config_path = Path(settings.ocio_config_path)
+        if not local_config_path.exists():
+            logger.error("Configured OCIO config not found for attachment: %s", local_config_path)
+            return None
+        aux_files.append((local_config_path, local_config_path.name))
+        remote_config_path = (
+            f"%DEADLINE_AUX_ROOT%\\{local_config_path.name}" if is_windows_path else f"$DEADLINE_AUX_ROOT/{local_config_path.name}"
+        )
+    else:
+        remote_config_path = settings.preview_ocio_remote_config
+        if not remote_config_path:
+            ocio_candidate = Path(settings.ocio_config_path)
+            remote_config_path = str(ocio_candidate) if ocio_candidate.is_absolute() else None
+
+    apply_color = settings.preview_apply_color_transform
+    if apply_color and not remote_config_path:
+        logger.warning(
+            "Preview color transform enabled but no OCIO config path available; disabling color transform for job %s",
+            job_id,
+        )
+        apply_color = False
+
+    script_args: List[str] = [
+        "--input-pattern",
+        input_sequence_path,
+        "--output-path",
+        video_output_path,
+        "--start-number",
+        str(start_frame),
+        "--frame-rate",
+        f"{frame_rate:g}",
+        "--ffmpeg-path",
+        ffmpeg_exec,
+        "--preset",
+        "medium",
+        "--crf",
+        "20",
+    ]
+
+    if settings.preview_temp_dir:
+        script_args.extend(["--temp-dir", settings.preview_temp_dir])
+
+    if apply_color:
+        if remote_config_path:
+            script_args.extend(["--ocio-config", remote_config_path])
+        script_args.extend(
+            [
+                "--input-space",
+                settings.preview_input_space,
+                "--display",
+                settings.preview_display,
+                "--view",
+                settings.preview_view,
+                "--lut-size",
+                str(settings.preview_lut_size),
+            ]
+        )
+    else:
+        script_args.append("--disable-color")
+
+    script_argv = ["deadline_preview_worker.py"] + script_args
+    argv_json = json.dumps(script_argv)
+    argv_b64 = base64.b64encode(argv_json.encode("utf-8")).decode("ascii")
+
+    stub_code = (
+        "import os,sys,base64,zlib,json;"
+        "script=os.environ['PREVIEW_SCRIPT_B64'];"
+        "argv=os.environ['PREVIEW_ARGV_B64'];"
+        "sys.argv=json.loads(base64.b64decode(argv).decode('utf-8'));"
+        "exec(zlib.decompress(base64.b64decode(script)))"
+    )
+
+    python_args = ["-c", stub_code]
+    if not is_windows_path:
+        python_args_str = " ".join(shlex.quote(arg) for arg in python_args)
 
     tasks = await get_job_tasks(login, password, job_id)
     slave_counter: Counter[str] = Counter(
@@ -949,36 +1042,80 @@ async def create_video_from_job(
     if preferred_slaves:
         preview_job_info["Whitelist"] = ",".join(preferred_slaves)
 
-    ffmpeg_exec = settings.ffmpeg_path or "ffmpeg"
-    command_line = f"{ffmpeg_exec} {arguments}".strip()
+    environment_pairs: Dict[str, str] = {
+        "PREVIEW_SCRIPT_B64": script_b64,
+        "PREVIEW_ARGV_B64": argv_b64,
+        "PREVIEW_STUB": stub_code,
+    }
+    if apply_color and remote_config_path:
+        environment_pairs["OCIO"] = remote_config_path
+
+    if environment_pairs:
+        for idx, (key, value) in enumerate(environment_pairs.items()):
+            preview_job_info[f"EnvironmentKeyValue{idx}"] = f"{key}={value}"
+
     if is_windows_path:
-        quoted_exec = ffmpeg_exec
-        if " " in quoted_exec and not quoted_exec.startswith('"'):
-            quoted_exec = f'"{quoted_exec}"'
-        command_line = f"{quoted_exec} {arguments}".strip()
-        plugin_info = {
-            "Executable": "cmd.exe",
-            "Arguments": f"/C {command_line}",
-            "Shell": "default",
-            "StartupDirectory": render_output_dir,
-        }
+        stub_placeholder = '"%PREVIEW_STUB%"'
+        def split_windows_command(command: str) -> List[str]:
+            cmd_trimmed = command.strip()
+            if not cmd_trimmed:
+                return []
+            if (
+                " " in cmd_trimmed
+                and not cmd_trimmed.startswith('"')
+                and (":" in cmd_trimmed or "\\" in cmd_trimmed or "/" in cmd_trimmed)
+            ):
+                return [cmd_trimmed]
+            try:
+                return shlex.split(cmd_trimmed, posix=False)
+            except ValueError:
+                return [cmd_trimmed]
+
+        candidate_commands: List[List[str]] = []
+        primary_tokens = split_windows_command(python_exec)
+        fallback_candidates = [
+            ["py"],
+            ["python"],
+        ]
+        for fallback in fallback_candidates:
+            if fallback not in candidate_commands:
+                candidate_commands.append(fallback)
+        if primary_tokens:
+            normalized = " ".join(primary_tokens).strip().lower()
+            if normalized and primary_tokens not in candidate_commands:
+                if normalized in {"python", "py", "py -3", "py -3.11"}:
+                    candidate_commands.append(primary_tokens)
+                else:
+                    candidate_commands.insert(0, primary_tokens)
+
+        command_segments = []
+        for tokens in candidate_commands:
+            cmd_head = subprocess.list2cmdline(tokens)
+            segment = f"{cmd_head} -c {stub_placeholder}"
+            command_segments.append(segment)
+        fallback_command = " || ".join(command_segments)
+        arguments_str = f"/C {fallback_command}"
+        executable = "cmd.exe"
+        command_line = f"{executable} {arguments_str}"
     else:
-        quoted_exec = shlex.quote(ffmpeg_exec)
-        command_line = f"{quoted_exec} {arguments}".strip()
-        plugin_info = {
-            "Executable": "/bin/bash",
-            "Arguments": f"-lc {shlex.quote(command_line)}",
-            "Shell": "default",
-            "StartupDirectory": render_output_dir,
-        }
+        executable = python_exec
+        arguments_str = python_args_str
+        command_line = f"{python_exec} {python_args_str}"
+
+    plugin_info = {
+        "Executable": executable,
+        "Arguments": arguments_str,
+        "Shell": "default",
+        "StartupDirectory": render_output_dir,
+    }
 
     try:
         submission_response = await submit_deadline_job(
             telegram_user_id=telegram_user_id,
             job_info=preview_job_info,
             plugin_info=plugin_info,
-            aux_files=None,
-            complete_submission=False,
+            aux_files=aux_files,
+            complete_submission=True,
         )
     except DeadlineSubmissionError as exc:
         logger.error("Failed to submit preview job for %s: %s", job_id, exc)
