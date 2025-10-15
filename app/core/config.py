@@ -80,6 +80,10 @@ class Settings(BaseSettings):
         default=None,
         description="Optional temp directory on workers for preview helper script",
     )
+    preview_color_mode: str = Field(
+        "lut",
+        description="Color transform mode for previews: 'lut' generates a LUT, 'cpu' applies OCIO on CPU",
+    )
     ffmpeg_path: str = Field("ffmpeg", description="Path to ffmpeg executable on Deadline workers")
 
     # Security Settings

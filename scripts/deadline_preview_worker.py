@@ -13,13 +13,15 @@ in the Python environment available on the worker.
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Tuple
 
 
 def configure_logging(verbosity: int) -> None:
@@ -70,6 +72,176 @@ def bake_preview_lut(
     destination.write_text(baked)
     logging.info("Preview LUT written to %s", destination)
 
+
+def _load_cpu_processor(
+    config_path: Path,
+    input_space: str,
+    display: str,
+    view: str,
+):
+    try:
+        import PyOpenColorIO as ocio
+    except ImportError as exc:  # pragma: no cover - depends on worker environment
+        raise RuntimeError("PyOpenColorIO is required for CPU color mode") from exc
+
+    config = ocio.Config.CreateFromFile(str(config_path))
+    transform = ocio.DisplayViewTransform()
+    transform.setSrc(input_space)
+    transform.setDisplay(display)
+    transform.setView(view)
+    transform.setDirection(ocio.TRANSFORM_DIR_FORWARD)
+    processor = config.getProcessor(transform)
+    cpu_processor = processor.getDefaultCPUProcessor()
+    if cpu_processor is None:
+        raise RuntimeError("Failed to create OCIO CPU processor")
+    return cpu_processor
+
+
+def _convert_exr_to_png_cpu(
+    exr_path: Path,
+    output_path: Path,
+    cpu_processor,
+    width_chunk: int = 256,
+):
+    try:
+        import OpenEXR
+        import Imath
+        import numpy as np
+        from PIL import Image
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError(
+            "CPU color mode requires OpenEXR, Imath, numpy, and Pillow"
+        ) from exc
+
+    FLOAT = Imath.PixelType(Imath.PixelType.FLOAT)
+    exr = OpenEXR.InputFile(str(exr_path))
+    try:
+        header = exr.header()
+        dw = header["dataWindow"]
+        width = dw.max.x - dw.min.x + 1
+        height = dw.max.y - dw.min.y + 1
+
+        channels = exr.channels(["R", "G", "B"], FLOAT)
+
+        processed_chunks = []
+        for y_start in range(0, height, width_chunk):
+            y_end = min(y_start + width_chunk, height)
+            chunk_height = y_end - y_start
+
+            r_chunk = np.frombuffer(
+                channels[0][y_start * width * 4 : y_end * width * 4],
+                dtype=np.float32,
+            ).reshape((chunk_height, width))
+            g_chunk = np.frombuffer(
+                channels[1][y_start * width * 4 : y_end * width * 4],
+                dtype=np.float32,
+            ).reshape((chunk_height, width))
+            b_chunk = np.frombuffer(
+                channels[2][y_start * width * 4 : y_end * width * 4],
+                dtype=np.float32,
+            ).reshape((chunk_height, width))
+
+            rgb_chunk = np.stack([r_chunk, g_chunk, b_chunk], axis=-1)
+            flat_chunk = rgb_chunk.reshape(-1, 3).astype(np.float32)
+            from PyOpenColorIO import PackedImageDesc  # type: ignore
+
+            img_desc = PackedImageDesc(flat_chunk, width, chunk_height, 3)
+            cpu_processor.apply(img_desc)
+            processed_chunk = flat_chunk.reshape(chunk_height, width, 3)
+            processed_chunks.append(processed_chunk)
+
+            del r_chunk, g_chunk, b_chunk, rgb_chunk, flat_chunk
+            gc.collect()
+
+        img = (
+            np.vstack(processed_chunks)
+            if processed_chunks
+            else np.zeros((height, width, 3), dtype=np.float32)
+        )
+        img = np.clip(img, 0.0, 1.0)
+        img8 = (img * 255.0 + 0.5).astype(np.uint8)
+
+        pil_img = Image.fromarray(img8, mode="RGB")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        pil_img.save(str(output_path), "PNG")
+    finally:
+        try:
+            exr.close()
+        except Exception:
+            pass
+        gc.collect()
+
+
+def _expand_sequence(pattern: str) -> Tuple[Path, str, int, List[Path]]:
+    pattern_path = Path(pattern)
+    directory = pattern_path.parent
+    template = pattern_path.name
+    match = re.search(r"%0(\d+)d", template)
+    if not match:
+        raise RuntimeError("Input pattern must contain %0Nd placeholder")
+    digits = int(match.group(1))
+    glob_pattern = re.sub(r"%0\d+d", "?" * digits, template)
+    files = sorted(directory.glob(glob_pattern))
+    frame_regex = re.compile(r"(\d+)(?=\.[^.]+$)")
+
+    def sort_key(path: Path) -> int:
+        m = frame_regex.search(path.name)
+        if not m:
+            raise RuntimeError(f"Could not extract frame number from {path.name}")
+        return int(m.group(1))
+
+    files.sort(key=sort_key)
+    if not files:
+        raise RuntimeError(f"No frames found matching pattern {pattern}")
+    return directory, template, digits, files
+
+
+def convert_sequence_cpu(
+    *,
+    input_pattern: str,
+    start_number: int,
+    config_path: Path,
+    input_space: str,
+    display: str,
+    view: str,
+    temp_dir: Optional[str],
+) -> Tuple[str, int, Optional[tempfile.TemporaryDirectory[str]]]:
+    directory, template, digits, files = _expand_sequence(input_pattern)
+
+    if config_path is None or not config_path.exists():
+        raise RuntimeError("OCIO config is required for CPU color mode")
+
+    cpu_processor = _load_cpu_processor(config_path, input_space, display, view)
+
+    temp_dir_obj: Optional[tempfile.TemporaryDirectory[str]]
+    base_dir = temp_dir
+    if base_dir:
+        Path(base_dir).mkdir(parents=True, exist_ok=True)
+    temp_dir_obj = tempfile.TemporaryDirectory(prefix="preview_cpu_", dir=base_dir)
+    cpu_dir = Path(temp_dir_obj.name)
+
+    frame_regex = re.compile(r"(\d+)(?=\.[^.]+$)")
+    frame_numbers: List[int] = []
+    for exr_path in files:
+        match = frame_regex.search(exr_path.name)
+        if not match:
+            raise RuntimeError(f"Could not extract frame number from {exr_path.name}")
+        frame_num = int(match.group(1))
+        frame_numbers.append(frame_num)
+        output_filename = exr_path.with_suffix(".png").name
+        output_path = cpu_dir / output_filename
+        logging.debug("Converting %s -> %s", exr_path, output_path)
+        _convert_exr_to_png_cpu(exr_path, output_path, cpu_processor)
+
+    first_frame = frame_numbers[0] if frame_numbers else start_number
+    png_template = template
+    if png_template.lower().endswith(".exr"):
+        png_template = png_template[:-4] + ".png"
+    else:
+        png_template = png_template + ".png"
+
+    converted_pattern = str(cpu_dir / png_template)
+    return converted_pattern, first_frame, temp_dir_obj
 
 def build_ffmpeg_command(
     *,
@@ -153,6 +325,12 @@ def parse_arguments(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=None,
         help="Optional directory for temporary files (uses system temp if omitted)",
     )
+    parser.add_argument(
+        "--color-mode",
+        choices=["lut", "cpu"],
+        default="lut",
+        help="Color transform mode: 'lut' (default) or 'cpu' to run OCIO on CPU",
+    )
 
     color_group = parser.add_argument_group("color management")
     color_group.add_argument("--disable-color", action="store_true", help="Disable OCIO color transform")
@@ -180,52 +358,79 @@ def main(argv: Optional[list[str]] = None) -> int:
     configure_logging(args.verbose)
 
     try:
-        config_path = resolve_config_path(args)
+        cleanup_resources: List[tempfile.TemporaryDirectory[str]] = []
 
+        color_mode = args.color_mode.lower()
+        apply_color = not args.disable_color
+        config_path: Optional[Path] = None
+        if apply_color:
+            config_path_optional = resolve_config_path(args)
+            config_path = Path(config_path_optional) if config_path_optional else None
+
+        ffmpeg_input_pattern = args.input_pattern
+        start_number = args.start_number
         lut_path: Optional[Path] = None
-        temp_dir_cm: Optional[tempfile.TemporaryDirectory[str]] = None
-        if not args.disable_color:
+
+        if apply_color and color_mode == "cpu":
+            if config_path is None:
+                raise RuntimeError("OCIO config required for CPU color mode")
+            converted_pattern, start_number, cpu_temp_dir = convert_sequence_cpu(
+                input_pattern=args.input_pattern,
+                start_number=args.start_number,
+                config_path=config_path,
+                input_space=args.input_space,
+                display=args.display,
+                view=args.view,
+                temp_dir=args.temp_dir,
+            )
+            ffmpeg_input_pattern = converted_pattern
+            if cpu_temp_dir is not None:
+                cleanup_resources.append(cpu_temp_dir)
+        elif apply_color:
+            if config_path is None:
+                raise RuntimeError("OCIO config required for LUT color mode")
             if args.lut_path:
                 lut_path = Path(args.lut_path)
             else:
                 base_temp_dir = args.temp_dir
                 if base_temp_dir:
                     Path(base_temp_dir).mkdir(parents=True, exist_ok=True)
-                temp_dir_cm = tempfile.TemporaryDirectory(prefix="preview_lut_", dir=base_temp_dir)
-                lut_path = Path(temp_dir_cm.name) / "preview_lut.cube"
+                lut_temp_dir = tempfile.TemporaryDirectory(prefix="preview_lut_", dir=base_temp_dir)
+                cleanup_resources.append(lut_temp_dir)
+                lut_path = Path(lut_temp_dir.name) / "preview_lut.cube"
             bake_preview_lut(
-                config_path=config_path,  # type: ignore[arg-type]
+                config_path=config_path,
                 input_space=args.input_space,
                 display=args.display,
                 view=args.view,
                 lut_size=args.lut_size,
-                destination=lut_path,  # type: ignore[arg-type]
+                destination=lut_path,
             )
 
         command = build_ffmpeg_command(
             ffmpeg_path=args.ffmpeg_path,
-            start_number=args.start_number,
+            start_number=start_number,
             frame_rate=args.frame_rate,
-            input_pattern=args.input_pattern,
+            input_pattern=ffmpeg_input_pattern,
             output_path=args.output_path,
-            lut_path=lut_path,
+            lut_path=lut_path if apply_color and color_mode == "lut" else None,
             preset=args.preset,
             crf=args.crf,
         )
         run_ffmpeg(command)
         logging.info("Preview video successfully written to %s", args.output_path)
 
-        if temp_dir_cm is not None and args.keep_lut:
+        if apply_color and color_mode == "lut" and args.keep_lut:
             logging.info("LUT kept at %s", lut_path)
     except Exception as exc:  # pragma: no cover - Deadline handles logging
         logging.error("Preview conversion failed: %s", exc, exc_info=True)
         return 1
     finally:
-        if "temp_dir_cm" in locals() and isinstance(temp_dir_cm, tempfile.TemporaryDirectory):
-            if args.keep_lut:
-                temp_dir_cm.cleanup = lambda: None  # type: ignore[assignment]
-            else:
+        for temp_dir_cm in cleanup_resources:
+            try:
                 temp_dir_cm.cleanup()
+            except Exception:
+                pass
 
     return 0
 

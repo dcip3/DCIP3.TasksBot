@@ -915,6 +915,8 @@ async def create_video_from_job(
         )
         apply_color = False
 
+    color_mode = (getattr(settings, "preview_color_mode", "lut") or "lut").strip().lower()
+
     script_args: List[str] = [
         "--input-pattern",
         input_sequence_path,
@@ -931,6 +933,7 @@ async def create_video_from_job(
         "--crf",
         "20",
     ]
+    script_args.extend(["--color-mode", color_mode])
 
     if settings.preview_temp_dir:
         script_args.extend(["--temp-dir", settings.preview_temp_dir])
