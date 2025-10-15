@@ -5,14 +5,6 @@ services:
       dockerfile: infra/backend/Dockerfile
     env_file:
       - .env
-    environment:
-      - TG_API_TOKEN=${TG_API_TOKEN}
-      - DROPBOX_APP_KEY=${DROPBOX_APP_KEY}
-      - DROPBOX_APP_SECRET=${DROPBOX_APP_SECRET}
-      - DROPBOX_REFRESH_TOKEN=${DROPBOX_REFRESH_TOKEN}
-      - DROPBOX_TEAM_MEMBER_ID=${DROPBOX_TEAM_MEMBER_ID}
-      - DROPBOX_ROOT_NAMESPACE_ID=${DROPBOX_ROOT_NAMESPACE_ID}
-      - DROPBOX_ROOT_MARKER=${DROPBOX_ROOT_MARKER}
     volumes:
       - ./storage/conv:/app/storage/conv
       - ./storage/temp:/app/storage/temp
