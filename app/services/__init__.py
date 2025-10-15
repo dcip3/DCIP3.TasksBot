@@ -87,10 +87,10 @@ async def create_optimized_session() -> aiohttp.ClientSession:
 async def get_jobs_list(telegram_user_id: int) -> List[Dict[str, Any]]:
     """
     Get list of jobs from Deadline API.
-    
+
     Args:
         telegram_user_id: Telegram user ID
-        
+
     Returns:
         List of job dictionaries
     """
@@ -100,22 +100,22 @@ async def get_jobs_list(telegram_user_id: int) -> List[Dict[str, Any]]:
         if not credentials:
             logger.error(f"No Deadline credentials found for user {telegram_user_id}")
             return []
-        
+
         login, password = credentials
         logger.info(f"Requesting jobs for user {telegram_user_id} with login {login}")
-        
-        async with aiohttp.ClientSession() as session:
-            headers = aiohttp.BasicAuth(login, password)
-            async with session.get(f"{settings.base_api_url}/jobs", auth=headers, ssl=False) as resp:
-                logger.info(f"Jobs API response status: {resp.status}")
-                if resp.status == 200:
-                    data = await resp.json()
-                    logger.info(f"Jobs API returned {len(data) if isinstance(data, list) else 'non-list'} items")
-                    return data
-                else:
-                    response_text = await resp.text()
-                    logger.error(f"Failed to get jobs: {resp.status}, response: {response_text}")
-                    return []
+
+        session = await get_aiosession()
+        headers = aiohttp.BasicAuth(login, password)
+        async with session.get(f"{settings.base_api_url}/jobs", auth=headers, ssl=False) as resp:
+            logger.info(f"Jobs API response status: {resp.status}")
+            if resp.status == 200:
+                data = await resp.json()
+                logger.info(f"Jobs API returned {len(data) if isinstance(data, list) else 'non-list'} items")
+                return data
+            else:
+                response_text = await resp.text()
+                logger.error(f"Failed to get jobs: {resp.status}, response: {response_text}")
+                return []
     except Exception as e:
         logger.error(f"Error getting jobs: {e}")
         return []
@@ -124,17 +124,17 @@ async def get_jobs_list(telegram_user_id: int) -> List[Dict[str, Any]]:
 async def _fetch_workers(login: str, password: str) -> List[Dict[str, Any]]:
     """Fetch workers list using provided Deadline credentials."""
     try:
-        async with aiohttp.ClientSession() as session:
-            headers = aiohttp.BasicAuth(login, password)
-            async with session.get(f"{settings.base_api_url}/slaves?Data=infosettings", auth=headers, ssl=False) as resp:
-                logger.info(f"Slaves API response status: {resp.status}")
-                if resp.status == 200:
-                    data = await resp.json()
-                    logger.info(f"Slaves API returned {len(data) if isinstance(data, list) else 'non-list'} items")
-                    return data
-                response_text = await resp.text()
-                logger.error(f"Failed to get slaves: {resp.status}, response: {response_text}")
-                return []
+        session = await get_aiosession()
+        headers = aiohttp.BasicAuth(login, password)
+        async with session.get(f"{settings.base_api_url}/slaves?Data=infosettings", auth=headers, ssl=False) as resp:
+            logger.info(f"Slaves API response status: {resp.status}")
+            if resp.status == 200:
+                data = await resp.json()
+                logger.info(f"Slaves API returned {len(data) if isinstance(data, list) else 'non-list'} items")
+                return data
+            response_text = await resp.text()
+            logger.error(f"Failed to get slaves: {resp.status}, response: {response_text}")
+            return []
     except Exception as e:
         logger.error(f"Error getting slaves: {e}")
         return []
@@ -173,33 +173,32 @@ async def get_workers_by_credentials(login: str, password: str) -> List[Dict[str
 async def get_job_info(login: str, password: str, job_id: str) -> Optional[Dict[str, Any]]:
     """
     Get detailed information about a specific job.
-    
+
     Args:
         login: User login
         password: User password
         job_id: Job ID
-        dropbox_path_hint: Optional explicit Dropbox video path
-        
+
     Returns:
         Job information dictionary or None if error
     """
     try:
-        async with aiohttp.ClientSession() as session:
-            headers = aiohttp.BasicAuth(login, password)
-            # Get all jobs and find the specific one
-            async with session.get(f"{settings.base_api_url}/jobs", auth=headers, ssl=False) as resp:
-                if resp.status == 200:
-                    jobs = await resp.json()
-                    # Find the job by _id
-                    matching_jobs = [j for j in jobs if j.get("_id") == job_id]
-                    if matching_jobs:
-                        return matching_jobs[0]
-                    else:
-                        logger.error(f"Job {job_id} not found in jobs list")
-                        return None
+        session = await get_aiosession()
+        headers = aiohttp.BasicAuth(login, password)
+        # Get all jobs and find the specific one
+        async with session.get(f"{settings.base_api_url}/jobs", auth=headers, ssl=False) as resp:
+            if resp.status == 200:
+                jobs = await resp.json()
+                # Find the job by _id
+                matching_jobs = [j for j in jobs if j.get("_id") == job_id]
+                if matching_jobs:
+                    return matching_jobs[0]
                 else:
-                    logger.error(f"Failed to get jobs list: {resp.status}")
+                    logger.error(f"Job {job_id} not found in jobs list")
                     return None
+            else:
+                logger.error(f"Failed to get jobs list: {resp.status}")
+                return None
     except Exception as e:
         logger.error(f"Error getting job info: {e}")
         return None
@@ -233,28 +232,28 @@ async def get_job_info_by_user_id(telegram_user_id: int, job_id: str) -> Optiona
 async def get_job_tasks(login: str, password: str, job_id: str) -> List[Dict[str, Any]]:
     """
     Get tasks for a specific job.
-    
+
     Args:
         login: User login
         password: User password
         job_id: Job ID
-        
+
     Returns:
         List of task dictionaries
     """
     try:
-        async with aiohttp.ClientSession() as session:
-            headers = aiohttp.BasicAuth(login, password)
-            async with session.get(f"{settings.base_api_url}/tasks?JobID={job_id}", auth=headers, ssl=False) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    # API may return {"Tasks": [...]} or a plain list
-                    if isinstance(data, dict):
-                        return data.get("Tasks", [])
-                    return data
-                else:
-                    logger.error(f"Failed to get job tasks: {resp.status}")
-                    return []
+        session = await get_aiosession()
+        headers = aiohttp.BasicAuth(login, password)
+        async with session.get(f"{settings.base_api_url}/tasks?JobID={job_id}", auth=headers, ssl=False) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                # API may return {"Tasks": [...]} or a plain list
+                if isinstance(data, dict):
+                    return data.get("Tasks", [])
+                return data
+            else:
+                logger.error(f"Failed to get job tasks: {resp.status}")
+                return []
     except Exception as e:
         logger.error(f"Error getting job tasks: {e}")
         return []
@@ -422,24 +421,24 @@ async def submit_deadline_job(
 async def requeue_job(login: str, password: str, job_id: str) -> bool:
     """
     Requeue a job.
-    
+
     Args:
         login: User login
         password: User password
         job_id: Job ID
-        
+
     Returns:
         True if successful, False otherwise
     """
     try:
-        async with aiohttp.ClientSession() as session:
-            headers = aiohttp.BasicAuth(login, password)
-            json_body = {"Command": "requeue", "JobID": job_id}
-            async with session.put(f"{settings.base_api_url}/jobs", json=json_body, auth=headers, ssl=False) as resp:
-                success = resp.status == 200
-                if not success:
-                    logger.error(f"Failed to requeue job: {resp.status}")
-                return success
+        session = await get_aiosession()
+        headers = aiohttp.BasicAuth(login, password)
+        json_body = {"Command": "requeue", "JobID": job_id}
+        async with session.put(f"{settings.base_api_url}/jobs", json=json_body, auth=headers, ssl=False) as resp:
+            success = resp.status == 200
+            if not success:
+                logger.error(f"Failed to requeue job: {resp.status}")
+            return success
     except Exception as e:
         logger.error(f"Error requeuing job: {e}")
         return False
@@ -473,24 +472,24 @@ async def requeue_job_by_user_id(telegram_user_id: int, job_id: str) -> bool:
 async def resume_job(login: str, password: str, job_id: str) -> bool:
     """
     Resume a suspended job.
-    
+
     Args:
         login: User login
         password: User password
         job_id: Job ID
-        
+
     Returns:
         True if successful, False otherwise
     """
     try:
-        async with aiohttp.ClientSession() as session:
-            headers = aiohttp.BasicAuth(login, password)
-            json_body = {"Command": "resume", "JobID": job_id}
-            async with session.put(f"{settings.base_api_url}/jobs", json=json_body, auth=headers, ssl=False) as resp:
-                success = resp.status == 200
-                if not success:
-                    logger.error(f"Failed to resume job: {resp.status}")
-                return success
+        session = await get_aiosession()
+        headers = aiohttp.BasicAuth(login, password)
+        json_body = {"Command": "resume", "JobID": job_id}
+        async with session.put(f"{settings.base_api_url}/jobs", json=json_body, auth=headers, ssl=False) as resp:
+            success = resp.status == 200
+            if not success:
+                logger.error(f"Failed to resume job: {resp.status}")
+            return success
     except Exception as e:
         logger.error(f"Error resuming job: {e}")
         return False
@@ -524,24 +523,24 @@ async def resume_job_by_user_id(telegram_user_id: int, job_id: str) -> bool:
 async def suspend_job(login: str, password: str, job_id: str) -> bool:
     """
     Suspend a job.
-    
+
     Args:
         login: User login
         password: User password
         job_id: Job ID
-        
+
     Returns:
         True if successful, False otherwise
     """
     try:
-        async with aiohttp.ClientSession() as session:
-            headers = aiohttp.BasicAuth(login, password)
-            json_body = {"Command": "suspend", "JobID": job_id}
-            async with session.put(f"{settings.base_api_url}/jobs", json=json_body, auth=headers, ssl=False) as resp:
-                success = resp.status == 200
-                if not success:
-                    logger.error(f"Failed to suspend job: {resp.status}")
-                return success
+        session = await get_aiosession()
+        headers = aiohttp.BasicAuth(login, password)
+        json_body = {"Command": "suspend", "JobID": job_id}
+        async with session.put(f"{settings.base_api_url}/jobs", json=json_body, auth=headers, ssl=False) as resp:
+            success = resp.status == 200
+            if not success:
+                logger.error(f"Failed to suspend job: {resp.status}")
+            return success
     except Exception as e:
         logger.error(f"Error suspending job: {e}")
         return False
@@ -575,23 +574,23 @@ async def suspend_job_by_user_id(telegram_user_id: int, job_id: str) -> bool:
 async def delete_job(login: str, password: str, job_id: str) -> bool:
     """
     Delete a job.
-    
+
     Args:
         login: User login
         password: User password
         job_id: Job ID
-        
+
     Returns:
         True if successful, False otherwise
     """
     try:
-        async with aiohttp.ClientSession() as session:
-            headers = aiohttp.BasicAuth(login, password)
-            async with session.delete(f"{settings.base_api_url}/jobs?JobID={job_id}", auth=headers, ssl=False) as resp:
-                success = resp.status == 200
-                if not success:
-                    logger.error(f"Failed to delete job: {resp.status}")
-                return success
+        session = await get_aiosession()
+        headers = aiohttp.BasicAuth(login, password)
+        async with session.delete(f"{settings.base_api_url}/jobs?JobID={job_id}", auth=headers, ssl=False) as resp:
+            success = resp.status == 200
+            if not success:
+                logger.error(f"Failed to delete job: {resp.status}")
+            return success
     except Exception as e:
         logger.error(f"Error deleting job: {e}")
         return False

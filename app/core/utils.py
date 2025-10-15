@@ -749,7 +749,12 @@ async def on_shutdown(bot):
 async def job_progress_watcher(bot):
     """
     Monitor job completion and notify users about finished jobs.
-    
+    Also monitors preview jobs for ALL users (regardless of notification settings).
+
+    Uses adaptive polling interval:
+    - 15 seconds when there are active preview jobs
+    - 60 seconds for regular monitoring
+
     Args:
         bot: Bot instance for sending notifications
     """
@@ -759,19 +764,64 @@ async def job_progress_watcher(bot):
         get_all_users_with_notifications,
         disable_notifications_for_user,
     )
-    from app.core.bot_core import notified_jobs
-    
+    from app.core.bot_core import notified_jobs, get_aiosession
+    from app.core.database import get_db_connection
+
     while True:
-        await asyncio.sleep(60)
-        
+        # Adaptive polling interval based on active preview jobs
+        has_active_previews = len(preview_message_registry) > 0
+        sleep_interval = settings.job_watcher_interval_preview if has_active_previews else settings.job_watcher_interval_normal
+
+        if has_active_previews:
+            logger.debug(f"Active preview jobs: {len(preview_message_registry)}, using fast polling ({sleep_interval}s)")
+
+        await asyncio.sleep(sleep_interval)
+
+        # Get users with notifications enabled for regular jobs
         users_with_notifications = await get_all_users_with_notifications()
         logger.info(f"Job progress watcher: Found {len(users_with_notifications)} users with notifications enabled")
-        
-        for telegram_user_id, login, password in users_with_notifications:
+
+        # Get ALL users with credentials to monitor preview jobs
+        conn = get_db_connection()
+        all_users_for_preview = []
+        if conn:
             try:
-                async with aiohttp.ClientSession() as session:
-                    headers = aiohttp.BasicAuth(login, password)
-                    async with session.get(f"{settings.base_api_url}/jobs", auth=headers, ssl=False) as resp:
+                async with conn.execute(
+                    "SELECT telegram_user_id, deadline_login, deadline_password FROM user_sessions"
+                ) as cursor:
+                    all_users_for_preview = await cursor.fetchall()
+            except Exception as e:
+                logger.error(f"Error fetching users for preview monitoring: {e}")
+
+        # Decrypt passwords and combine lists (use telegram_user_id as key to avoid duplicates)
+        from app.auth import _decrypt_password
+        users_dict = {}
+
+        # Add users with notifications
+        for user_id, login, password in users_with_notifications:
+            try:
+                decrypted_password = _decrypt_password(password)
+            except Exception:
+                decrypted_password = password
+            users_dict[user_id] = (user_id, login, decrypted_password, True)  # True = has notifications
+
+        # Add all users for preview monitoring
+        for user_id, login, password in all_users_for_preview:
+            if user_id not in users_dict:
+                try:
+                    decrypted_password = _decrypt_password(password)
+                except Exception:
+                    decrypted_password = password
+                users_dict[user_id] = (user_id, login, decrypted_password, False)  # False = no notifications
+
+        logger.info(f"Job progress watcher: Monitoring {len(users_dict)} total users (notifications + preview)")
+
+        for telegram_user_id, login, decrypted_password, has_notifications in users_dict.values():
+
+            try:
+                session = await get_aiosession()
+                headers = aiohttp.BasicAuth(login, decrypted_password)
+                async with session.get(f"{settings.base_api_url}/jobs", auth=headers, ssl=False) as resp:
                         if resp.status == 200:
                             jobs = await resp.json()
                             for job in jobs:
@@ -785,7 +835,7 @@ async def job_progress_watcher(bot):
                                     date_comp_str = job.get("DateComp") or job.get("Props", {}).get("DateComp")
                                     if not date_comp_str or date_comp_str == "0001-01-01T00:00:00Z":
                                         continue
-                                        
+
                                     try:
                                         date_comp = datetime.fromisoformat(date_comp_str.replace("Z", "+00:00"))
                                         now = datetime.now(timezone.utc)
@@ -806,15 +856,20 @@ async def job_progress_watcher(bot):
                                         or extra_dict.get("PreviewJob") == "1"
                                     )
 
+                                    # Always process preview jobs regardless of notification settings
                                     if is_preview_job:
                                         await _notify_preview_job_completion(
                                             telegram_user_id,
                                             job,
                                             name,
                                             login,
-                                            password,
+                                            decrypted_password,
                                         )
                                         notified_jobs.add((job_id, telegram_user_id))
+                                        continue
+
+                                    # Only send regular job notifications if user has notifications enabled
+                                    if not has_notifications:
                                         continue
 
                                     batch = props.get("Batch") or "No Batch"

@@ -9,7 +9,7 @@ worker monitoring, and realtime operations.
 
 import logging
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
@@ -27,6 +27,11 @@ from app.services import (
     create_video_from_job, check_video_exists_in_dropbox, download_video_from_dropbox,
     WorkerStatusError
 )
+from app.bot.job_helpers import (
+    group_and_sort_jobs,
+    truncate_cell,
+    format_progress_old
+)
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -37,49 +42,6 @@ router = Router()
 # Column width constants for text tables
 BATCH_COLUMN_WIDTH = 22
 PAGE_SIZE = 6
-
-
-async def compute_batch_activity_timestamp(batch_jobs: list[dict]) -> datetime:
-    """Return the batch creation timestamp based on job-level metadata."""
-    for job in sorted(batch_jobs, key=lambda j: j.get('Date') or '', reverse=True):
-        date_value = job.get('Date') if isinstance(job, dict) else None
-        if not date_value:
-            continue
-        try:
-            return datetime.fromisoformat(date_value)
-        except ValueError:
-            continue
-    return datetime.min
-
-
-def truncate_cell(text: str, max_width: int = BATCH_COLUMN_WIDTH) -> str:
-    """
-    Ensure table cell content fits the allocated width.
-
-    Args:
-        text: Original string to display.
-        max_width: Maximum allowed characters for the column.
-
-    Returns:
-        Possibly truncated string with ellipsis if it exceeds the width.
-    """
-    text = str(text)
-    if len(text) <= max_width:
-        return text
-    if max_width <= 4:
-        return text[:max_width]
-
-    ellipsis = "..."
-    tail_len = min(3, len(text))
-    prefix_len = max_width - len(ellipsis) - tail_len
-
-    if prefix_len < 1:
-        tail_len = max_width - len(ellipsis) - 1
-        if tail_len < 1:
-            return text[:max_width]
-        prefix_len = 1
-
-    return text[:prefix_len] + ellipsis + text[-tail_len:]
 
 # ============================================================================
 # === STATE MACHINES ===
@@ -301,47 +263,9 @@ async def handle_jobs(message: Message, page: int = 0):
         if not jobs:
             await message.answer("No jobs found. This could mean:\n• There are no active jobs in Deadline\n• Your user doesn't have access to jobs\n• There was an API error (check logs)")
             return
-            
-        # Group jobs by batch name (like in old version)
-        from collections import defaultdict
-        grouped_jobs = defaultdict(list)
-        for job in jobs:
-            batch = job.get("Props", {}).get("Batch", "Untitled")
-            grouped_jobs[batch].append(job)
-        
-        # Combine jobs by batch (like in old version)
-        combined_jobs = []
-        for batch, batch_jobs in grouped_jobs.items():
-            total_tasks = sum(j.get("Props", {}).get("Tasks", 0) for j in batch_jobs)
-            completed_chunks = sum(j.get("CompletedChunks", 0) for j in batch_jobs)
-            
-            # Determine batch-level status with priority: Active > Pending > Suspended > Failed > Completed > Unknown
-            status_list = [j.get("Stat", 0) for j in batch_jobs]
-            if 1 in status_list:
-                batch_stat = 1      # Active
-            elif 6 in status_list:
-                batch_stat = 6      # Pending
-            elif 2 in status_list:
-                batch_stat = 2      # Suspended
-            elif 4 in status_list:
-                batch_stat = 4      # Failed
-            elif all(s == 3 for s in status_list):
-                batch_stat = 3      # Completed
-            else:
-                batch_stat = 0      # Unknown
-                
-            latest_activity = await compute_batch_activity_timestamp(batch_jobs)
-            
-            combined_jobs.append({
-                "_id": batch_jobs[0].get("_id"),
-                "Props": {"Batch": batch, "Tasks": total_tasks},
-                "CompletedChunks": completed_chunks,
-                "Stat": batch_stat,
-                "DateParsed": latest_activity
-            })
-        
-        # Sort by DateParsed descending (newest first)
-        combined_jobs.sort(key=lambda j: j["DateParsed"], reverse=True)
+
+        # Group and sort jobs using helper function
+        combined_jobs = await group_and_sort_jobs(jobs)
         
         # Pagination by newest first
         jobs_slice = combined_jobs[page * PAGE_SIZE : page * PAGE_SIZE + PAGE_SIZE]
@@ -538,11 +462,6 @@ def format_progress(completed: int, total: int) -> str:
     return f"{percentage}% ({completed}/{total})"
 
 
-def format_progress_old(completed: int, total: int) -> str:
-    """Format progress in old style (like in an earlier bot)."""
-    return f"{int((completed / total) * 100) if total else 0}% {completed}/{total}"
-
-
 def stop_realtime_for_chat(chat_id: int):
     """Stop realtime updates for a specific chat."""
     if not hasattr(handle_realtime, "active_realtime_tasks"):
@@ -586,47 +505,9 @@ async def jobs_page_callback(callback_query: CallbackQuery):
         if not jobs:
             await callback_query.message.edit_text("No jobs found.")
             return
-            
-        # Group jobs by batch name (like in old version)
-        from collections import defaultdict
-        grouped_jobs = defaultdict(list)
-        for job in jobs:
-            batch = job.get("Props", {}).get("Batch", "Untitled")
-            grouped_jobs[batch].append(job)
-        
-        # Combine jobs by batch (like in old version)
-        combined_jobs = []
-        for batch, batch_jobs in grouped_jobs.items():
-            total_tasks = sum(j.get("Props", {}).get("Tasks", 0) for j in batch_jobs)
-            completed_chunks = sum(j.get("CompletedChunks", 0) for j in batch_jobs)
-            
-            # Determine batch-level status with priority: Active > Pending > Suspended > Failed > Completed > Unknown
-            status_list = [j.get("Stat", 0) for j in batch_jobs]
-            if 1 in status_list:
-                batch_stat = 1      # Active
-            elif 6 in status_list:
-                batch_stat = 6      # Pending
-            elif 2 in status_list:
-                batch_stat = 2      # Suspended
-            elif 4 in status_list:
-                batch_stat = 4      # Failed
-            elif all(s == 3 for s in status_list):
-                batch_stat = 3      # Completed
-            else:
-                batch_stat = 0      # Unknown
-                
-            latest_activity = await compute_batch_activity_timestamp(batch_jobs)
-            
-            combined_jobs.append({
-                "_id": batch_jobs[0].get("_id"),
-                "Props": {"Batch": batch, "Tasks": total_tasks},
-                "CompletedChunks": completed_chunks,
-                "Stat": batch_stat,
-                "DateParsed": latest_activity
-            })
-        
-        # Sort by DateParsed descending (newest first)
-        combined_jobs.sort(key=lambda j: j["DateParsed"], reverse=True)
+
+        # Group and sort jobs using helper function
+        combined_jobs = await group_and_sort_jobs(jobs)
         
         # Pagination: 4 jobs per page
         jobs_slice = combined_jobs[page * PAGE_SIZE : page * PAGE_SIZE + PAGE_SIZE]
@@ -735,7 +616,24 @@ async def job_info_callback(callback_query: CallbackQuery):
         
         # Delete the original message
         await callback_query.message.delete()
-        
+
+        # Batch load all tasks for all jobs in the batch to avoid N+1 problem
+        job_tasks_map = {}
+        tasks_futures = []
+        for job in batch_jobs:
+            job_id = job.get("_id")
+            if job_id:
+                tasks_futures.append((job_id, get_job_tasks_by_user_id(callback_query.from_user.id, job_id)))
+
+        if tasks_futures:
+            results = await asyncio.gather(*[future for _, future in tasks_futures], return_exceptions=True)
+            for (job_id, _), tasks in zip(tasks_futures, results):
+                if isinstance(tasks, Exception):
+                    logger.error(f"Error loading tasks for job {job_id}: {tasks}")
+                    job_tasks_map[job_id] = []
+                else:
+                    job_tasks_map[job_id] = tasks or []
+
         # Send info for each job in the batch
         for job in batch_jobs:
             props = job.get("Props", {})
@@ -750,7 +648,8 @@ async def job_info_callback(callback_query: CallbackQuery):
             # Calculate ETA for this job
             eta_str = "N/A"
             try:
-                tasks = await get_job_tasks_by_user_id(callback_query.from_user.id, job.get("_id"))
+                # Get tasks from pre-loaded map to avoid N+1 queries
+                tasks = job_tasks_map.get(job.get("_id"), [])
                 if tasks:
                     from datetime import datetime, timedelta
                     # Calculate durations of completed tasks
@@ -1041,48 +940,9 @@ async def jobs_back_callback(callback_query: CallbackQuery):
             if not jobs:
                 await callback_query.message.edit_text("No jobs found.")
                 return
-                
-            # Group jobs by batch name (like in old version)
-            from collections import defaultdict
-            grouped_jobs = defaultdict(list)
-            for job in jobs:
-                batch = job.get("Props", {}).get("Batch", "Untitled")
-                grouped_jobs[batch].append(job)
-            
-            # Combine jobs by batch (like in old version)
-            from datetime import datetime
-            combined_jobs = []
-            for batch, batch_jobs in grouped_jobs.items():
-                total_tasks = sum(j.get("Props", {}).get("Tasks", 0) for j in batch_jobs)
-                completed_chunks = sum(j.get("CompletedChunks", 0) for j in batch_jobs)
-                
-                # Determine batch-level status with priority: Active > Pending > Suspended > Failed > Completed > Unknown
-                status_list = [j.get("Stat", 0) for j in batch_jobs]
-                if 1 in status_list:
-                    batch_stat = 1      # Active
-                elif 6 in status_list:
-                    batch_stat = 6      # Pending
-                elif 2 in status_list:
-                    batch_stat = 2      # Suspended
-                elif 4 in status_list:
-                    batch_stat = 4      # Failed
-                elif all(s == 3 for s in status_list):
-                    batch_stat = 3      # Completed
-                else:
-                    batch_stat = 0      # Unknown
-                    
-                latest_activity = await compute_batch_activity_timestamp(batch_jobs)
-                
-                combined_jobs.append({
-                    "_id": batch_jobs[0].get("_id"),
-                    "Props": {"Batch": batch, "Tasks": total_tasks},
-                    "CompletedChunks": completed_chunks,
-                    "Stat": batch_stat,
-                    "DateParsed": latest_activity
-                })
-            
-            # Sort by DateParsed descending (newest first)
-            combined_jobs.sort(key=lambda j: j["DateParsed"], reverse=True)
+
+            # Group and sort jobs using helper function
+            combined_jobs = await group_and_sort_jobs(jobs)
             
             # Pagination: first page preview
             jobs_slice = combined_jobs[:PAGE_SIZE]
@@ -1175,42 +1035,13 @@ async def handle_realtime(message: Message):
     await message.answer("Tasks will be updated every 5 seconds until the next message.")
 
     async def realtime_loop():
-        from collections import defaultdict
         try:
             msg = await message.answer("Loading...")
             last_text = None
             while True:
                 jobs = await get_jobs_list(user_id)
-                # Group and format jobs the same way as handle_jobs
-                grouped_jobs = defaultdict(list)
-                for job in jobs:
-                    batch = job.get("Props", {}).get("Batch", "Untitled")
-                    grouped_jobs[batch].append(job)
-                combined_jobs = []
-                for batch, batch_jobs in grouped_jobs.items():
-                    total_tasks = sum(j.get("Props", {}).get("Tasks", 0) for j in batch_jobs)
-                    completed_chunks = sum(j.get("CompletedChunks", 0) for j in batch_jobs)
-                    status_list = [j.get("Stat", 0) for j in batch_jobs]
-                    if 1 in status_list:
-                        batch_stat = 1
-                    elif 6 in status_list:
-                        batch_stat = 6
-                    elif 2 in status_list:
-                        batch_stat = 2
-                    elif 4 in status_list:
-                        batch_stat = 4
-                    elif all(s == 3 for s in status_list):
-                        batch_stat = 3
-                    else:
-                        batch_stat = 0
-                    latest_activity = await compute_batch_activity_timestamp(batch_jobs)
-                    combined_jobs.append({
-                        "Props": {"Batch": batch, "Tasks": total_tasks},
-                        "CompletedChunks": completed_chunks,
-                        "Stat": batch_stat,
-                        "DateParsed": latest_activity
-                    })
-                combined_jobs.sort(key=lambda j: j["DateParsed"], reverse=True)
+                # Group and format jobs using helper function
+                combined_jobs = await group_and_sort_jobs(jobs)
                 messages = []
                 for job in combined_jobs:
                     props = job.get("Props", {})

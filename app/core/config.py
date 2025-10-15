@@ -88,10 +88,15 @@ class Settings(BaseSettings):
 
     # Security Settings
     password_salt: str = Field(..., description="Salt for password hashing")
+    encryption_key: str = Field(..., description="Fernet encryption key for password storage (generate with Fernet.generate_key())")
 
     # Application Limits
     max_concurrent_downloads: int = Field(2, ge=1, description="Max parallel Dropbox downloads")
     min_free_space_bytes: int = Field(10 * 1024 * 1024 * 1024, description="Minimum required free disk space in bytes")
+
+    # Job monitoring intervals (seconds)
+    job_watcher_interval_normal: int = Field(60, ge=5, description="Job monitoring interval in seconds (normal mode)")
+    job_watcher_interval_preview: int = Field(15, ge=5, description="Job monitoring interval in seconds (when preview jobs are active)")
 
     # Mini App Configuration
     mini_app_url: str = Field("http://localhost:3000", description="URL for the Telegram mini app")

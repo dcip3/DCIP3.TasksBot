@@ -9,11 +9,52 @@ functions including login, logout, and session management for TasksBot.
 import hashlib
 import logging
 from typing import Optional, Tuple
+from cryptography.fernet import Fernet
 from app.core.config import settings
 from app.core.database import get_db_connection
 import aiohttp
 
 logger = logging.getLogger(__name__)
+
+# Initialize Fernet cipher for password encryption
+_cipher: Optional[Fernet] = None
+
+def _get_cipher() -> Fernet:
+    """Get or create Fernet cipher for password encryption."""
+    global _cipher
+    if _cipher is None:
+        _cipher = Fernet(settings.encryption_key.encode())
+    return _cipher
+
+
+def _encrypt_password(password: str) -> str:
+    """
+    Encrypt password using Fernet symmetric encryption.
+
+    Args:
+        password: Plain text password to encrypt
+
+    Returns:
+        Encrypted password as base64 string
+    """
+    cipher = _get_cipher()
+    encrypted = cipher.encrypt(password.encode('utf-8'))
+    return encrypted.decode('utf-8')
+
+
+def _decrypt_password(encrypted_password: str) -> str:
+    """
+    Decrypt password using Fernet symmetric encryption.
+
+    Args:
+        encrypted_password: Encrypted password as base64 string
+
+    Returns:
+        Decrypted plain text password
+    """
+    cipher = _get_cipher()
+    decrypted = cipher.decrypt(encrypted_password.encode('utf-8'))
+    return decrypted.decode('utf-8')
 
 
 def _hash_password(password: str) -> str:
@@ -188,29 +229,32 @@ async def save_deadline_credentials(telegram_user_id: int, deadline_login: str, 
     """
     Save Deadline credentials for a user.
     (Used to persist login/password so we do not ask on each request.)
-    
+
     Args:
         telegram_user_id: Telegram user ID
         deadline_login: Deadline login
-        deadline_password: Deadline password
-    
+        deadline_password: Deadline password (will be encrypted before storage)
+
     Returns:
         True if saved successfully, False otherwise
     """
     logger.info(f"Saving Deadline credentials for user {telegram_user_id}")
-    
+
     conn = get_db_connection()
     if conn is None:
         logger.error("Database connection not available")
         return False
-    
+
     try:
+        # Encrypt password before storage
+        encrypted_password = _encrypt_password(deadline_password)
+
         # Insert or update session data
         await conn.execute("""
-            INSERT OR REPLACE INTO user_sessions 
-            (telegram_user_id, deadline_login, deadline_password, last_login) 
+            INSERT OR REPLACE INTO user_sessions
+            (telegram_user_id, deadline_login, deadline_password, last_login)
             VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-        """, (telegram_user_id, deadline_login, deadline_password))
+        """, (telegram_user_id, deadline_login, encrypted_password))
         await conn.commit()
         logger.info(f"Successfully saved Deadline credentials for user {telegram_user_id}")
         
@@ -235,20 +279,20 @@ async def save_deadline_credentials(telegram_user_id: int, deadline_login: str, 
 async def get_deadline_credentials(telegram_user_id: int) -> Optional[Tuple[str, str]]:
     """
     Get Deadline credentials for a user.
-    
+
     Args:
         telegram_user_id: Telegram user ID
-        
+
     Returns:
-        Tuple of (login, password) or None if not found
+        Tuple of (login, decrypted_password) or None if not found
     """
     logger.info(f"Getting Deadline credentials for user {telegram_user_id}")
-    
+
     conn = get_db_connection()
     if conn is None:
         logger.error("Database connection not available")
         return None
-    
+
     try:
         async with conn.execute(
             "SELECT deadline_login, deadline_password FROM user_sessions WHERE telegram_user_id = ?",
@@ -257,7 +301,13 @@ async def get_deadline_credentials(telegram_user_id: int) -> Optional[Tuple[str,
             row = await cursor.fetchone()
             if row:
                 logger.info(f"Found credentials for user {telegram_user_id}")
-                return (row[0], row[1])
+                # Decrypt password before returning
+                try:
+                    decrypted_password = _decrypt_password(row[1])
+                    return (row[0], decrypted_password)
+                except Exception as decrypt_error:
+                    logger.error(f"Failed to decrypt password for user {telegram_user_id}: {decrypt_error}")
+                    return None
             else:
                 logger.info(f"No credentials found for user {telegram_user_id}")
                 return None
