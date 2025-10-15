@@ -22,7 +22,7 @@
 param (
     [string]$PythonId = "Python.Python.3.11",
     [string]$PythonExecutable = "C:\Python311\python.exe",
-    [string[]]$Packages = @("OpenColorIO", "OpenEXR", "numpy")
+    [string[]]$Packages = @("OpenColorIO", "OpenEXR", "numpy", "Pillow")
 )
 
 function Write-Section {
@@ -97,6 +97,7 @@ function Install-Packages {
         "PyOpenColorIO" = @("PyOpenColorIO", "OpenColorIO")
         "OpenEXR" = @("OpenEXR", "openexr-python")
         "numpy" = @("numpy")
+        "Pillow" = @("Pillow")
     }
 
     foreach ($pkg in $Pkgs) {
