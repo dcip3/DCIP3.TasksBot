@@ -22,7 +22,7 @@ dp = Dispatcher(storage=storage)
 
 # Global state variables
 download_states: Dict[str, Dict[str, Any]] = {}
-stop_downloads: Dict[str, bool] = {}
+stop_downloads: Dict[str, asyncio.Event] = {}
 
 # Use TTL cache for notified jobs to prevent memory leak
 # Stores (job_id, user_id) pairs with 1 hour TTL

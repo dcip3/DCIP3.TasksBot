@@ -11,7 +11,7 @@ from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, Inli
 from app.auth import get_deadline_credentials, get_preview_default_worker
 from app.core.bot_core import bot, download_states, stop_downloads
 from app.core.config import settings
-from app.core.utils import cleanup_temp_and_conv, register_preview_message
+from app.core.utils import cleanup_temp_and_conv, register_preview_message, pop_preview_message
 from app.integrations.dropbox_helpers import (
     download_exr_folder,
     fetch_dropbox_metadata,
@@ -47,12 +47,12 @@ def _build_render_method_keyboard(job_id: str) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="☁️ Deadline",
-                    callback_data=f"preview_render:deadline:{job_id}",
-                ),
-                InlineKeyboardButton(
                     text="🖥️ Server",
                     callback_data=f"preview_render:server:{job_id}",
+                ),
+                InlineKeyboardButton(
+                    text="☁️ Deadline",
+                    callback_data=f"preview_render:deadline:{job_id}",
                 ),
             ],
             [
@@ -61,6 +61,20 @@ def _build_render_method_keyboard(job_id: str) -> InlineKeyboardMarkup:
                     callback_data="preview_cancel",
                 )
             ],
+        ]
+    )
+
+
+def _build_server_cancel_keyboard(job_id: str) -> InlineKeyboardMarkup:
+    """Inline keyboard with a cancel button for server-side preview generation."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✖️ Cancel",
+                    callback_data=f"preview_server_cancel:{job_id}",
+                )
+            ]
         ]
     )
 
@@ -277,6 +291,37 @@ async def preview_render_callback(callback_query: CallbackQuery) -> None:
     _, mode, job_id = parts
 
     if mode == "deadline":
+        if callback_query.from_user is None:
+            await callback_query.answer("Error: user not found.", show_alert=True)
+            return
+
+        default_worker = await get_preview_default_worker(callback_query.from_user.id)
+        if default_worker:
+            progress_msg = (
+                callback_query.message if isinstance(callback_query.message, Message) else None
+            )
+            try:
+                await create_new_video_process(
+                    callback_query,
+                    job_id,
+                    use_any_machine=False,
+                    skip_worker_validation=True,
+                    progress_message=progress_msg,
+                    specific_worker=default_worker,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Error auto-submitting preview to default worker %s: %s",
+                    default_worker,
+                    exc,
+                )
+                try:
+                    await show_worker_selection_for_preview(callback_query, job_id)
+                except Exception as fallback_exc:
+                    logger.error("Error showing worker selection fallback: %s", fallback_exc)
+                    await callback_query.answer("Failed to submit with default worker.", show_alert=True)
+            return
+
         await show_worker_selection_for_preview(callback_query, job_id)
         return
 
@@ -475,6 +520,35 @@ async def preview_cancel_callback(callback_query: CallbackQuery) -> None:
         pass
 
 
+@router.callback_query(lambda c: c.data and c.data.startswith("preview_server_cancel:"))
+async def preview_server_cancel_callback(callback_query: CallbackQuery) -> None:
+    """Handle cancellation of server-side preview generation."""
+    if callback_query.data is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+
+    job_id = callback_query.data.split(":", 1)[1]
+    stop_event = stop_downloads.get(job_id)
+    state = download_states.get(job_id)
+
+    if stop_event is None or state is None:
+        await callback_query.answer("Nothing to cancel.", show_alert=False)
+        return
+
+    if not stop_event.is_set():
+        stop_event.set()
+
+    state["cancel_requested"] = True
+    state["stop_kb"] = None
+    progress_msg = state.get("progress_msg")
+
+    if progress_msg:
+        with contextlib.suppress(Exception):
+            await progress_msg.edit_text("⏹️ Cancelling preview generation...", reply_markup=None)
+
+    await callback_query.answer("Cancelling preview...", show_alert=False)
+
+
 @router.callback_query(lambda c: c.data and c.data.startswith("preview_job_cancel:"))
 async def preview_job_cancel_callback(callback_query: CallbackQuery) -> None:
     """Cancel a queued preview job."""
@@ -486,9 +560,22 @@ async def preview_job_cancel_callback(callback_query: CallbackQuery) -> None:
     try:
         success = await delete_job_by_user_id(callback_query.from_user.id, preview_job_id)
         if success:
+            stored_message = pop_preview_message(preview_job_id)
+            if stored_message and callback_query.message:
+                stored_chat_id, stored_message_id = stored_message
+                if (
+                    callback_query.message.chat.id != stored_chat_id
+                    or callback_query.message.message_id != stored_message_id
+                ):
+                    with contextlib.suppress(Exception):
+                        await bot.edit_message_text(
+                            "⏹️ Preview generation cancelled.",
+                            chat_id=stored_chat_id,
+                            message_id=stored_message_id,
+                        )
             if callback_query.message:
-                await callback_query.message.edit_text("✅ Preview job cancelled successfully.", reply_markup=None)
-            await callback_query.answer("Preview job cancelled.", show_alert=False)
+                await callback_query.message.edit_text("⏹️ Preview generation cancelled.", reply_markup=None)
+            await callback_query.answer("Preview generation cancelled.", show_alert=False)
         else:
             await callback_query.answer("Failed to cancel preview job.", show_alert=True)
     except Exception as exc:
@@ -503,6 +590,9 @@ async def render_preview_via_server(callback_query: CallbackQuery, job_id: str) 
         return
 
     progress_msg: Optional[Message] = None
+    cancel_keyboard: Optional[InlineKeyboardMarkup] = None
+    stop_event: Optional[asyncio.Event] = None
+    state: Optional[dict] = None
     try:
         base_message = callback_query.message
         if base_message:
@@ -512,7 +602,47 @@ async def render_preview_via_server(callback_query: CallbackQuery, job_id: str) 
                 callback_query.from_user.id, "🔍 Starting preview generation..."
             )
 
-        await progress_msg.edit_text("📥 Step 1: Downloading files from Dropbox...")
+        cancel_keyboard = _build_server_cancel_keyboard(job_id)
+        stop_event = stop_downloads.get(job_id)
+        if stop_event is None:
+            stop_event = asyncio.Event()
+            stop_downloads[job_id] = stop_event
+
+        download_states[job_id] = {
+            "progress_msg": progress_msg,
+            "total_files": 0,
+            "stop_kb": cancel_keyboard,
+        }
+        state = download_states[job_id]
+
+        async def finalize_cancellation() -> bool:
+            if stop_event is None or state is None:
+                return False
+            if not (stop_event.is_set() or state.get("cancel_requested")):
+                return False
+            if not state.get("cancel_finalized"):
+                state["cancel_finalized"] = True
+                state["stop_kb"] = None
+                progress = state.get("progress_msg") or progress_msg
+                if progress:
+                    with contextlib.suppress(Exception):
+                        await progress.edit_text("⏹️ Preview generation cancelled.", reply_markup=None)
+                try:
+                    cleanup_job_files(job_id)
+                    cleanup_temp_and_conv()
+                    cleanup_old_files(max_age_hours=6)
+                except Exception as cleanup_error:
+                    logger.error("Error cleaning up after cancellation: %s", cleanup_error)
+                with contextlib.suppress(Exception):
+                    await callback_query.answer("Preview generation cancelled.", show_alert=False)
+            return True
+
+        await progress_msg.edit_text(
+            "📥 Step 1: Downloading files from Dropbox...",
+            reply_markup=cancel_keyboard,
+        )
+        if await finalize_cancellation():
+            return
 
         job_info = await get_job_info_by_user_id(callback_query.from_user.id, job_id)
         if not job_info:
@@ -578,12 +708,9 @@ async def render_preview_via_server(callback_query: CallbackQuery, job_id: str) 
             await callback_query.answer("No frames available for preview build.", show_alert=True)
             return
 
-        download_states[job_id] = {
-            "progress_msg": progress_msg,
-            "total_files": total_files,
-            "stop_kb": None,
-        }
-        stop_downloads[job_id] = None
+        if state is not None:
+            state["total_files"] = total_files
+            state["stop_kb"] = cancel_keyboard
 
         await download_exr_folder(
             session_dbx,
@@ -595,10 +722,20 @@ async def render_preview_via_server(callback_query: CallbackQuery, job_id: str) 
             download_states,
             stop_downloads,
         )
+        if await finalize_cancellation():
+            return
 
         conv_dir = Path(settings.conv_dir) / f"{exr_folder_name}_{job_id}"
-        await progress_msg.edit_text("🎬 Step 2: Converting EXR files and creating video...")
+        await progress_msg.edit_text(
+            "🎬 Step 2: Converting EXR files and creating video...",
+            reply_markup=cancel_keyboard,
+        )
+        if await finalize_cancellation():
+            return
+
         video_path = await asyncio.to_thread(assemble_video_from_jpg, conv_dir, str(exr_folder_name))
+        if await finalize_cancellation():
+            return
 
         try:
             metadata = await fetch_dropbox_metadata(session_dbx, dropbox_path, headers_dbx)
@@ -607,23 +744,43 @@ async def render_preview_via_server(callback_query: CallbackQuery, job_id: str) 
             logger.error("Error uploading video to Dropbox: %s", upload_error)
             dropbox_video_path = dropbox_path
 
-        await progress_msg.edit_text("📏 Step 3: Checking file size...")
+        if await finalize_cancellation():
+            return
+
+        await progress_msg.edit_text(
+            "📏 Step 3: Checking file size...",
+            reply_markup=cancel_keyboard,
+        )
         video_path_obj = Path(video_path)
         video_size_mb = get_file_size_mb(video_path_obj)
 
         if video_size_mb > 45.0:
             await progress_msg.edit_text(
-                f"🗜️ Step 3.5: Compressing video ({video_size_mb:.1f} MB → target <45 MB)..."
+                f"🗜️ Step 3.5: Compressing video ({video_size_mb:.1f} MB → target <45 MB)...",
+                reply_markup=cancel_keyboard,
             )
+            if await finalize_cancellation():
+                return
+
             final_video_path = await asyncio.to_thread(
                 compress_video_if_needed, video_path_obj, 45.0
             )
             final_size_mb = get_file_size_mb(final_video_path)
+            if await finalize_cancellation():
+                return
         else:
             final_video_path = video_path_obj
             final_size_mb = video_size_mb
 
-        await progress_msg.edit_text(f"📤 Step 4: Sending video ({final_size_mb:.1f} MB)...")
+        if await finalize_cancellation():
+            return
+
+        await progress_msg.edit_text(
+            f"📤 Step 4: Sending video ({final_size_mb:.1f} MB)...",
+            reply_markup=cancel_keyboard,
+        )
+        if await finalize_cancellation():
+            return
 
         video_filename = final_video_path.name
         project_name = video_filename.replace(".mp4", "")
