@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # Import bot modules
 from app.core.bot_core import dp, bot
+from app.core.config import settings
 from app.core.utils import on_startup, on_shutdown
 from app.bot.handlers import register_handlers
 
@@ -43,33 +44,42 @@ app.add_middleware(
 app.include_router(api_router, prefix="/api")
 
 # Startup and shutdown events
+def _log_bot_task_result(task: asyncio.Task) -> None:
+    """Log unexpected results of the polling task."""
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        logger.info("Bot polling task cancelled")
+    except Exception:
+        logger.exception("Bot polling task failed")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Handle startup and shutdown events"""
-    # Startup
+    """Handle startup and shutdown events."""
     logger.info("Starting TasksBot with API support...")
-    
-    # Register bot handlers
+
     register_handlers()
-    
-    # Setup bot startup and shutdown handlers
+
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
-    
-    # Start bot polling in background
+
     bot_task = asyncio.create_task(dp.start_polling(bot, skip_updates=True))
-    
+    bot_task.add_done_callback(_log_bot_task_result)
+
     logger.info("TasksBot started successfully")
-    
-    yield
-    
-    # Shutdown
-    logger.info("Shutting down TasksBot...")
-    bot_task.cancel()
+
     try:
-        await bot_task
-    except asyncio.CancelledError:
-        pass
+        yield
+    finally:
+        logger.info("Shutting down TasksBot...")
+        bot_task.cancel()
+        try:
+            await bot_task
+        except asyncio.CancelledError:
+            logger.debug("Bot polling task cancellation confirmed")
+        except Exception:
+            logger.exception("Error while awaiting bot polling task during shutdown")
 
 # Set lifespan
 app.router.lifespan_context = lifespan

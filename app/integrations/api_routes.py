@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import json
 import urllib.parse
+from datetime import datetime, timezone
 
 from app.auth import authenticate_user, is_authorized, logout_user, get_deadline_credentials
 from app.core.config import settings
@@ -66,19 +67,50 @@ def validate_telegram_init_data(init_data: str = Header(None)) -> Optional[int]:
         return None
     
     try:
-        # Parse init data
-        parsed_data = dict(urllib.parse.parse_qsl(init_data))
-        
-        # Extract user data
-        user_str = parsed_data.get('user', '{}')
+        # Parse init data preserving multiple values if any
+        parsed_pairs = urllib.parse.parse_qsl(init_data, keep_blank_values=True)
+        parsed_data = dict(parsed_pairs)
+
+        provided_hash = parsed_data.pop("hash", None)
+        if not provided_hash:
+            logger.warning("Missing hash in Telegram init data")
+            return None
+
+        data_check_string = "\n".join(
+            f"{key}={value}"
+            for key, value in sorted(parsed_data.items())
+        )
+
+        secret_key = hmac.new(
+            b"WebAppData",
+            settings.tg_api_token.encode(),
+            hashlib.sha256,
+        ).digest()
+        calculated_hash = hmac.new(
+            secret_key,
+            data_check_string.encode(),
+            hashlib.sha256,
+        ).hexdigest()
+
+        if not hmac.compare_digest(calculated_hash, provided_hash):
+            logger.warning("Invalid Telegram init data hash")
+            return None
+
+        # Optional: reject stale init data (>24h)
+        auth_date_str = parsed_data.get("auth_date")
+        if auth_date_str and auth_date_str.isdigit():
+            auth_date = datetime.fromtimestamp(int(auth_date_str), tz=timezone.utc)
+            if (datetime.now(timezone.utc) - auth_date).total_seconds() > 24 * 3600:
+                logger.warning("Telegram init data expired")
+                return None
+
+        user_str = parsed_data.get("user", "{}")
         user_data = json.loads(user_str)
-        user_id = user_data.get('id')
+        user_id = user_data.get("id")
         
         if not user_id:
             return None
-            
-        # TODO: Add proper signature validation
-        # For now, we'll trust the init data
+
         return user_id
         
     except Exception as e:
