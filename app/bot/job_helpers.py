@@ -8,7 +8,10 @@ job data for display in the Telegram bot.
 
 from collections import defaultdict
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import Any, Dict, List
+
+BATCH_COLUMN_WIDTH = 22
+JOBS_PAGE_SIZE = 6
 
 
 async def compute_batch_activity_timestamp(batch_jobs: list[dict]) -> datetime:
@@ -116,7 +119,7 @@ async def group_and_sort_jobs(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]
     return combined_jobs
 
 
-def truncate_cell(text: str, max_width: int = 22) -> str:
+def truncate_cell(text: str, max_width: int = BATCH_COLUMN_WIDTH) -> str:
     """
     Ensure table cell content fits the allocated width.
 
