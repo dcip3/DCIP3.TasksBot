@@ -101,7 +101,22 @@ async def init_db():
         else:
             logger.error("Failed to ensure notification_scope column: %s", column_error)
             raise
-    
+
+    # Ensure preview_default_worker column exists for legacy databases
+    try:
+        await tasks_db_conn.execute(
+            "ALTER TABLE user_sessions ADD COLUMN preview_default_worker TEXT"
+        )
+        await tasks_db_conn.commit()
+        logger.info("Added preview_default_worker column to user_sessions table")
+    except aiosqlite.OperationalError as column_error:
+        message = str(column_error).lower()
+        if "duplicate column name" in message:
+            logger.debug("preview_default_worker column already exists on user_sessions table")
+        else:
+            logger.error("Failed to ensure preview_default_worker column: %s", column_error)
+            raise
+
     await tasks_db_conn.commit()
     logger.info("Database initialized successfully")
 

@@ -412,6 +412,66 @@ async def set_notification_scope(telegram_user_id: int, scope: NotificationScope
     return await get_notification_settings(telegram_user_id)
 
 
+async def get_preview_default_worker(telegram_user_id: int) -> Optional[str]:
+    """
+    Get the default worker for preview jobs.
+
+    Args:
+        telegram_user_id: Telegram user ID
+
+    Returns:
+        Worker name or None if not set
+    """
+    conn = get_db_connection()
+    if conn is None:
+        return None
+
+    try:
+        async with conn.execute(
+            "SELECT preview_default_worker FROM user_sessions WHERE telegram_user_id = ?",
+            (telegram_user_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row or not row[0]:
+                return None
+            return row[0]
+    except Exception as e:
+        logger.error(f"Failed to fetch preview default worker for user {telegram_user_id}: {e}")
+        return None
+
+
+async def set_preview_default_worker(telegram_user_id: int, worker_name: Optional[str]) -> bool:
+    """
+    Set the default worker for preview jobs.
+
+    Args:
+        telegram_user_id: Telegram user ID
+        worker_name: Worker name or None to clear
+
+    Returns:
+        True if successful, False otherwise
+    """
+    conn = get_db_connection()
+    if conn is None:
+        return False
+
+    try:
+        await conn.execute(
+            """
+            UPDATE user_sessions
+            SET preview_default_worker = ?
+            WHERE telegram_user_id = ?
+            """,
+            (worker_name, telegram_user_id),
+        )
+        await conn.commit()
+        logger.info("User %s preview default worker set to %s", telegram_user_id, worker_name or "None")
+        return True
+    except Exception as e:
+        logger.error("Failed to set preview default worker for user %s: %s", telegram_user_id, e)
+        return False
+
+
 async def get_notification_status(telegram_user_id: int) -> bool:
     """
     Get notification status for a user.

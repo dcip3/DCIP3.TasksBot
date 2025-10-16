@@ -76,8 +76,18 @@ def pop_preview_message(preview_job_id: str) -> Optional[tuple[int, int]]:
 
 async def _run_preview_animation(preview_job_id: str, chat_id: int, message_id: int) -> None:
     """Animate the preview queued message until the job finishes."""
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
     frames = ["□ □ □", "■ □ □", "■ ■ □", "■ ■ ■"]
     index = 1  # start from next frame to avoid "message is not modified"
+
+    # Create cancel keyboard
+    cancel_keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✖️ Cancel", callback_data=f"preview_job_cancel:{preview_job_id}")]
+        ]
+    )
+
     try:
         while preview_message_registry.get(preview_job_id) == (chat_id, message_id):
             frame = frames[index % len(frames)]
@@ -87,6 +97,7 @@ async def _run_preview_animation(preview_job_id: str, chat_id: int, message_id: 
                     text,
                     chat_id=chat_id,
                     message_id=message_id,
+                    reply_markup=cancel_keyboard,
                 )
             except Exception as edit_error:
                 message = str(edit_error).lower()

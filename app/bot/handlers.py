@@ -36,6 +36,8 @@ from app.auth import (
     get_notification_settings,
     set_notification_enabled,
     set_notification_scope,
+    get_preview_default_worker,
+    set_preview_default_worker,
     NotificationScope,
 )
 from app.services import (
@@ -92,7 +94,13 @@ def _build_settings_root_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    text="Close",
+                    text="🎬 Preview Worker",
+                    callback_data="settings:preview_worker",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✖️ Close",
                     callback_data="settings:close",
                 ),
             ],
@@ -152,7 +160,7 @@ def _build_notification_keyboard(enabled: bool, scope: str) -> InlineKeyboardMar
                     callback_data="settings:back:root",
                 ),
                 InlineKeyboardButton(
-                    text="Close",
+                    text="✖️ Close",
                     callback_data="settings:close",
                 ),
             ],
@@ -169,7 +177,7 @@ def _build_render_method_keyboard(job_id: str) -> InlineKeyboardMarkup:
                     callback_data=f"preview_render:deadline:{job_id}",
                 ),
                 InlineKeyboardButton(
-                    text="🖥 Server",
+                    text="🖥️ Server",
                     callback_data=f"preview_render:server:{job_id}",
                 ),
             ],
@@ -468,9 +476,9 @@ async def handle_jobs(message: Message, page: int = 0):
             total_pages = (total_items + PAGE_SIZE - 1) // PAGE_SIZE
             nav_buttons = []
             if page > 0:
-                nav_buttons.append(InlineKeyboardButton(text="⬅ Back", callback_data=f"jobs_page:{page-1}"))
+                nav_buttons.append(InlineKeyboardButton(text="⬅️ Back", callback_data=f"jobs_page:{page-1}"))
             if (page + 1) < total_pages:
-                nav_buttons.append(InlineKeyboardButton(text="Next ➡", callback_data=f"jobs_page:{page+1}"))
+                nav_buttons.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"jobs_page:{page+1}"))
             if nav_buttons:
                 inline_keyboard.append(nav_buttons)
             
@@ -662,6 +670,64 @@ async def settings_callback_handler(callback_query: CallbackQuery):
             if "message is not modified" not in str(exc).lower():
                 raise
 
+    async def show_preview_worker():
+        default_worker = await get_preview_default_worker(user_id)
+        workers = await get_workers_list(user_id)
+
+        text_lines = ["Preview Worker Settings", ""]
+        if default_worker:
+            text_lines.append(f"Default worker: {default_worker}")
+        else:
+            text_lines.append("Default worker: Not set (will show menu)")
+        text_lines.append("")
+        text_lines.append("Choose a worker to set as default, or select 'None' to always show the selection menu.")
+
+        text = "\n".join(text_lines)
+
+        # Build keyboard with available workers
+        keyboard_rows = []
+
+        if workers:
+            # Show workers in rows of 2
+            for i in range(0, len(workers), 2):
+                row = []
+                for j in range(i, min(i + 2, len(workers))):
+                    worker = workers[j]
+                    info = worker.get("Info", {})
+                    worker_name = info.get("Name", "Unknown")
+                    # Mark current default with checkmark
+                    display_name = f"✅ {worker_name}" if worker_name == default_worker else worker_name
+                    row.append(
+                        InlineKeyboardButton(
+                            text=display_name,
+                            callback_data=f"settings:preview_worker:set:{worker_name}"
+                        )
+                    )
+                keyboard_rows.append(row)
+
+        # Add "None" option and back button
+        keyboard_rows.append([
+            InlineKeyboardButton(
+                text="✅ None (Always ask)" if not default_worker else "None (Always ask)",
+                callback_data="settings:preview_worker:set:none"
+            )
+        ])
+        keyboard_rows.append([
+            InlineKeyboardButton(
+                text="⬅️ Back",
+                callback_data="settings:back:root"
+            )
+        ])
+
+        try:
+            await callback_query.message.edit_text(
+                text,
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+            )
+        except TelegramBadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                raise
+
     if action == "close":
         await callback_query.message.edit_text("Settings closed.")
         await callback_query.answer()
@@ -671,6 +737,26 @@ async def settings_callback_handler(callback_query: CallbackQuery):
         await show_notifications()
         await callback_query.answer()
         return
+
+    if action == "preview_worker":
+        if len(parts) == 2:
+            # Show preview worker settings menu
+            await show_preview_worker()
+            await callback_query.answer()
+            return
+        elif len(parts) > 2:
+            # Handle preview worker actions
+            sub_action = parts[2]
+            if sub_action == "set" and len(parts) > 3:
+                worker_name = parts[3]
+                if worker_name == "none":
+                    await set_preview_default_worker(user_id, None)
+                    await callback_query.answer("Default worker cleared. Menu will be shown for each preview.")
+                else:
+                    await set_preview_default_worker(user_id, worker_name)
+                    await callback_query.answer(f"Default worker set to: {worker_name}")
+                await show_preview_worker()
+                return
 
     if action == "notif" and len(parts) > 2:
         sub_action = parts[2]
@@ -787,9 +873,9 @@ async def jobs_page_callback(callback_query: CallbackQuery):
             total_pages = (total_items + PAGE_SIZE - 1) // PAGE_SIZE
             nav_buttons = []
             if page > 0:
-                nav_buttons.append(InlineKeyboardButton(text="⬅ Back", callback_data=f"jobs_page:{page-1}"))
+                nav_buttons.append(InlineKeyboardButton(text="⬅️ Back", callback_data=f"jobs_page:{page-1}"))
             if (page + 1) < total_pages:
-                nav_buttons.append(InlineKeyboardButton(text="Next ➡", callback_data=f"jobs_page:{page+1}"))
+                nav_buttons.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"jobs_page:{page+1}"))
             if nav_buttons:
                 inline_keyboard.append(nav_buttons)
             
@@ -924,13 +1010,13 @@ async def job_info_callback(callback_query: CallbackQuery):
             buttons = []
             if stat != 3:  # Not completed
                 if stat == 2:  # Suspended
-                    buttons.append(InlineKeyboardButton(text="▶ Resume", callback_data=f"resume_job:{current_job_id}"))
+                    buttons.append(InlineKeyboardButton(text="▶️ Resume", callback_data=f"resume_job:{current_job_id}"))
                 else:
-                    buttons.append(InlineKeyboardButton(text="⏸ Suspend", callback_data=f"suspend_job:{current_job_id}"))
+                    buttons.append(InlineKeyboardButton(text="⏸️ Suspend", callback_data=f"suspend_job:{current_job_id}"))
                 buttons.append(InlineKeyboardButton(text="🔄 Requeue", callback_data=f"requeue_job:{current_job_id}"))
             
             buttons.append(InlineKeyboardButton(text="🔍 Preview", callback_data=f"preview_job:{current_job_id}"))
-            buttons.append(InlineKeyboardButton(text="🗑 Delete", callback_data=f"delete_job:{current_job_id}"))
+            buttons.append(InlineKeyboardButton(text="🗑️ Delete", callback_data=f"delete_job:{current_job_id}"))
             buttons.append(InlineKeyboardButton(text="📋 Tasks", callback_data=f"tasks_job:{current_job_id}"))
             
             # Arrange buttons in rows
@@ -945,7 +1031,7 @@ async def job_info_callback(callback_query: CallbackQuery):
                 inline_keyboard.append(row)
             
             # Add back button in a separate row
-            inline_keyboard.append([InlineKeyboardButton(text="⬅ Back", callback_data="jobs_back")])
+            inline_keyboard.append([InlineKeyboardButton(text="⬅️ Back", callback_data="jobs_back")])
             
             keyboard = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
             
@@ -1049,17 +1135,19 @@ async def create_new_video_process(
     use_any_machine: bool = False,
     skip_worker_validation: bool = False,
     progress_message: Optional[Message] = None,
+    specific_worker: Optional[str] = None,
 ) -> None:
     """Submit a Deadline job that generates a preview video via ffmpeg."""
     if callback_query.from_user is None:
         await callback_query.answer("Error: user not found.", show_alert=True)
         return
 
-    initial_text = (
-        "🧾 Submitting preview job to Deadline..."
-        if not use_any_machine
-        else "🧾 Submitting preview job without machine restrictions..."
-    )
+    if specific_worker:
+        initial_text = f"🧾 Submitting preview job to worker: {specific_worker}..."
+    elif use_any_machine:
+        initial_text = "🧾 Submitting preview job without machine restrictions..."
+    else:
+        initial_text = "🧾 Submitting preview job to Deadline..."
     progress_msg = progress_message
     if progress_msg is None:
         progress_msg = await callback_query.message.answer(initial_text)
@@ -1074,6 +1162,7 @@ async def create_new_video_process(
             job_id,
             skip_worker_validation=skip_worker_validation,
             use_any_machine=use_any_machine,
+            specific_worker=specific_worker,
         )
         if not result:
             await progress_msg.edit_text("❌ Failed to submit the job to Deadline.")
@@ -1084,7 +1173,13 @@ async def create_new_video_process(
         preferred_slaves = result.get("preferred_slaves") or []
         dropbox_path = result.get("expected_dropbox_path")
 
-        await progress_msg.edit_text("✅ Preview job queued\n□ □ □")
+        cancel_keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✖️ Cancel", callback_data=f"preview_job_cancel:{preview_id}")]
+            ]
+        ) if preview_id else None
+
+        await progress_msg.edit_text("✅ Preview job queued\n□ □ □", reply_markup=cancel_keyboard)
         if preview_id:
             register_preview_message(preview_id, progress_msg.chat.id, progress_msg.message_id)
         await callback_query.answer("Preview job queued!", show_alert=False)
@@ -1111,8 +1206,13 @@ async def create_new_video_process(
                     InlineKeyboardButton(
                         text="🔄 Check again", callback_data=f"preview_retry:{job_id}"
                     ),
+                ],
+                [
                     InlineKeyboardButton(
-                        text="☁️ Use any worker", callback_data=f"preview_force:{job_id}"
+                        text="🖥️ Select Worker", callback_data=f"preview_select_worker:{job_id}"
+                    ),
+                    InlineKeyboardButton(
+                        text="☁️ Any Worker", callback_data=f"preview_force:{job_id}"
                     ),
                 ],
                 [InlineKeyboardButton(text="✖️ Cancel", callback_data="preview_cancel")],
@@ -1320,6 +1420,72 @@ async def render_preview_via_server(callback_query: CallbackQuery, job_id: str) 
         stop_downloads.pop(job_id, None)
 
 
+async def show_worker_selection_for_preview(callback_query: CallbackQuery, job_id: str) -> None:
+    """Show worker selection menu for preview rendering."""
+    if callback_query.from_user is None:
+        await callback_query.answer("Error: user not found.", show_alert=True)
+        return
+
+    if callback_query.message is None:
+        await callback_query.answer("Error: message not found.", show_alert=True)
+        return
+
+    user_id = callback_query.from_user.id
+    default_worker = await get_preview_default_worker(user_id)
+    workers = await get_workers_list(user_id)
+
+    text_lines = ["🎬 Select worker for preview rendering:"]
+    if default_worker:
+        text_lines.append(f"\nDefault: {default_worker}")
+
+    text = "\n".join(text_lines)
+
+    # Build keyboard with available workers
+    keyboard_rows = []
+
+    if workers:
+        # Show workers in rows of 2
+        for i in range(0, len(workers), 2):
+            row = []
+            for j in range(i, min(i + 2, len(workers))):
+                worker = workers[j]
+                info = worker.get("Info", {})
+                worker_name = info.get("Name", "Unknown")
+                # Mark default worker with checkmark
+                display_name = f"✅ {worker_name}" if worker_name == default_worker else worker_name
+                row.append(
+                    InlineKeyboardButton(
+                        text=display_name,
+                        callback_data=f"preview_submit:{job_id}:{worker_name}"
+                    )
+                )
+            keyboard_rows.append(row)
+
+    # Add "Any Worker" and Cancel buttons
+    keyboard_rows.append([
+        InlineKeyboardButton(
+            text="☁️ Any Worker",
+            callback_data=f"preview_submit:{job_id}:any"
+        )
+    ])
+    keyboard_rows.append([
+        InlineKeyboardButton(
+            text="✖️ Cancel",
+            callback_data="preview_cancel"
+        )
+    ])
+
+    try:
+        await callback_query.message.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+        )
+        await callback_query.answer()
+    except Exception as exc:
+        logger.error("Error showing worker selection: %s", exc)
+        await callback_query.answer("Failed to load workers.", show_alert=True)
+
+
 @router.callback_query(lambda c: c.data and c.data.startswith("preview_render:"))
 async def preview_render_callback(callback_query: CallbackQuery):
     """Handle render method choice for previews."""
@@ -1335,7 +1501,8 @@ async def preview_render_callback(callback_query: CallbackQuery):
     _, mode, job_id = parts
 
     if mode == "deadline":
-        await create_new_video_process(callback_query, job_id)
+        # Show worker selection menu instead of directly creating preview
+        await show_worker_selection_for_preview(callback_query, job_id)
         return
 
     if mode == "server":
@@ -1343,6 +1510,51 @@ async def preview_render_callback(callback_query: CallbackQuery):
         return
 
     await callback_query.answer("Unknown action.", show_alert=True)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("preview_submit:"))
+async def preview_submit_callback(callback_query: CallbackQuery):
+    """Handle preview submission with selected worker."""
+    if callback_query.data is None or callback_query.from_user is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+
+    parts = callback_query.data.split(":", 2)
+    if len(parts) != 3:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    job_id = parts[1]
+    worker_choice = parts[2]
+
+    # Safely get progress message
+    progress_msg: Optional[Message] = None
+    if callback_query.message and isinstance(callback_query.message, Message):
+        progress_msg = callback_query.message
+
+    try:
+        if worker_choice == "any":
+            # Use any worker
+            await create_new_video_process(
+                callback_query,
+                job_id,
+                use_any_machine=True,
+                skip_worker_validation=True,
+                progress_message=progress_msg,
+            )
+        else:
+            # Use specific worker
+            await create_new_video_process(
+                callback_query,
+                job_id,
+                use_any_machine=False,
+                skip_worker_validation=True,
+                progress_message=progress_msg,
+                specific_worker=worker_choice,
+            )
+    except Exception as exc:
+        logger.error("Error submitting preview with worker %s: %s", worker_choice, exc)
+        await callback_query.answer("Failed to submit preview job.", show_alert=True)
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("preview_retry:"))
@@ -1385,6 +1597,104 @@ async def preview_force_callback(callback_query: CallbackQuery):
         await callback_query.answer("Failed to submit without restrictions.", show_alert=True)
 
 
+@router.callback_query(lambda c: c.data and c.data.startswith("preview_select_worker:"))
+async def preview_select_worker_callback(callback_query: CallbackQuery):
+    """Show worker selection menu for preview job."""
+    if callback_query.data is None or callback_query.from_user is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+
+    job_id = callback_query.data.split(":", 1)[1]
+    try:
+        # Get list of available workers
+        workers = await get_workers_list(callback_query.from_user.id)
+        if not workers:
+            await callback_query.answer("No workers available.", show_alert=True)
+            return
+
+        # Filter workers by status (only active/idle/rendering)
+        from app.services import ALLOWED_WORKER_STATUSES
+        available_workers = []
+        for worker in workers:
+            info = worker.get("Info", {})
+            name = info.get("Name")
+            status_code = info.get("Stat")
+            if name and status_code in ALLOWED_WORKER_STATUSES:
+                available_workers.append(name)
+
+        if not available_workers:
+            await callback_query.answer("No active workers available.", show_alert=True)
+            return
+
+        # Build inline keyboard with worker buttons (max 2 per row)
+        keyboard_rows = []
+        for i in range(0, len(available_workers), 2):
+            row = []
+            for j in range(i, min(i + 2, len(available_workers))):
+                worker_name = available_workers[j]
+                row.append(
+                    InlineKeyboardButton(
+                        text=worker_name,
+                        callback_data=f"preview_worker_chosen:{job_id}:{worker_name}"
+                    )
+                )
+            keyboard_rows.append(row)
+
+        # Add "Any Worker" and Cancel buttons
+        keyboard_rows.append([
+            InlineKeyboardButton(
+                text="☁️ Any Worker",
+                callback_data=f"preview_force:{job_id}"
+            )
+        ])
+        keyboard_rows.append([
+            InlineKeyboardButton(
+                text="✖️ Cancel",
+                callback_data="preview_cancel"
+            )
+        ])
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+        await callback_query.message.edit_text(
+            "🖥️ Select a worker for preview rendering:",
+            reply_markup=keyboard
+        )
+        await callback_query.answer()
+    except Exception as exc:
+        logger.error("Error showing worker selection: %s", exc)
+        await callback_query.answer("Failed to load workers.", show_alert=True)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("preview_worker_chosen:"))
+async def preview_worker_chosen_callback(callback_query: CallbackQuery):
+    """Submit preview job to specific worker."""
+    if callback_query.data is None or callback_query.from_user is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+
+    parts = callback_query.data.split(":", 2)
+    if len(parts) != 3:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    job_id = parts[1]
+    worker_name = parts[2]
+
+    try:
+        # Submit preview job with specific worker
+        await create_new_video_process(
+            callback_query,
+            job_id,
+            use_any_machine=False,
+            skip_worker_validation=True,
+            progress_message=callback_query.message,
+            specific_worker=worker_name,
+        )
+    except Exception as exc:
+        logger.error("Error submitting preview to worker %s: %s", worker_name, exc)
+        await callback_query.answer("Failed to submit preview job.", show_alert=True)
+
+
 @router.callback_query(lambda c: c.data == "preview_cancel")
 async def preview_cancel_callback(callback_query: CallbackQuery):
     """Cancel preview submission attempt."""
@@ -1393,6 +1703,26 @@ async def preview_cancel_callback(callback_query: CallbackQuery):
         await callback_query.message.edit_text("Action cancelled.", reply_markup=None)
     except Exception:
         pass
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("preview_job_cancel:"))
+async def preview_job_cancel_callback(callback_query: CallbackQuery):
+    """Cancel a queued preview job."""
+    if callback_query.data is None or callback_query.from_user is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+
+    preview_job_id = callback_query.data.split(":", 1)[1]
+    try:
+        success = await delete_job_by_user_id(callback_query.from_user.id, preview_job_id)
+        if success:
+            await callback_query.message.edit_text("✅ Preview job cancelled successfully.", reply_markup=None)
+            await callback_query.answer("Preview job cancelled.", show_alert=False)
+        else:
+            await callback_query.answer("Failed to cancel preview job.", show_alert=True)
+    except Exception as exc:
+        logger.error("Error cancelling preview job %s: %s", preview_job_id, exc)
+        await callback_query.answer("Error cancelling job.", show_alert=True)
 
 
 @router.callback_query(lambda c: c.data == "jobs_back")
@@ -1458,9 +1788,9 @@ async def jobs_back_callback(callback_query: CallbackQuery):
                 total_pages = (total_items + PAGE_SIZE - 1) // PAGE_SIZE
                 nav_buttons = []
                 if 0 > 0:
-                    nav_buttons.append(InlineKeyboardButton(text="⬅ Back", callback_data=f"jobs_page:{0-1}"))
+                    nav_buttons.append(InlineKeyboardButton(text="⬅️ Back", callback_data=f"jobs_page:{0-1}"))
                 if (0 + 1) < total_pages:
-                    nav_buttons.append(InlineKeyboardButton(text="Next ➡", callback_data=f"jobs_page:{0+1}"))
+                    nav_buttons.append(InlineKeyboardButton(text="➡️ Next", callback_data=f"jobs_page:{0+1}"))
                 if nav_buttons:
                     inline_keyboard.append(nav_buttons)
                 
