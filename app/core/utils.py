@@ -45,9 +45,6 @@ logger = logging.getLogger(__name__)
 # Scheduler for automated tasks
 scheduler = AsyncIOScheduler(timezone="Europe/Moscow", job_defaults={'coalesce': True, 'max_instances': 1})
 
-# Track jobs that have been notified about
-notified_jobs = set()
-
 # Track preview submission progress messages (preview_job_id -> (chat_id, message_id))
 preview_message_registry: dict[str, tuple[int, int]] = {}
 preview_animation_tasks: dict[str, asyncio.Task] = {}
@@ -713,7 +710,20 @@ async def on_startup(bot):
         id="log_directory_sizes",
         replace_existing=True
     )
-    
+
+    # Log TTL cache statistics every hour
+    def log_cache_stats():
+        from app.core.bot_core import notified_jobs
+        stats = notified_jobs.get_stats()
+        logger.info(f"TTL Cache stats: {stats}")
+
+    scheduler.add_job(
+        log_cache_stats,
+        CronTrigger(minute=0),  # Every hour at minute 0
+        id="log_cache_stats",
+        replace_existing=True
+    )
+
     logger.info("Scheduled cleanup tasks added")
     
     # Start job progress watcher

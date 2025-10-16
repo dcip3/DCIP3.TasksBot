@@ -28,11 +28,14 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="TasksBot", version="1.0.0")
 
 # Add CORS middleware
+# Parse CORS origins from comma-separated string
+cors_origins_list = [origin.strip() for origin in settings.cors_origins.split(",") if origin.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Restrict to explicit domains in production
+    allow_origins=cors_origins_list,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 

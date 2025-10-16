@@ -11,6 +11,7 @@ from typing import Dict, Set, Any, Tuple
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 from app.core.config import settings
+from app.core.ttl_cache import TTLCache
 import aiohttp
 import logging
 
@@ -22,7 +23,12 @@ dp = Dispatcher(storage=storage)
 # Global state variables
 download_states: Dict[str, Dict[str, Any]] = {}
 stop_downloads: Dict[str, bool] = {}
-notified_jobs: Set[Tuple[str, int]] = set()  # Now stores (job_id, user_id) pairs
+
+# Use TTL cache for notified jobs to prevent memory leak
+# Stores (job_id, user_id) pairs with 1 hour TTL
+# After 1 hour, notifications for the same job can be sent again
+notified_jobs = TTLCache(ttl_seconds=3600, max_size=10000)
+
 active_realtime_tasks: Dict[str, asyncio.Task] = {}
 current_downloads: int = 0
 conversion_semaphore = asyncio.Semaphore(1)

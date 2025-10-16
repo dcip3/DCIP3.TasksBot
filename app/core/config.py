@@ -100,7 +100,16 @@ class Settings(BaseSettings):
 
     # Mini App Configuration
     mini_app_url: str = Field("http://localhost:3000", description="URL for the Telegram mini app")
-    
+
+    # CORS Configuration
+    cors_origins: str = Field(
+        "http://localhost:3000",
+        description="Comma-separated list of allowed CORS origins"
+    )
+
+    # Development mode
+    dev_mode: bool = Field(False, description="Enable development mode (disables some security checks)")
+
     # Worker and Job Status Mappings
     worker_status_map: Dict[int, str] = {
         0: "Unknown",

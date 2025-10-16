@@ -28,8 +28,9 @@ logger = logging.getLogger(__name__)
 # Create router
 router = APIRouter()
 
-# Development mode - set to True for testing without Telegram WebApp
-DEV_MODE = True
+# Development mode - controlled by environment variable
+import os
+DEV_MODE = os.getenv("DEV_MODE", "false").lower() in ("true", "1", "yes")
 
 # Pydantic models
 class LoginRequest(BaseModel):
