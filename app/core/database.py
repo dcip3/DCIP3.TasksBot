@@ -66,6 +66,8 @@ async def init_db():
             deadline_password TEXT,
             notifications_enabled INTEGER DEFAULT 0,
             notification_scope TEXT DEFAULT 'all',
+            preview_default_worker TEXT,
+            preview_default_method TEXT,
             last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (telegram_user_id) REFERENCES users(telegram_user_id)
         )
@@ -115,6 +117,20 @@ async def init_db():
             logger.debug("preview_default_worker column already exists on user_sessions table")
         else:
             logger.error("Failed to ensure preview_default_worker column: %s", column_error)
+            raise
+    # Ensure preview_default_method column exists for legacy databases
+    try:
+        await tasks_db_conn.execute(
+            "ALTER TABLE user_sessions ADD COLUMN preview_default_method TEXT"
+        )
+        await tasks_db_conn.commit()
+        logger.info("Added preview_default_method column to user_sessions table")
+    except aiosqlite.OperationalError as column_error:
+        message = str(column_error).lower()
+        if "duplicate column name" in message:
+            logger.debug("preview_default_method column already exists on user_sessions table")
+        else:
+            logger.error("Failed to ensure preview_default_method column: %s", column_error)
             raise
 
     await tasks_db_conn.commit()

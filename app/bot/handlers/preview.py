@@ -8,7 +8,7 @@ from typing import Optional
 from aiogram import Router
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from app.auth import get_deadline_credentials, get_preview_default_worker
+from app.auth import get_deadline_credentials, get_preview_default_method, get_preview_default_worker
 from app.core.bot_core import bot, download_states, stop_downloads
 from app.core.config import settings
 from app.core.utils import cleanup_temp_and_conv, register_preview_message, pop_preview_message
@@ -93,6 +93,44 @@ async def _prompt_render_method(
         await bot.send_message(callback_query.from_user.id, text, reply_markup=keyboard)
 
 
+async def _start_deadline_preview(callback_query: CallbackQuery, job_id: str) -> None:
+    if callback_query.from_user is None:
+        await callback_query.answer("Error: user not found.", show_alert=True)
+        return
+
+    default_worker = await get_preview_default_worker(callback_query.from_user.id)
+    progress_msg = (
+        callback_query.message if isinstance(callback_query.message, Message) else None
+    )
+
+    if default_worker:
+        try:
+            await create_new_video_process(
+                callback_query,
+                job_id,
+                use_any_machine=False,
+                skip_worker_validation=True,
+                progress_message=progress_msg,
+                specific_worker=default_worker,
+            )
+            return
+        except Exception as exc:
+            logger.error(
+                "Error auto-submitting preview to default worker %s: %s",
+                default_worker,
+                exc,
+            )
+            try:
+                await show_worker_selection_for_preview(callback_query, job_id)
+                return
+            except Exception as fallback_exc:
+                logger.error("Error showing worker selection fallback: %s", fallback_exc)
+                await callback_query.answer("Failed to submit with default worker.", show_alert=True)
+                return
+
+    await show_worker_selection_for_preview(callback_query, job_id)
+
+
 @router.callback_query(lambda c: c.data and c.data.startswith("preview_job:"))
 async def preview_job_callback(callback_query: CallbackQuery) -> None:
     """Handle preview job button press."""
@@ -131,6 +169,14 @@ async def preview_job_callback(callback_query: CallbackQuery) -> None:
             await callback_query.answer()
             return
 
+        default_method = await get_preview_default_method(callback_query.from_user.id)
+        if default_method == "server":
+            await render_preview_via_server(callback_query, job_id)
+            return
+        if default_method == "deadline":
+            await _start_deadline_preview(callback_query, job_id)
+            return
+
         await _prompt_render_method(
             callback_query,
             job_id,
@@ -152,6 +198,19 @@ async def preview_render_options_callback(callback_query: CallbackQuery) -> None
         return
 
     job_id = callback_query.data.split(":", 1)[1]
+
+    default_method = (
+        await get_preview_default_method(callback_query.from_user.id)
+        if callback_query.from_user
+        else None
+    )
+    if default_method == "server":
+        await render_preview_via_server(callback_query, job_id)
+        return
+    if default_method == "deadline":
+        await _start_deadline_preview(callback_query, job_id)
+        return
+
     await _prompt_render_method(
         callback_query,
         job_id,
@@ -291,38 +350,7 @@ async def preview_render_callback(callback_query: CallbackQuery) -> None:
     _, mode, job_id = parts
 
     if mode == "deadline":
-        if callback_query.from_user is None:
-            await callback_query.answer("Error: user not found.", show_alert=True)
-            return
-
-        default_worker = await get_preview_default_worker(callback_query.from_user.id)
-        if default_worker:
-            progress_msg = (
-                callback_query.message if isinstance(callback_query.message, Message) else None
-            )
-            try:
-                await create_new_video_process(
-                    callback_query,
-                    job_id,
-                    use_any_machine=False,
-                    skip_worker_validation=True,
-                    progress_message=progress_msg,
-                    specific_worker=default_worker,
-                )
-            except Exception as exc:
-                logger.error(
-                    "Error auto-submitting preview to default worker %s: %s",
-                    default_worker,
-                    exc,
-                )
-                try:
-                    await show_worker_selection_for_preview(callback_query, job_id)
-                except Exception as fallback_exc:
-                    logger.error("Error showing worker selection fallback: %s", fallback_exc)
-                    await callback_query.answer("Failed to submit with default worker.", show_alert=True)
-            return
-
-        await show_worker_selection_for_preview(callback_query, job_id)
+        await _start_deadline_preview(callback_query, job_id)
         return
 
     if mode == "server":

@@ -22,6 +22,7 @@ _cipher: Optional[Fernet] = None
 NotificationScope = Literal["all", "own"]
 DEFAULT_NOTIFICATION_SCOPE: NotificationScope = "all"
 VALID_NOTIFICATION_SCOPES = {"all", "own"}
+VALID_PREVIEW_RENDER_METHODS = {"server", "deadline"}
 
 def _get_cipher() -> Fernet:
     """Get or create Fernet cipher for password encryption."""
@@ -469,6 +470,92 @@ async def set_preview_default_worker(telegram_user_id: int, worker_name: Optiona
         return True
     except Exception as e:
         logger.error("Failed to set preview default worker for user %s: %s", telegram_user_id, e)
+        return False
+
+
+async def get_preview_default_method(telegram_user_id: int) -> Optional[str]:
+    """
+    Get the default render method for previews.
+
+    Returns:
+        'server', 'deadline', or None if not set.
+    """
+    conn = get_db_connection()
+    if conn is None:
+        return None
+
+    try:
+        async with conn.execute(
+            "SELECT preview_default_method FROM user_sessions WHERE telegram_user_id = ?",
+            (telegram_user_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row or not row[0]:
+                return None
+            method = (row[0] or "").strip().lower()
+            if method not in VALID_PREVIEW_RENDER_METHODS:
+                return None
+            return method
+    except Exception as e:
+        logger.error(
+            "Failed to fetch preview default method for user %s: %s",
+            telegram_user_id,
+            e,
+        )
+        return None
+
+
+async def set_preview_default_method(telegram_user_id: int, method: Optional[str]) -> bool:
+    """
+    Set the default render method for previews.
+
+    Args:
+        telegram_user_id: Telegram user ID
+        method: 'server', 'deadline', or None/'ask' to clear
+    """
+    conn = get_db_connection()
+    if conn is None:
+        return False
+
+    normalized: Optional[str]
+    if method is None:
+        normalized = None
+    else:
+        candidate = method.strip().lower()
+        if candidate in {"none", "ask", ""}:
+            normalized = None
+        elif candidate in VALID_PREVIEW_RENDER_METHODS:
+            normalized = candidate
+        else:
+            logger.error(
+                "Unsupported preview default method '%s' for user %s",
+                method,
+                telegram_user_id,
+            )
+            return False
+
+    try:
+        await conn.execute(
+            """
+            UPDATE user_sessions
+            SET preview_default_method = ?
+            WHERE telegram_user_id = ?
+            """,
+            (normalized, telegram_user_id),
+        )
+        await conn.commit()
+        logger.info(
+            "User %s preview default method set to %s",
+            telegram_user_id,
+            normalized or "ask",
+        )
+        return True
+    except Exception as e:
+        logger.error(
+            "Failed to set preview default method for user %s: %s",
+            telegram_user_id,
+            e,
+        )
         return False
 
 

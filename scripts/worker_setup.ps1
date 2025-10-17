@@ -12,7 +12,7 @@
 
 .EXAMPLE
     # Run from an elevated PowerShell prompt on the worker:
-    .\setup_deadline_python.ps1 -PythonId "Python.Python.3.11" -Packages @("PyOpenColorIO","OpenEXR","numpy")
+    .\worker_setup.ps1 -PythonId "Python.Python.3.11" -Packages @("PyOpenColorIO","OpenEXR","numpy")
 
 .NOTES
     - Ensure winget is available (Windows 10 2004+ or 11).

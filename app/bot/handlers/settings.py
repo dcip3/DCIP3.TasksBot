@@ -1,17 +1,20 @@
 import logging
+from pathlib import Path
 from typing import cast
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from app.auth import (
     NotificationScope,
     get_notification_settings,
+    get_preview_default_method,
     get_preview_default_worker,
     is_authorized,
     set_notification_enabled,
     set_notification_scope,
+    set_preview_default_method,
     set_preview_default_worker,
 )
 from app.bot.handlers.realtime import stop_realtime_for_chat
@@ -40,6 +43,18 @@ def _build_settings_root_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="🎬 Preview Worker",
                     callback_data="settings:preview_worker",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🎛 Preview Method",
+                    callback_data="settings:preview_method",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🛠️ Worker Setup",
+                    callback_data="settings:setup_script",
                 )
             ],
             [
@@ -229,6 +244,59 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
             if "message is not modified" not in str(exc).lower():
                 raise
 
+    async def show_preview_method() -> None:
+        default_method = await get_preview_default_method(user_id)
+        method_display = {
+            "server": "Server (bot host)",
+            "deadline": "Deadline farm",
+            None: "Always ask",
+        }
+
+        text_lines = [
+            "Preview Method Settings",
+            "",
+            f"Default method: {method_display.get(default_method, 'Always ask')}",
+            "",
+            "Choose how previews should be rendered by default.",
+            "Select 'Always ask' to see the method menu every time.",
+        ]
+
+        def _button(label: str, method_value: str, selected: bool) -> InlineKeyboardButton:
+            prefix = "✅ " if selected else ""
+            return InlineKeyboardButton(
+                text=f"{prefix}{label}",
+                callback_data=f"settings:preview_method:set:{method_value}",
+            )
+
+        keyboard_rows = [
+            [
+                _button("🖥️ Server", "server", default_method == "server"),
+                _button("☁️ Deadline", "deadline", default_method == "deadline"),
+            ],
+            [
+                _button(
+                    "None (Always ask)",
+                    "none",
+                    default_method is None,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Back",
+                    callback_data="settings:back:root",
+                )
+            ],
+        ]
+
+        try:
+            await callback_query.message.edit_text(
+                "\n".join(text_lines),
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+            )
+        except TelegramBadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                raise
+
     if action == "close":
         await callback_query.message.edit_text("Settings closed.")
         await callback_query.answer()
@@ -258,6 +326,58 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
                     await callback_query.answer(f"Default worker set to: {worker_name}")
                 await show_preview_worker()
                 return
+
+    if action == "preview_method":
+        if len(parts) == 2:
+            await show_preview_method()
+            await callback_query.answer()
+            return
+        if len(parts) > 2:
+            sub_action = parts[2]
+            if sub_action == "set" and len(parts) > 3:
+                method_value = parts[3]
+                if method_value == "none":
+                    await set_preview_default_method(user_id, None)
+                    await callback_query.answer("Preview method set to: Always ask")
+                elif method_value in {"server", "deadline"}:
+                    await set_preview_default_method(user_id, method_value)
+                    await callback_query.answer(
+                        "Preview method set to: Server"
+                        if method_value == "server"
+                        else "Preview method set to: Deadline"
+                    )
+                else:
+                    await callback_query.answer("Unsupported option.", show_alert=True)
+                    return
+                await show_preview_method()
+                return
+
+    if action == "setup_script":
+        script_path = Path(__file__).resolve().parents[3] / "scripts" / "worker_setup.ps1"
+        if not script_path.exists():
+            await callback_query.answer("Setup script not found.", show_alert=True)
+            return
+        try:
+            document = FSInputFile(str(script_path))
+            caption = "PowerShell helper for Deadline worker dependencies."
+            if callback_query.message:
+                await callback_query.message.answer_document(document=document, caption=caption)
+            elif callback_query.from_user:
+                from app.core.bot_core import bot
+
+                await bot.send_document(
+                    chat_id=callback_query.from_user.id,
+                    document=document,
+                    caption=caption,
+                )
+            else:
+                await callback_query.answer("Unable to send setup script.", show_alert=True)
+                return
+            await callback_query.answer("Setup script sent!")
+        except Exception as exc:
+            logger.error("Failed to send Deadline setup script: %s", exc)
+            await callback_query.answer("Failed to send setup script.", show_alert=True)
+        return
 
     if action == "notif" and len(parts) > 2:
         sub_action = parts[2]
