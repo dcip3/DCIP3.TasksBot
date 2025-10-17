@@ -935,17 +935,33 @@ async def send_dbx_video_callback(callback_query: CallbackQuery) -> None:
         progress_msg = await callback_query.message.answer("📥 Downloading existing video from Dropbox...")
 
         try:
-            video_path = await download_video_from_dropbox(login, password, job_id)
+            download_result = await download_video_from_dropbox(login, password, job_id)
         except Exception as exc:
             logger.error("Error downloading video from Dropbox: %s", exc)
             await progress_msg.edit_text(f"❌ Error downloading video: {exc}")
             await callback_query.answer("Error occurred while downloading video.", show_alert=True)
             return
 
+        if not download_result:
+            await progress_msg.edit_text("⚠️ Video not found in Dropbox.")
+            await callback_query.answer("No video available on Dropbox.", show_alert=True)
+            return
+
+        if isinstance(download_result, tuple):
+            video_path, dropbox_path = download_result
+        else:
+            video_path = download_result
+            dropbox_path = None
+
         try:
             video_file = FSInputFile(video_path)
             project_name = Path(video_path).stem
-            caption = f"📁 {project_name}\n<code>{video_path}</code>"
+            caption_lines = [f"📁 {project_name}"]
+            if dropbox_path:
+                caption_lines.append(f"<code>{dropbox_path}</code>")
+            else:
+                caption_lines.append(f"<code>{video_path}</code>")
+            caption = "\n".join(caption_lines)
             await callback_query.message.answer_video(
                 video=video_file,
                 caption=caption,
