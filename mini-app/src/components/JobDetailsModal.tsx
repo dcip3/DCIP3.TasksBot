@@ -28,13 +28,13 @@ const getStatusIcon = (stat: number) => {
 
 const getStatusText = (stat: number) => {
   switch (stat) {
-    case 0: return 'Неизвестно';
-    case 1: return 'Активен';
-    case 2: return 'Приостановлен';
-    case 3: return 'Завершен';
-    case 4: return 'Ошибка';
-    case 6: return 'Ожидает';
-    default: return 'Неизвестно';
+    case 0: return 'Unknown';
+    case 1: return 'Active';
+    case 2: return 'Suspended';
+    case 3: return 'Completed';
+    case 4: return 'Failed';
+    case 6: return 'Pending';
+    default: return 'Unknown';
   }
 };
 

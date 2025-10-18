@@ -1,104 +1,104 @@
 # TasksBot Mini App
 
-Telegram Mini App для управления задачами Deadline через веб-интерфейс.
+Telegram Mini App for managing Deadline jobs through a web interface.
 
-## Возможности
+## Features
 
-- 🔐 Аутентификация через Deadline credentials
-- 📋 Просмотр списка задач (Jobs) с группировкой по батчам
-- 👥 Мониторинг воркеров (Workers)
-- ⚡ Управление задачами: requeue, resume, suspend, delete
-- 📊 Отображение прогресса выполнения задач
-- 🎨 Современный UI с адаптивным дизайном
-- 🔄 Автоматическое обновление данных
+- 🔐 Authentication with Deadline credentials
+- 📋 Job list view with batch grouping
+- 👥 Worker monitoring
+- ⚡ Job controls: requeue, resume, suspend, delete
+- 📊 Progress tracking for active jobs
+- 🎨 Modern responsive UI
+- 🔄 Automatic data refresh
 
-## Установка
+## Setup
 
-1. Установите зависимости:
+1. Install dependencies:
 ```bash
 npm install
 ```
 
-2. Создайте файл `.env` в корне проекта:
+2. Create a `.env` file in the project root:
 ```env
 VITE_API_URL=http://localhost:8000
 ```
 
-3. Запустите сервер разработки:
+3. Start the development server:
 ```bash
 npm run dev
 ```
 
-## Сборка для продакшена
+## Production Build
 
 ```bash
 npm run build
 ```
 
-## Интеграция с Telegram Bot
+## Telegram Bot Integration
 
-Для работы mini app необходимо добавить API endpoints в ваш бот:
+Expose the following API endpoints in the bot backend for the mini app to function:
 
-### Аутентификация
-- `POST /api/auth/login` - вход пользователя
-- `POST /api/auth/logout` - выход пользователя  
-- `GET /api/auth/check` - проверка аутентификации
+### Authentication
+- `POST /api/auth/login` - user login
+- `POST /api/auth/logout` - end the session
+- `GET /api/auth/check` - session validation
 
-### Задачи
-- `GET /api/jobs` - получение списка задач
-- `GET /api/jobs/{id}` - детали задачи
-- `GET /api/jobs/{id}/tasks` - задачи в рамках job
-- `PUT /api/jobs/{id}/requeue` - перезапуск задачи
-- `PUT /api/jobs/{id}/resume` - возобновление задачи
-- `PUT /api/jobs/{id}/suspend` - приостановка задачи
-- `DELETE /api/jobs/{id}` - удаление задачи
+### Jobs
+- `GET /api/jobs` - fetch the job list
+- `GET /api/jobs/{id}` - job details
+- `GET /api/jobs/{id}/tasks` - tasks inside a job
+- `PUT /api/jobs/{id}/requeue` - restart a job
+- `PUT /api/jobs/{id}/resume` - resume a paused job
+- `PUT /api/jobs/{id}/suspend` - pause a job
+- `DELETE /api/jobs/{id}` - delete a job
 
-### Воркеры
-- `GET /api/workers` - получение списка воркеров
+### Workers
+- `GET /api/workers` - fetch worker list
 
-## Структура проекта
+## Project Structure
 
 ```
 mini-app/
 ├── src/
-│   ├── components/     # React компоненты
-│   ├── services/       # API сервисы
-│   ├── types/          # TypeScript типы
-│   ├── utils/          # Утилиты
-│   ├── App.tsx         # Главный компонент
+│   ├── components/     # React components
+│   ├── services/       # API services
+│   ├── types/          # TypeScript types
+│   ├── utils/          # Shared utilities
+│   ├── App.tsx         # Root component
 │   └── main.tsx        # Entry point
-├── public/             # Статические файлы
-├── package.json        # Зависимости
-└── README.md          # Документация
+├── public/             # Static assets
+├── package.json        # Dependencies
+└── README.md          # Documentation
 ```
 
-## Технологии
+## Technology Stack
 
-- **React 18** - UI библиотека
-- **TypeScript** - типизация
-- **Tailwind CSS** - стилизация
-- **Vite** - сборщик
-- **Axios** - HTTP клиент
-- **Lucide React** - иконки
-- **Telegram WebApp API** - интеграция с Telegram
+- **React 18** - UI library
+- **TypeScript** - type safety
+- **Tailwind CSS** - styling
+- **Vite** - build tool
+- **Axios** - HTTP client
+- **Lucide React** - icon set
+- **Telegram WebApp API** - Telegram integration
 
-## Разработка
+## Development Tips
 
-### Добавление новых компонентов
+### Adding New Components
 
-1. Создайте файл в `src/components/`
-2. Экспортируйте компонент как default или named export
-3. Импортируйте в нужном месте
+1. Create a file in `src/components/`
+2. Export the component as a default or named export
+3. Import it where it is needed
 
-### Добавление новых API endpoints
+### Adding API Endpoints
 
-1. Добавьте метод в соответствующий API сервис в `src/services/api.ts`
-2. Используйте в компонентах через хуки или напрямую
+1. Create a method in the appropriate service inside `src/services/api.ts`
+2. Consume it from components via hooks or directly
 
-### Стилизация
+### Styling Guidelines
 
-Используйте Tailwind CSS классы для стилизации. Основные цвета:
+Use Tailwind CSS utility classes for styling. Preferred color tokens:
 - Primary: `primary-500`, `primary-600`, `primary-700`
 - Success: `green-500`, `green-600`
 - Warning: `yellow-500`, `yellow-600`
-- Error: `red-500`, `red-600` 
+- Error: `red-500`, `red-600`
