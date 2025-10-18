@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import cast, Optional
 
 from aiogram.types import (
+    BotCommand,
     Message,
     KeyboardButton,
     ReplyKeyboardMarkup,
@@ -699,7 +700,16 @@ async def on_startup(bot):
     # Setup menu button for Mini App
     await setup_menu_button()
     logger.info("Menu button setup completed")
-    
+
+    await bot.set_my_commands(
+        [
+            BotCommand(command="start", description="Start the bot"),
+            BotCommand(command="login", description="Authenticate to the bot"),
+            BotCommand(command="logout", description="End the current session"),
+        ]
+    )
+    logger.info("Bot commands registered")
+
     # Start scheduler
     scheduler.start()
     logger.info("Scheduler started")
