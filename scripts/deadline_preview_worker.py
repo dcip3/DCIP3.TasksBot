@@ -13,15 +13,21 @@ in the Python environment available on the worker.
 from __future__ import annotations
 
 import argparse
+import atexit
 import gc
 import logging
 import os
 import re
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Set, Union
+
+
+ACTIVE_TEMP_PATHS: Set[Path] = set()
 
 
 def configure_logging(verbosity: int) -> None:
@@ -35,6 +41,74 @@ def configure_logging(verbosity: int) -> None:
         format="%(asctime)s - preview_worker - %(levelname)s - %(message)s",
         stream=sys.stdout,
     )
+
+
+def _register_temp_path(path: Path) -> None:
+    try:
+        ACTIVE_TEMP_PATHS.add(path)
+    except TypeError:
+        # Path may not be hashable or valid; ignore to avoid blocking processing
+        pass
+
+
+def _unregister_temp_path(path: Optional[Path]) -> None:
+    if path is None:
+        return
+    ACTIVE_TEMP_PATHS.discard(path)
+
+
+def _cleanup_registered_temp_paths() -> None:
+    for temp_path in list(ACTIVE_TEMP_PATHS):
+        shutil.rmtree(temp_path, ignore_errors=True)
+        if temp_path.exists():
+            logging.warning("Temporary preview folder persists after cleanup: %s", temp_path)
+        else:
+            ACTIVE_TEMP_PATHS.discard(temp_path)
+
+
+def _resolve_base_temp_dir(raw_dir: Optional[Union[str, Path]]) -> Path:
+    if raw_dir is not None:
+        raw_str = str(raw_dir).strip()
+        if raw_str.lower() in {"", "auto", "default", "system", "local"}:
+            raw_str = ""
+    else:
+        raw_str = ""
+
+    if raw_str:
+        expanded = os.path.expandvars(os.path.expanduser(raw_str))
+        base_path = Path(expanded)
+    else:
+        base_path = Path(tempfile.gettempdir()) / "PreviewTemp"
+
+    try:
+        base_path.mkdir(parents=True, exist_ok=True)
+    except Exception as mkdir_error:
+        logging.warning("Could not create preview temp dir %s: %s", base_path, mkdir_error)
+    return base_path
+
+
+def _handle_termination(signum, frame) -> None:  # pragma: no cover - Deadline signal handling
+    logging.warning("Received signal %s; cleaning up preview temp folders", signum)
+    _cleanup_registered_temp_paths()
+    try:
+        signal.signal(signum, signal.SIG_DFL)
+    except Exception:
+        pass
+    os.kill(os.getpid(), signum)
+
+
+def _install_signal_handlers() -> None:
+    possible_signals = [getattr(signal, name, None) for name in ("SIGTERM", "SIGINT", "SIGBREAK")]
+    for sig in possible_signals:
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _handle_termination)
+        except (ValueError, OSError):  # pragma: no cover - platform specific behavior
+            continue
+
+
+atexit.register(_cleanup_registered_temp_paths)
 
 
 def bake_preview_lut(
@@ -204,7 +278,7 @@ def convert_sequence_cpu(
     input_space: str,
     display: str,
     view: str,
-    temp_dir: Optional[str],
+    temp_dir: Optional[Union[str, Path]],
 ) -> Tuple[str, int, Optional[tempfile.TemporaryDirectory[str]]]:
     directory, template, digits, files = _expand_sequence(input_pattern)
 
@@ -214,34 +288,48 @@ def convert_sequence_cpu(
     cpu_processor = _load_cpu_processor(config_path, input_space, display, view)
 
     temp_dir_obj: Optional[tempfile.TemporaryDirectory[str]]
-    base_dir = temp_dir
-    if base_dir:
-        Path(base_dir).mkdir(parents=True, exist_ok=True)
-    temp_dir_obj = tempfile.TemporaryDirectory(prefix="preview_cpu_", dir=base_dir)
-    cpu_dir = Path(temp_dir_obj.name)
-
-    frame_regex = re.compile(r"(\d+)(?=\.[^.]+$)")
-    frame_numbers: List[int] = []
-    for exr_path in files:
-        match = frame_regex.search(exr_path.name)
-        if not match:
-            raise RuntimeError(f"Could not extract frame number from {exr_path.name}")
-        frame_num = int(match.group(1))
-        frame_numbers.append(frame_num)
-        output_filename = exr_path.with_suffix(".png").name
-        output_path = cpu_dir / output_filename
-        logging.debug("Converting %s -> %s", exr_path, output_path)
-        _convert_exr_to_png_cpu(exr_path, output_path, cpu_processor)
-
-    first_frame = frame_numbers[0] if frame_numbers else start_number
-    png_template = template
-    if png_template.lower().endswith(".exr"):
-        png_template = png_template[:-4] + ".png"
+    base_dir: Optional[Path]
+    if temp_dir is not None and str(temp_dir).strip():
+        base_dir = Path(str(temp_dir).strip())
+        base_dir.mkdir(parents=True, exist_ok=True)
+        base_dir_str = str(base_dir)
     else:
-        png_template = png_template + ".png"
+        base_dir = _resolve_base_temp_dir(None)
+        base_dir_str = str(base_dir)
 
-    converted_pattern = str(cpu_dir / png_template)
-    return converted_pattern, first_frame, temp_dir_obj
+    temp_dir_obj = tempfile.TemporaryDirectory(prefix="preview_cpu_", dir=base_dir_str)
+    cpu_dir = Path(temp_dir_obj.name)
+    _register_temp_path(cpu_dir)
+
+    try:
+        frame_regex = re.compile(r"(\d+)(?=\.[^.]+$)")
+        frame_numbers: List[int] = []
+        for exr_path in files:
+            match = frame_regex.search(exr_path.name)
+            if not match:
+                raise RuntimeError(f"Could not extract frame number from {exr_path.name}")
+            frame_num = int(match.group(1))
+            frame_numbers.append(frame_num)
+            output_filename = exr_path.with_suffix(".png").name
+            output_path = cpu_dir / output_filename
+            logging.debug("Converting %s -> %s", exr_path, output_path)
+            _convert_exr_to_png_cpu(exr_path, output_path, cpu_processor)
+
+        first_frame = frame_numbers[0] if frame_numbers else start_number
+        png_template = template
+        if png_template.lower().endswith(".exr"):
+            png_template = png_template[:-4] + ".png"
+        else:
+            png_template = png_template + ".png"
+
+        converted_pattern = str(cpu_dir / png_template)
+        return converted_pattern, first_frame, temp_dir_obj
+    except Exception:
+        try:
+            temp_dir_obj.cleanup()
+        finally:
+            _unregister_temp_path(cpu_dir)
+        raise
 
 def build_ffmpeg_command(
     *,
@@ -356,9 +444,11 @@ def parse_arguments(argv: Optional[list[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_arguments(argv)
     configure_logging(args.verbose)
+    _install_signal_handlers()
 
     try:
         cleanup_resources: List[tempfile.TemporaryDirectory[str]] = []
+        base_temp_dir = _resolve_base_temp_dir(args.temp_dir)
 
         color_mode = args.color_mode.lower()
         apply_color = not args.disable_color
@@ -381,7 +471,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 input_space=args.input_space,
                 display=args.display,
                 view=args.view,
-                temp_dir=args.temp_dir,
+                temp_dir=base_temp_dir,
             )
             ffmpeg_input_pattern = converted_pattern
             if cpu_temp_dir is not None:
@@ -392,11 +482,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             if args.lut_path:
                 lut_path = Path(args.lut_path)
             else:
-                base_temp_dir = args.temp_dir
-                if base_temp_dir:
-                    Path(base_temp_dir).mkdir(parents=True, exist_ok=True)
-                lut_temp_dir = tempfile.TemporaryDirectory(prefix="preview_lut_", dir=base_temp_dir)
+                lut_temp_dir = tempfile.TemporaryDirectory(prefix="preview_lut_", dir=str(base_temp_dir))
                 cleanup_resources.append(lut_temp_dir)
+                _register_temp_path(Path(lut_temp_dir.name))
                 lut_path = Path(lut_temp_dir.name) / "preview_lut.cube"
             bake_preview_lut(
                 config_path=config_path,
@@ -427,10 +515,22 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 1
     finally:
         for temp_dir_cm in cleanup_resources:
+            temp_dir_path: Optional[Path]
+            try:
+                temp_dir_path = Path(temp_dir_cm.name)
+            except Exception:
+                temp_dir_path = None
+
             try:
                 temp_dir_cm.cleanup()
-            except Exception:
-                pass
+            except Exception as cleanup_error:
+                logging.warning("Failed to cleanup temp dir via context manager: %s", cleanup_error)
+
+            if temp_dir_path and temp_dir_path.exists():
+                shutil.rmtree(temp_dir_path, ignore_errors=True)
+                if temp_dir_path.exists():
+                    logging.warning("Temporary preview folder persists after cleanup: %s", temp_dir_path)
+            _unregister_temp_path(temp_dir_path)
 
     return 0
 

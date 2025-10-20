@@ -292,29 +292,37 @@ def cleanup_old_files(max_age_hours: int = 6):
     try:
         current_time = time.time()
         max_age_seconds = max_age_hours * 3600
-        
-        for directory in [Path(settings.temp_dir), Path(settings.conv_dir)]:
+
+        directories = [Path(settings.temp_dir), Path(settings.conv_dir)]
+        if settings.preview_temp_dir:
+            sentinel_values = {"local", "auto", "default", "system"}
+            if settings.preview_temp_dir.strip().lower() not in sentinel_values:
+                expanded = os.path.expandvars(os.path.expanduser(settings.preview_temp_dir))
+                if not (any(symbol in expanded for symbol in ("%", "$")) and expanded == settings.preview_temp_dir):
+                    directories.append(Path(expanded))
+
+        for directory in directories:
             if not directory.exists():
                 continue
-                
+
             for item in directory.glob("*"):
                 try:
                     if not item.exists():  # Skip if already deleted
                         continue
-                        
+
                     # Get last modification time
                     mtime = item.stat().st_mtime
                     age = current_time - mtime
-                    
+
                     if age > max_age_seconds:
                         if item.is_dir():
-                            shutil.rmtree(item)
+                            shutil.rmtree(item, ignore_errors=True)
                         else:
-                            item.unlink()
+                            item.unlink(missing_ok=True)
                         logger.debug(f"Cleaned up old file: {item}")
                 except Exception as e:
                     logger.warning(f"Error cleaning up {item}: {e}")
-                    
+
     except Exception as e:
         logger.error(f"Error in cleanup_old_files: {e}")
 

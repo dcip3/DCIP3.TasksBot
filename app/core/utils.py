@@ -439,7 +439,7 @@ def has_enough_space(path: str, min_free_bytes: int | None = None) -> bool:
 def clear_folder(folder_path: str | Path) -> None:
     """
     Clear contents of a folder without removing the folder itself.
-    
+
     Args:
         folder_path: Path to the folder to clear
     """
@@ -457,6 +457,43 @@ def clear_folder(folder_path: str | Path) -> None:
         folder.mkdir(parents=True, exist_ok=True)
 
 
+def _cleanup_preview_temp_dir() -> None:
+    preview_dir = settings.preview_temp_dir
+    if not preview_dir:
+        return
+
+    sentinel_values = {"local", "auto", "default", "system"}
+    if preview_dir.strip().lower() in sentinel_values:
+        logger.debug("Skipping preview temp cleanup for sentinel value '%s'", preview_dir)
+        return
+
+    try:
+        expanded = os.path.expandvars(os.path.expanduser(preview_dir))
+        # If expansion failed (still contains % or $), skip cleanup to avoid creating bogus paths
+        if any(symbol in expanded for symbol in ("%", "$")) and expanded == preview_dir:
+            logger.debug("Skipping preview temp cleanup; unresolved env vars in %s", preview_dir)
+            return
+
+        preview_path = Path(expanded)
+        if not preview_path.exists():
+            return
+
+        for item in preview_path.iterdir():
+            try:
+                if item.is_dir():
+                    shutil.rmtree(item, ignore_errors=True)
+                else:
+                    item.unlink(missing_ok=True)
+            except Exception:
+                pass
+    except Exception as preview_error:
+        logger.warning(
+            "Failed to clean preview temp directory %s: %s",
+            preview_dir,
+            preview_error,
+        )
+
+
 def cleanup_temp_and_conv() -> None:
     """
     Clear contents of 'temp' and 'conv' directories.
@@ -464,11 +501,14 @@ def cleanup_temp_and_conv() -> None:
     """
     # Clear temp directory completely
     clear_folder(Path(settings.temp_dir))
-    
+
     # Clear conv directory completely (including .mp4 files)
     clear_folder(Path(settings.conv_dir))
-    
-    logger.info("Cleaned up temp and conv directories (removed all files)")
+
+    # Clear preview temp directory if configured (best effort; intended for deadlines workers sharing storage)
+    _cleanup_preview_temp_dir()
+
+    logger.info("Cleaned up temp, conv, and preview directories (where accessible)")
 
 
 def force_cleanup_temp_and_conv() -> None:
@@ -481,8 +521,11 @@ def force_cleanup_temp_and_conv() -> None:
     
     # Clear conv directory completely
     clear_folder(Path(settings.conv_dir))
-    
-    logger.info("Force cleaned up temp and conv directories (removed all files)")
+
+    # Clear preview temp directory if configured (best effort)
+    _cleanup_preview_temp_dir()
+
+    logger.info("Force cleaned up temp, conv, and preview directories (where accessible)")
 
 
 def cleanup_old_files(max_age_hours: int = 24) -> None:
@@ -500,10 +543,21 @@ def cleanup_old_files(max_age_hours: int = 24) -> None:
     
     temp_dir = Path(settings.temp_dir)
     conv_dir = Path(settings.conv_dir)
-    
+    preview_dir = None
+    if settings.preview_temp_dir:
+        sentinel_values = {"local", "auto", "default", "system"}
+        if settings.preview_temp_dir.strip().lower() not in sentinel_values:
+            expanded = os.path.expandvars(os.path.expanduser(settings.preview_temp_dir))
+            if not (any(symbol in expanded for symbol in ("%", "$")) and expanded == settings.preview_temp_dir):
+                preview_dir = Path(expanded)
+
     cleaned_count = 0
-    
-    for directory in [temp_dir, conv_dir]:
+
+    directories_to_clean = [temp_dir, conv_dir]
+    if preview_dir:
+        directories_to_clean.append(preview_dir)
+
+    for directory in directories_to_clean:
         if not directory.exists():
             continue
             

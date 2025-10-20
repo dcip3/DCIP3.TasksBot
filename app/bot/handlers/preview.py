@@ -844,11 +844,6 @@ async def render_preview_via_server(callback_query: CallbackQuery, job_id: str) 
         except Exception as answer_error:  # pragma: no cover - telegram timing
             logger.warning("Could not answer callback query: %s", answer_error)
 
-        try:
-            cleanup_temp_and_conv()
-            cleanup_old_files(max_age_hours=6)
-        except Exception as cleanup_error:
-            logger.error("Error cleaning up directories after video creation: %s", cleanup_error)
     except Exception as exc:
         logger.error(
             "Error in server-side preview generation for user %s job %s: %s",
@@ -867,11 +862,14 @@ async def render_preview_via_server(callback_query: CallbackQuery, job_id: str) 
                 await callback_query.message.answer("❌ Error occurred while creating video.")
         try:
             cleanup_job_files(job_id)
-            cleanup_temp_and_conv()
-            cleanup_old_files(max_age_hours=6)
         except Exception as cleanup_error:
             logger.error("Error cleaning up job files after failure: %s", cleanup_error)
     finally:
+        try:
+            cleanup_temp_and_conv()
+            cleanup_old_files(max_age_hours=6)
+        except Exception as cleanup_error:
+            logger.error("Error cleaning up directories after preview workflow: %s", cleanup_error)
         download_states.pop(job_id, None)
         stop_downloads.pop(job_id, None)
 
