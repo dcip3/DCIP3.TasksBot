@@ -7,6 +7,8 @@ import { initTelegramApp, getTelegramUser, getTelegramThemeParams, subscribeThem
 import { jobsApi, workersApi, authApi } from './services/api';
 import { Job, Worker, User } from './types';
 
+const DEV_MODE = import.meta.env.MODE !== 'production';
+
 function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -16,8 +18,36 @@ function App() {
   const [jobs, setJobs] = useState<Job[]>([]);
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [isTelegramEnv, setIsTelegramEnv] = useState<boolean>(DEV_MODE);
+  const [envChecked, setEnvChecked] = useState<boolean>(DEV_MODE);
 
   useEffect(() => {
+    if (DEV_MODE) {
+      setIsTelegramEnv(true);
+      setEnvChecked(true);
+      return;
+    }
+
+    const tg = window.Telegram?.WebApp;
+    const hasInitData = Boolean(tg?.initData);
+
+    if (!hasInitData) {
+      console.warn('Telegram Mini App environment not detected');
+      setIsTelegramEnv(false);
+      setEnvChecked(true);
+      setLoading(false);
+      return;
+    }
+
+    setIsTelegramEnv(true);
+    setEnvChecked(true);
+  }, []);
+
+  useEffect(() => {
+    if (!envChecked || !isTelegramEnv) {
+      return;
+    }
+
     console.log('App mounted');
     initTelegramApp();
     checkAuth();
@@ -44,7 +74,7 @@ function App() {
     // Subscribe to theme change events
     subscribeThemeChanged(applyTheme);
     // --- END THEME INIT ---
-  }, []);
+  }, [envChecked, isTelegramEnv]);
 
   const checkAuth = async () => {
     console.log('Checking auth...');
@@ -236,6 +266,18 @@ function App() {
     return (
       <div className="min-h-screen flex items-center justify-center bg-tg-bg">
         <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-tg-button"></div>
+      </div>
+    );
+  }
+
+  if (envChecked && !isTelegramEnv) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-tg-bg">
+        <div className="max-w-sm mx-auto px-6 py-8 bg-tg-secondary-bg rounded-lg shadow text-center text-tg-text">
+          <p className="text-sm">
+            Приложение доступно только внутри Telegram Mini App.
+          </p>
+        </div>
       </div>
     );
   }

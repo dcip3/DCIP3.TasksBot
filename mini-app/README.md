@@ -29,6 +29,11 @@ VITE_API_URL=http://localhost:8000
 npm run dev
 ```
 
+## Access Requirements
+
+- Production build checks for Telegram Mini App context and blocks direct browser access.
+- Local development via `npm run dev` keeps a relaxed mode for testing outside Telegram.
+
 ## Production Build
 
 ```bash

@@ -10,8 +10,8 @@ const api = axios.create({
   timeout: 10000,
 });
 
-// Development mode - set to true for testing without Telegram WebApp
-const DEV_MODE = true;
+// Enable relaxed behaviour only when running Vite dev server
+const DEV_MODE = import.meta.env.MODE !== 'production';
 
 console.log('DEV_MODE:', DEV_MODE);
 
@@ -29,6 +29,8 @@ api.interceptors.request.use((config) => {
     const tg = window.Telegram?.WebApp;
     if (tg?.initData) {
       config.headers['X-Telegram-Init-Data'] = tg.initData;
+    } else {
+      return Promise.reject(new Error('Telegram Mini App context required'));
     }
   }
   return config;

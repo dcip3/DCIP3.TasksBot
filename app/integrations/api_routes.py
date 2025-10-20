@@ -48,7 +48,10 @@ class AuthResponse(BaseModel):
     user: Optional[Dict[str, Any]] = None
 
 # Telegram WebApp validation
-def validate_telegram_init_data(init_data: str = Header(None)) -> Optional[int]:
+def validate_telegram_init_data(
+    init_data: Optional[str] = Header(None, alias="X-Telegram-Init-Data"),
+    fallback_init_data: Optional[str] = Header(None, alias="Init-Data"),
+) -> Optional[int]:
     """
     Validate Telegram WebApp init data and extract user ID.
     
@@ -63,12 +66,14 @@ def validate_telegram_init_data(init_data: str = Header(None)) -> Optional[int]:
         logger.info("Development mode: using test user ID")
         return 123456789
     
-    if not init_data:
+    header_value = init_data or fallback_init_data
+
+    if not header_value:
         return None
     
     try:
         # Parse init data preserving multiple values if any
-        parsed_pairs = urllib.parse.parse_qsl(init_data, keep_blank_values=True)
+        parsed_pairs = urllib.parse.parse_qsl(header_value, keep_blank_values=True)
         parsed_data = dict(parsed_pairs)
 
         provided_hash = parsed_data.pop("hash", None)
