@@ -358,21 +358,51 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
             await callback_query.answer("Setup script not found.", show_alert=True)
             return
         try:
-            document = FSInputFile(str(script_path))
-            caption = "PowerShell helper for Deadline worker dependencies."
-            if callback_query.message:
-                await callback_query.message.answer_document(document=document, caption=caption)
-            elif callback_query.from_user:
-                from app.core.bot_core import bot
+            async def send_document(path: Path, caption: str, parse_mode: str | None = None) -> None:
+                document = FSInputFile(str(path))
+                if callback_query.message:
+                    await callback_query.message.answer_document(
+                        document=document,
+                        caption=caption,
+                        parse_mode=parse_mode,
+                    )
+                elif callback_query.from_user:
+                    from app.core.bot_core import bot
 
-                await bot.send_document(
-                    chat_id=callback_query.from_user.id,
-                    document=document,
-                    caption=caption,
+                    await bot.send_document(
+                        chat_id=callback_query.from_user.id,
+                        document=document,
+                        caption=caption,
+                        parse_mode=parse_mode,
+                    )
+                else:
+                    raise RuntimeError("Unable to resolve target for sending document")
+
+            caption_lines = [
+                "*Deadline worker setup helper*",
+                "",
+                "Run this script on a Deadline worker to install the required dependencies.",
+                "",
+                "If PowerShell blocks running the script, execute from the same folder:",
+                "```powershell",
+                "powershell -ExecutionPolicy Bypass -File .\\worker_setup.ps1",
+                "```",
+                "You will also receive `worker_setup.bat`, which applies the bypass automatically.",
+                "",
+                "Re-running the script is safe; existing installations will be reused.",
+            ]
+            caption = "\n".join(caption_lines)
+
+            await send_document(script_path, caption, parse_mode="Markdown")
+
+            batch_path = script_path.with_suffix(".bat")
+            if batch_path.exists():
+                await send_document(
+                    batch_path,
+                    "Windows launcher (`worker_setup.bat`) that bypasses execution policy for `worker_setup.ps1`.",
+                    parse_mode="Markdown",
                 )
-            else:
-                await callback_query.answer("Unable to send setup script.", show_alert=True)
-                return
+
             await callback_query.answer("Setup script sent!")
         except Exception as exc:
             logger.error("Failed to send Deadline setup script: %s", exc)

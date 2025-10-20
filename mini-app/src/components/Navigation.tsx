@@ -1,11 +1,10 @@
 import React from 'react';
-import { Briefcase, Users, LogOut, RefreshCw } from 'lucide-react';
+import { Briefcase, Users, RefreshCw } from 'lucide-react';
 
 interface NavigationProps {
   activeTab: 'jobs' | 'workers';
   onTabChange: (tab: 'jobs' | 'workers') => void;
   onRefresh: () => void;
-  onLogout: () => void;
   loading?: boolean;
 }
 
@@ -13,7 +12,6 @@ export const Navigation: React.FC<NavigationProps> = ({
   activeTab,
   onTabChange,
   onRefresh,
-  onLogout,
   loading = false,
 }) => {
   return (
@@ -58,15 +56,8 @@ export const Navigation: React.FC<NavigationProps> = ({
           >
             <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
           </button>
-          <button
-            onClick={onLogout}
-            className="flex items-center px-3 py-2 text-sm font-medium text-tg-destructive hover:bg-tg-secondary-bg rounded-md transition-colors"
-          >
-            <LogOut className="w-4 h-4 mr-2" />
-            Logout
-          </button>
         </div>
       </div>
     </div>
   );
-}; 
+};

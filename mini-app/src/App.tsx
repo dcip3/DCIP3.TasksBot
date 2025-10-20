@@ -116,19 +116,6 @@ function App() {
     }
   };
 
-  const handleLogout = async () => {
-    try {
-      await authApi.logout();
-    } catch (error) {
-      console.error('Logout error:', error);
-    } finally {
-      setIsAuthenticated(false);
-      setUser(null);
-      setJobs([]);
-      setWorkers([]);
-    }
-  };
-
   const loadData = async () => {
     console.log('loadData called, activeTab:', activeTab);
     setLoading(true);
@@ -275,7 +262,7 @@ function App() {
       <div className="min-h-screen flex items-center justify-center bg-tg-bg">
         <div className="max-w-sm mx-auto px-6 py-8 bg-tg-secondary-bg rounded-lg shadow text-center text-tg-text">
           <p className="text-sm">
-            Приложение доступно только внутри Telegram Mini App.
+            This application is available only inside the Telegram Mini App.
           </p>
         </div>
       </div>
@@ -297,7 +284,6 @@ function App() {
         activeTab={activeTab}
         onTabChange={handleTabChange}
         onRefresh={loadData}
-        onLogout={handleLogout}
         loading={loading}
       />
       
