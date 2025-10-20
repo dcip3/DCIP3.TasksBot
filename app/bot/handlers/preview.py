@@ -313,9 +313,6 @@ async def create_new_video_process(
                     InlineKeyboardButton(
                         text="🖥️ Select Worker", callback_data=f"preview_select_worker:{job_id}"
                     ),
-                    InlineKeyboardButton(
-                        text="☁️ Any Worker", callback_data=f"preview_force:{job_id}"
-                    ),
                 ],
                 [InlineKeyboardButton(text="✖️ Cancel", callback_data="preview_cancel")],
             ]

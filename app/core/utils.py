@@ -11,12 +11,13 @@ This module provides core utilities for the Telegram bot including:
 """
 
 import asyncio
+import html
 import logging
 import os
 import shutil
 from functools import wraps
 from pathlib import Path
-from typing import cast, Optional
+from typing import cast, Optional, Tuple, List, Dict, Any
 
 from aiogram.types import (
     BotCommand,
@@ -123,6 +124,59 @@ async def _run_preview_animation(preview_job_id: str, chat_id: int, message_id: 
 # ============================================================================
 
 
+def _extract_preview_context(
+    props: Dict[str, Any],
+    default_user_id: int,
+) -> Tuple[str, str, int, Dict[str, Any]]:
+    """Extract preview metadata from job properties.
+
+    Returns local/dropbox path hints, resolved target Telegram user ID,
+    and a sanitized copy of the Extra dictionary.
+    """
+
+    local_path_hint = props.get("Ex0") or ""
+    dropbox_path_hint = props.get("Ex1") or ""
+
+    extra_dict = props.get("ExDic") or {}
+    if not isinstance(extra_dict, dict):
+        extra_dict = {}
+
+    local_path_hint = extra_dict.get("PreviewLocal", local_path_hint)
+    dropbox_path_hint = extra_dict.get("PreviewDropbox", dropbox_path_hint)
+    preview_user_id_str = extra_dict.get("PreviewTelegram")
+
+    for key in (
+        "ExtraInfoKeyValue0",
+        "ExtraInfoKeyValue1",
+        "ExtraInfoKeyValue2",
+        "ExtraInfoKeyValue3",
+        "ExtraInfoKeyValue4",
+        "ExtraInfoKeyValue5",
+    ):
+        value = props.get(key)
+        if not value or "=" not in value:
+            continue
+        prefix, payload = value.split("=", 1)
+        if prefix == "PreviewLocal":
+            local_path_hint = payload
+        elif prefix == "PreviewDropbox":
+            dropbox_path_hint = payload
+        elif prefix == "PreviewTelegram":
+            preview_user_id_str = payload
+
+    target_user_id = default_user_id
+    if preview_user_id_str:
+        try:
+            target_user_id = int(str(preview_user_id_str).strip())
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid PreviewTelegram value '%s' in preview job metadata",
+                preview_user_id_str,
+            )
+
+    return local_path_hint, dropbox_path_hint, target_user_id, extra_dict
+
+
 async def _notify_preview_job_completion(
     telegram_user_id: int,
     job: dict,
@@ -138,44 +192,12 @@ async def _notify_preview_job_completion(
     props = job.get("Props", {})
     job_id = job.get("_id", "")
 
-    local_path_hint = props.get("Ex0") or ""
-    dropbox_path_hint = props.get("Ex1") or ""
-
-    extra_dict = props.get("ExDic") or {}
-    if not isinstance(extra_dict, dict):
-        extra_dict = {}
-    local_path_hint = extra_dict.get("PreviewLocal", local_path_hint)
-    dropbox_path_hint = extra_dict.get("PreviewDropbox", dropbox_path_hint)
-    preview_user_id_str = extra_dict.get("PreviewTelegram")
-
-    for key in (
-        "ExtraInfoKeyValue0",
-        "ExtraInfoKeyValue1",
-        "ExtraInfoKeyValue2",
-        "ExtraInfoKeyValue3",
-        "ExtraInfoKeyValue4",
-    ):
-        value = props.get(key)
-        if not value or "=" not in value:
-            continue
-        prefix, payload = value.split("=", 1)
-        if prefix == "PreviewLocal":
-            local_path_hint = payload
-        elif prefix == "PreviewDropbox":
-            dropbox_path_hint = payload
-        elif prefix == "PreviewTelegram":
-            preview_user_id_str = payload
-
-    target_user_id = telegram_user_id
-    if preview_user_id_str:
-        try:
-            target_user_id = int(str(preview_user_id_str).strip())
-        except (TypeError, ValueError):
-            logger.warning(
-                "Invalid PreviewTelegram value '%s' for job %s",
-                preview_user_id_str,
-                job_id,
-            )
+    (
+        local_path_hint,
+        dropbox_path_hint,
+        target_user_id,
+        extra_dict,
+    ) = _extract_preview_context(props, telegram_user_id)
 
     final_path: Optional[Path] = None
     dropbox_path = dropbox_path_hint
@@ -293,6 +315,151 @@ async def _notify_preview_job_completion(
 
     logger.info("Preview video sent to user %s for job %s", target_user_id, job_id)
     return target_user_id
+
+async def _notify_preview_job_failure(
+    telegram_user_id: int,
+    job: dict,
+    job_name: str,
+    login: str,
+    password: str,
+) -> Optional[int]:
+    """Notify requester about a failed preview job and include worker error details."""
+
+    job_id = job.get("_id", "")
+    props = job.get("Props", {})
+
+    (
+        _local_hint,
+        _dropbox_hint,
+        target_user_id,
+        _extra_dict,
+    ) = _extract_preview_context(props, telegram_user_id)
+
+    safe_name = html.escape(job_name)
+    failure_title = f"❌ Preview for {safe_name} failed."
+    stored_message = pop_preview_message(job_id)
+    edited_progress: Optional[Tuple[int, int]] = None
+    if stored_message:
+        chat_id, message_id = stored_message
+        try:
+            await bot.edit_message_text(
+                failure_title,
+                chat_id=chat_id,
+                message_id=message_id,
+            )
+            edited_progress = (chat_id, message_id)
+        except Exception as edit_error:
+            logger.warning(
+                "Failed to edit preview progress message for job %s failure: %s",
+                job_id,
+                edit_error,
+            )
+            edited_progress = None
+
+    worker_names: List[str] = []
+    try:
+        from app.services import get_job_tasks, get_worker_report_contents
+
+        tasks = await get_job_tasks(login, password, job_id)
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            worker = task.get("Slave") or task.get("Worker") or task.get("Machine")
+            if worker:
+                worker_names.append(str(worker))
+    except Exception as task_error:
+        logger.warning(
+            "Could not gather worker names for failed preview job %s: %s",
+            job_id,
+            task_error,
+        )
+
+    if not worker_names:
+        fallback_worker = props.get("Mach") or props.get("Slave")
+        if fallback_worker:
+            worker_names.append(str(fallback_worker))
+
+    worker_names = list(dict.fromkeys(worker_names))
+
+    error_segments: List[str] = []
+    try:
+        if worker_names:
+            reports = await get_worker_report_contents(login, password, worker_names)
+            for report in reports:
+                report_type = report.get("type")
+                if str(report_type) not in {"1", "ErrorReport"}:
+                    continue
+                contents = report.get("contents") or ""
+                if not contents:
+                    continue
+                worker_label = html.escape(str(report.get("worker") or "Unknown worker"))
+                title_raw = report.get("title")
+                header = f"• {worker_label}"
+                if title_raw:
+                    header += f" — {html.escape(str(title_raw))}"
+                snippet_lines = contents.strip().splitlines()
+                if not snippet_lines:
+                    continue
+                snippet = "\n".join(snippet_lines[:20])
+                escaped_snippet = html.escape(snippet)
+                error_segments.append(f"{header}\n<pre>{escaped_snippet}</pre>")
+    except Exception as reports_error:
+        logger.warning(
+            "Failed to fetch worker reports for job %s: %s",
+            job_id,
+            reports_error,
+        )
+
+    if error_segments:
+        body = "\n\n".join(error_segments)
+    else:
+        body = "No worker error logs were retrieved."
+
+    full_message = f"{failure_title}\n\n{body}"
+    if edited_progress is not None:
+        chat_id, message_id = edited_progress
+        try:
+            await bot.edit_message_text(
+                full_message,
+                chat_id=chat_id,
+                message_id=message_id,
+                parse_mode="HTML",
+            )
+        except Exception as edit_error:
+            logger.warning(
+                "Failed to update preview failure message for job %s: %s",
+                job_id,
+                edit_error,
+            )
+            await bot.send_message(
+                target_user_id,
+                full_message,
+                parse_mode="HTML",
+            )
+    else:
+        await bot.send_message(
+            target_user_id,
+            full_message,
+            parse_mode="HTML",
+        )
+
+    try:
+        from app.services import delete_job
+
+        deleted = await delete_job(login, password, job_id)
+        if deleted:
+            logger.info("Failed preview job %s deleted from Deadline", job_id)
+        else:
+            logger.warning("Failed to delete preview job %s from Deadline", job_id)
+    except Exception as delete_error:
+        logger.warning(
+            "Error deleting failed preview job %s: %s",
+            job_id,
+            delete_error,
+        )
+
+    return target_user_id
+
 
 # ============================================================================
 # === DECORATORS ===
@@ -956,8 +1123,6 @@ async def job_progress_watcher(bot):
 
                                 # Verify job status
                                 stat = job.get("Stat", 0)
-                                if stat != 3:
-                                    continue
 
                                 props = job.get("Props", {})
                                 name = props.get("Name", "").split("/")[-1]
@@ -992,10 +1157,40 @@ async def job_progress_watcher(bot):
                                             job_id,
                                         )
 
-                                notified_key = (
-                                    job_id,
-                                    preview_owner_id if preview_owner_id is not None else telegram_user_id,
+                                is_preview_job = (
+                                    "Preview job generated by TasksBot" in comment
+                                    or name.endswith(" - Preview")
+                                    or extra_dict.get("PreviewJob") == "1"
                                 )
+
+                                if is_preview_job and preview_owner_id is not None and preview_owner_id != telegram_user_id:
+                                    continue
+
+                                target_user_for_cache = (
+                                    preview_owner_id if preview_owner_id is not None else telegram_user_id
+                                )
+                                notified_key = (job_id, target_user_for_cache)
+
+                                if stat == 4 and is_preview_job:
+                                    if notified_key in notified_jobs:
+                                        continue
+
+                                    notified_user_id = await _notify_preview_job_failure(
+                                        telegram_user_id,
+                                        job,
+                                        name,
+                                        login,
+                                        decrypted_password,
+                                    )
+                                    resolved_user_id = (
+                                        notified_user_id or preview_owner_id or telegram_user_id
+                                    )
+                                    notified_jobs.add((job_id, resolved_user_id))
+                                    continue
+
+                                if stat != 3:
+                                    continue
+
                                 if notified_key in notified_jobs:
                                     continue
 
@@ -1012,17 +1207,7 @@ async def job_progress_watcher(bot):
                                 except Exception:
                                     continue
 
-                                is_preview_job = (
-                                    "Preview job generated by TasksBot" in comment
-                                    or name.endswith(" - Preview")
-                                    or extra_dict.get("PreviewJob") == "1"
-                                )
-
-                                # Always process preview jobs regardless of notification settings
                                 if is_preview_job:
-                                    if preview_owner_id is not None and preview_owner_id != telegram_user_id:
-                                        continue
-
                                     notified_user_id = await _notify_preview_job_completion(
                                         telegram_user_id,
                                         job,
@@ -1030,11 +1215,12 @@ async def job_progress_watcher(bot):
                                         login,
                                         decrypted_password,
                                     )
-                                    resolved_user_id = notified_user_id or telegram_user_id
+                                    resolved_user_id = (
+                                        notified_user_id or preview_owner_id or telegram_user_id
+                                    )
                                     notified_jobs.add((job_id, resolved_user_id))
                                     continue
 
-                                # Only send regular job notifications if user has notifications enabled
                                 if not has_notifications:
                                     continue
 

@@ -170,6 +170,96 @@ async def get_workers_by_credentials(login: str, password: str) -> List[Dict[str
     return await _fetch_workers(login, password)
 
 
+async def get_worker_report_contents(
+    login: str,
+    password: str,
+    worker_names: List[str],
+) -> List[Dict[str, Any]]:
+    """Fetch worker report contents (including error logs) for specified workers."""
+
+    filtered_names = []
+    seen = set()
+    for name in worker_names:
+        if not name:
+            continue
+        normalized = str(name).strip()
+        if not normalized:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        filtered_names.append(normalized)
+
+    if not filtered_names:
+        return []
+
+    params = [("Data", "reportcontents")]
+    for name in filtered_names:
+        params.append(("Name", name))
+
+    url = f"{settings.base_api_url}/slaves"
+    session = await get_aiosession()
+    auth = aiohttp.BasicAuth(login, password)
+    async with session.get(url, params=params, auth=auth, ssl=False) as resp:
+        text = await resp.text()
+        if resp.status != 200:
+            logger.error(
+                "Failed to fetch worker report contents (%s): %s",
+                resp.status,
+                text,
+            )
+            return []
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as decode_error:
+            logger.error(
+                "Worker report contents returned invalid JSON: %s (error: %s)",
+                text[:200],
+                decode_error,
+            )
+            return []
+
+    reports: List[Dict[str, Any]] = []
+
+    def walk(node: Any, current_worker: Optional[str] = None) -> None:
+        if isinstance(node, dict):
+            worker = (
+                node.get("Slave")
+                or node.get("Worker")
+                or node.get("Name")
+                or node.get("WorkerName")
+                or current_worker
+            )
+            report_type = node.get("ReportType")
+            if report_type is None and "Type" in node:
+                report_type = node.get("Type")
+            contents = (
+                node.get("Contents")
+                or node.get("ReportContents")
+                or node.get("Content")
+                or node.get("Text")
+            )
+            if contents is not None and report_type is not None:
+                reports.append(
+                    {
+                        "worker": worker,
+                        "type": report_type,
+                        "contents": contents,
+                        "title": node.get("Title") or node.get("Filename"),
+                        "timestamp": node.get("Date") or node.get("Timestamp"),
+                    }
+                )
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    walk(value, worker)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item, current_worker)
+
+    walk(data)
+    return reports
+
+
 async def get_job_info(login: str, password: str, job_id: str) -> Optional[Dict[str, Any]]:
     """
     Get detailed information about a specific job.
@@ -1120,12 +1210,29 @@ async def create_video_from_job(
         arguments_str = python_args_str
         command_line = f"{python_exec} {python_args_str}"
 
+    startup_dir: Optional[str] = render_output_dir
+    try:
+        if startup_dir and not Path(startup_dir).exists():
+            logger.warning(
+                "Preview startup directory %s is not accessible; using default working directory",
+                startup_dir,
+            )
+            startup_dir = None
+    except Exception as path_error:
+        logger.warning(
+            "Could not verify preview startup directory %s: %s",
+            startup_dir,
+            path_error,
+        )
+        startup_dir = None
+
     plugin_info = {
         "Executable": executable,
         "Arguments": arguments_str,
         "Shell": "default",
-        "StartupDirectory": render_output_dir,
     }
+    if startup_dir:
+        plugin_info["StartupDirectory"] = startup_dir
 
     try:
         submission_response = await submit_deadline_job(
