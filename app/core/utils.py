@@ -129,8 +129,12 @@ async def _notify_preview_job_completion(
     job_name: str,
     login: str,
     password: str,
-) -> None:
-    """Send ready preview video to the user when the ffmpeg job finishes."""
+) -> Optional[int]:
+    """Send ready preview video to the user when the ffmpeg job finishes.
+
+    Returns the Telegram user ID that received the notification, or ``None``
+    if the notification could not be delivered.
+    """
     props = job.get("Props", {})
     job_id = job.get("_id", "")
 
@@ -142,8 +146,15 @@ async def _notify_preview_job_completion(
         extra_dict = {}
     local_path_hint = extra_dict.get("PreviewLocal", local_path_hint)
     dropbox_path_hint = extra_dict.get("PreviewDropbox", dropbox_path_hint)
+    preview_user_id_str = extra_dict.get("PreviewTelegram")
 
-    for key in ("ExtraInfoKeyValue0", "ExtraInfoKeyValue1", "ExtraInfoKeyValue2"):
+    for key in (
+        "ExtraInfoKeyValue0",
+        "ExtraInfoKeyValue1",
+        "ExtraInfoKeyValue2",
+        "ExtraInfoKeyValue3",
+        "ExtraInfoKeyValue4",
+    ):
         value = props.get(key)
         if not value or "=" not in value:
             continue
@@ -152,6 +163,19 @@ async def _notify_preview_job_completion(
             local_path_hint = payload
         elif prefix == "PreviewDropbox":
             dropbox_path_hint = payload
+        elif prefix == "PreviewTelegram":
+            preview_user_id_str = payload
+
+    target_user_id = telegram_user_id
+    if preview_user_id_str:
+        try:
+            target_user_id = int(str(preview_user_id_str).strip())
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid PreviewTelegram value '%s' for job %s",
+                preview_user_id_str,
+                job_id,
+            )
 
     final_path: Optional[Path] = None
     dropbox_path = dropbox_path_hint
@@ -182,11 +206,11 @@ async def _notify_preview_job_completion(
         local_path = Path(local_path_hint) if local_path_hint else None
         if local_path is None:
             await bot.send_message(
-                telegram_user_id,
+                target_user_id,
                 f"⚠️ Preview for {job_name} is ready, but the file path is missing.",
             )
             logger.warning("Preview job %s has no recorded paths", job_id)
-            return
+            return None
 
         for _ in range(6):
             if local_path.exists():
@@ -195,14 +219,14 @@ async def _notify_preview_job_completion(
 
         if not local_path.exists():
             await bot.send_message(
-                telegram_user_id,
+                target_user_id,
                 (
                     f"⚠️ Preview for {job_name} finished, but the file is still not available at:\n"
                     f"{local_path}"
                 ),
             )
             logger.warning("Preview file %s not found after job %s", local_path, job_id)
-            return
+            return None
 
         final_path = local_path
         dropbox_path = dropbox_path or dropbox_path_hint
@@ -218,9 +242,11 @@ async def _notify_preview_job_completion(
     caption = "\n".join(caption_parts)
 
     ready_text = f"🎬 Preview for {job_name} is ready."
+    target_chat_id = target_user_id
     stored_message = pop_preview_message(job_id)
     if stored_message:
         chat_id, message_id = stored_message
+        target_chat_id = chat_id
         try:
             await bot.edit_message_text(
                 ready_text,
@@ -233,14 +259,15 @@ async def _notify_preview_job_completion(
                 job_id,
                 edit_error,
             )
-            await bot.send_message(telegram_user_id, ready_text)
+            target_chat_id = target_user_id
+            await bot.send_message(target_chat_id, ready_text)
     else:
         await bot.send_message(
-            telegram_user_id,
+            target_chat_id,
             ready_text,
         )
     await bot.send_video(
-        telegram_user_id,
+        target_chat_id,
         FSInputFile(str(final_path)),
         caption=caption,
         parse_mode="HTML",
@@ -264,7 +291,8 @@ async def _notify_preview_job_completion(
             delete_error,
         )
 
-    logger.info("Preview video sent to user %s for job %s", telegram_user_id, job_id)
+    logger.info("Preview video sent to user %s for job %s", target_user_id, job_id)
+    return target_user_id
 
 # ============================================================================
 # === DECORATORS ===
@@ -874,94 +902,135 @@ async def job_progress_watcher(bot):
 
                                 # Verify job status
                                 stat = job.get("Stat", 0)
-                                if stat == 3 and (job_id, telegram_user_id) not in notified_jobs:  # Completed
-                                    date_comp_str = job.get("DateComp") or job.get("Props", {}).get("DateComp")
-                                    if not date_comp_str or date_comp_str == "0001-01-01T00:00:00Z":
-                                        continue
+                                if stat != 3:
+                                    continue
 
+                                props = job.get("Props", {})
+                                name = props.get("Name", "").split("/")[-1]
+                                comment = props.get("Cmmt", "")
+                                extra_dict = props.get("ExDic") or {}
+                                if not isinstance(extra_dict, dict):
+                                    extra_dict = {}
+
+                                preview_owner_str = extra_dict.get("PreviewTelegram")
+                                for key in (
+                                    "ExtraInfoKeyValue0",
+                                    "ExtraInfoKeyValue1",
+                                    "ExtraInfoKeyValue2",
+                                    "ExtraInfoKeyValue3",
+                                    "ExtraInfoKeyValue4",
+                                ):
+                                    value = props.get(key)
+                                    if not value or "=" not in value:
+                                        continue
+                                    prefix, payload = value.split("=", 1)
+                                    if prefix == "PreviewTelegram":
+                                        preview_owner_str = payload
+
+                                preview_owner_id: Optional[int] = None
+                                if preview_owner_str:
                                     try:
-                                        date_comp = datetime.fromisoformat(date_comp_str.replace("Z", "+00:00"))
-                                        now = datetime.now(timezone.utc)
-                                        diff = now - date_comp
-                                        if diff > timedelta(minutes=10):
-                                            continue
-                                    except Exception:
+                                        preview_owner_id = int(str(preview_owner_str).strip())
+                                    except (TypeError, ValueError):
+                                        logger.warning(
+                                            "Invalid PreviewTelegram value '%s' for job %s",
+                                            preview_owner_str,
+                                            job_id,
+                                        )
+
+                                notified_key = (
+                                    job_id,
+                                    preview_owner_id if preview_owner_id is not None else telegram_user_id,
+                                )
+                                if notified_key in notified_jobs:
+                                    continue
+
+                                date_comp_str = job.get("DateComp") or props.get("DateComp")
+                                if not date_comp_str or date_comp_str == "0001-01-01T00:00:00Z":
+                                    continue
+
+                                try:
+                                    date_comp = datetime.fromisoformat(date_comp_str.replace("Z", "+00:00"))
+                                    now = datetime.now(timezone.utc)
+                                    diff = now - date_comp
+                                    if diff > timedelta(minutes=10):
                                         continue
-                                    props = job.get("Props", {})
-                                    name = props.get("Name", "").split("/")[-1]
-                                    comment = props.get("Cmmt", "")
-                                    extra_dict = props.get("ExDic") or {}
-                                    if not isinstance(extra_dict, dict):
-                                        extra_dict = {}
-                                    is_preview_job = (
-                                        "Preview job generated by TasksBot" in comment
-                                        or name.endswith(" - Preview")
-                                        or extra_dict.get("PreviewJob") == "1"
-                                    )
+                                except Exception:
+                                    continue
 
-                                    # Always process preview jobs regardless of notification settings
-                                    if is_preview_job:
-                                        await _notify_preview_job_completion(
-                                            telegram_user_id,
-                                            job,
-                                            name,
-                                            login,
-                                            decrypted_password,
-                                        )
-                                        notified_jobs.add((job_id, telegram_user_id))
+                                is_preview_job = (
+                                    "Preview job generated by TasksBot" in comment
+                                    or name.endswith(" - Preview")
+                                    or extra_dict.get("PreviewJob") == "1"
+                                )
+
+                                # Always process preview jobs regardless of notification settings
+                                if is_preview_job:
+                                    if preview_owner_id is not None and preview_owner_id != telegram_user_id:
                                         continue
 
-                                    # Only send regular job notifications if user has notifications enabled
-                                    if not has_notifications:
-                                        continue
-
-                                    if scope == "own":
-                                        job_owner = (
-                                            props.get("User")
-                                            or job.get("UserName")
-                                            or ""
-                                        )
-                                        if not job_owner:
-                                            continue
-                                        normalized_login = (
-                                            str(login).split("\\")[-1].split("/")[-1].lower()
-                                        )
-                                        normalized_owner = (
-                                            str(job_owner).split("\\")[-1].split("/")[-1].lower()
-                                        )
-                                        if normalized_owner != normalized_login:
-                                            continue
-
-                                    batch = props.get("Batch") or "No Batch"
-                                    message_text = (
-                                        "✅ Job completed:\n"
-                                        f"• Batch: {batch}\n"
-                                        f"• Name: {name}"
-                                    )
-
-                                    preview_markup = InlineKeyboardMarkup(
-                                        inline_keyboard=[
-                                            [
-                                                InlineKeyboardButton(
-                                                    text="🔍 Preview",
-                                                    callback_data=f"preview_job:{job_id}"
-                                                )
-                                            ]
-                                        ]
-                                    )
-
-                                    await bot.send_message(
+                                    notified_user_id = await _notify_preview_job_completion(
                                         telegram_user_id,
-                                        message_text,
-                                        reply_markup=preview_markup
-                                    )
-                                    logger.info(
-                                        "Completion notification sent to user %s for job %s (%s)",
-                                        telegram_user_id,
-                                        job_id,
+                                        job,
                                         name,
+                                        login,
+                                        decrypted_password,
                                     )
-                                    notified_jobs.add((job_id, telegram_user_id))
+                                    resolved_user_id = notified_user_id or telegram_user_id
+                                    notified_jobs.add((job_id, resolved_user_id))
+                                    continue
+
+                                # Only send regular job notifications if user has notifications enabled
+                                if not has_notifications:
+                                    continue
+
+                                if scope == "own":
+                                    job_owner = (
+                                        props.get("User")
+                                        or job.get("UserName")
+                                        or ""
+                                    )
+                                    if not job_owner:
+                                        continue
+                                    normalized_login = (
+                                        str(login).split("\\")[-1].split("/")[-1].lower()
+                                    )
+                                    normalized_owner = (
+                                        str(job_owner).split("\\")[-1].split("/")[-1].lower()
+                                    )
+                                    if normalized_owner != normalized_login:
+                                        continue
+
+                                batch = props.get("Batch") or "No Batch"
+                                message_text = (
+                                    "✅ Job completed:\n"
+                                    f"• Batch: {batch}\n"
+                                    f"• Name: {name}"
+                                )
+
+                                preview_markup = InlineKeyboardMarkup(
+                                    inline_keyboard=[
+                                        [
+                                            InlineKeyboardButton(
+                                                text="🔍 Preview",
+                                                callback_data=f"preview_job:{job_id}"
+                                            )
+                                        ]
+                                    ]
+                                )
+
+                                await bot.send_message(
+                                    telegram_user_id,
+                                    message_text,
+                                    reply_markup=preview_markup
+                                )
+                                logger.info(
+                                    "Completion notification sent to user %s for job %s (%s)",
+                                    telegram_user_id,
+                                    job_id,
+                                    name,
+                                )
+                                notified_jobs.add((job_id, telegram_user_id))
                         elif resp.status == 401:
                             logger.warning(
                                 "Watcher: Unauthorized for user %s. Disabling notifications and requesting re-login.",

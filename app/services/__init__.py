@@ -1047,6 +1047,7 @@ async def create_video_from_job(
         "ExtraInfoKeyValue0": f"PreviewLocal={expected_local_path}",
         "ExtraInfoKeyValue1": f"PreviewDropbox={expected_dropbox_video}",
         "ExtraInfoKeyValue2": "PreviewJob=1",
+        "ExtraInfoKeyValue3": f"PreviewTelegram={telegram_user_id}",
     }
     if not is_job_completed:
         preview_job_info["JobDependency0"] = job_id
