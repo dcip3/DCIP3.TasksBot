@@ -8,6 +8,7 @@ from aiogram.types import Message
 from app.bot.handlers.auth import LoginStates
 from app.bot.handlers.realtime import stop_realtime_for_chat
 from app.core.bot_core import bot
+from app.core.config import settings
 from app.core.utils import get_main_keyboard
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,10 @@ async def cmd_start(message: Message) -> None:
 async def cmd_setup_menu(message: Message) -> None:
     """Setup the menu button for Mini App."""
     from app.core.utils import setup_menu_button
+
+    if not settings.mini_app_enabled:
+        await message.answer("Mini app integration is disabled in configuration.")
+        return
 
     try:
         await message.answer("🔄 Setting up menu button...")

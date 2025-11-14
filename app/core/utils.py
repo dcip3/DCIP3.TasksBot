@@ -541,6 +541,10 @@ async def setup_menu_button():
     Setup the menu button for Mini App.
     This creates a button in the chat menu that opens the Mini App.
     """
+    if not settings.mini_app_enabled:
+        logger.info("Skipping menu button setup because MINI_APP_ENABLED is false")
+        return
+
     try:
         # Mini App URL: use localhost for development, HTTPS domain for production
         # mini_app_url defaults to the value provided in settings

@@ -80,14 +80,23 @@ All configuration lives in `.env`. Use the tables below as a checklist.
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
-### Telegram / WebApp
+### Telegram
 | Variable | Description | How to obtain | Example |
 |----------|-------------|---------------|---------|
 | `TG_API_TOKEN` | Telegram bot token | @BotFather | `123456789:ABCdef...` |
-| `MINI_APP_URL` | URL of the deployed mini-app | Your hosting | `https://tasks.example.com/app` |
 
 ```bash
 TG_API_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
+```
+
+### Mini App
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `MINI_APP_ENABLED` | `true` to register the Tasks mini app/menu button | `true` |
+| `MINI_APP_URL` | HTTPS URL of the deployed mini-app | `https://tasks.example.com/app` |
+
+```bash
+MINI_APP_ENABLED=true
 MINI_APP_URL=https://tasks.example.com/app
 ```
 

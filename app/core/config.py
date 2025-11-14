@@ -99,6 +99,7 @@ class Settings(BaseSettings):
     job_watcher_interval_preview: int = Field(15, ge=5, description="Job monitoring interval in seconds (when preview jobs are active)")
 
     # Mini App Configuration
+    mini_app_enabled: bool = Field(True, description="Enable Telegram mini app integration")
     mini_app_url: str = Field("http://localhost:3000", description="URL for the Telegram mini app")
 
     # CORS Configuration
