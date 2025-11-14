@@ -22,8 +22,8 @@ from app.integrations.video_helpers import (
     assemble_video_from_jpg,
     cleanup_job_files,
     cleanup_old_files,
-    compress_video_if_needed,
     get_file_size_mb,
+    prepare_video_for_delivery,
 )
 from app.services import (
     ALLOWED_WORKER_STATUSES,
@@ -777,25 +777,26 @@ async def render_preview_via_server(callback_query: CallbackQuery, job_id: str) 
             reply_markup=cancel_keyboard,
         )
         video_path_obj = Path(video_path)
+        max_video_size_mb = 45.0
         video_size_mb = get_file_size_mb(video_path_obj)
 
-        if video_size_mb > 45.0:
+        if video_size_mb > max_video_size_mb:
             await progress_msg.edit_text(
-                f"🗜️ Step 3.5: Compressing video ({video_size_mb:.1f} MB → target <45 MB)...",
+                f"🗜️ Step 3.5: Compressing video ({video_size_mb:.1f} MB → target <{max_video_size_mb:.0f} MB)...",
                 reply_markup=cancel_keyboard,
             )
             if await finalize_cancellation():
                 return
 
-            final_video_path = await asyncio.to_thread(
-                compress_video_if_needed, video_path_obj, 45.0
-            )
-            final_size_mb = get_file_size_mb(final_video_path)
-            if await finalize_cancellation():
-                return
-        else:
-            final_video_path = video_path_obj
-            final_size_mb = video_size_mb
+        preparation = await prepare_video_for_delivery(
+            video_path_obj,
+            dropbox_video_path,
+            max_size_mb=max_video_size_mb,
+            initial_size_mb=video_size_mb,
+        )
+        final_video_path = preparation.video_path
+        final_size_mb = preparation.size_mb
+        fallback_message = preparation.fallback_message
 
         if await finalize_cancellation():
             return
@@ -819,19 +820,32 @@ async def render_preview_via_server(callback_query: CallbackQuery, job_id: str) 
             pass
 
         caption = f"📁 {project_name}\n<code>{dropbox_video_path or ''}</code>"
-        if callback_query.message:
-            await callback_query.message.answer_video(
-                video=FSInputFile(str(final_video_path)),
-                caption=caption,
-                parse_mode="HTML",
-            )
+        if fallback_message:
+            if callback_query.message:
+                await callback_query.message.answer(
+                    fallback_message,
+                    parse_mode="HTML",
+                )
+            else:
+                await bot.send_message(
+                    callback_query.from_user.id,
+                    fallback_message,
+                    parse_mode="HTML",
+                )
         else:
-            await bot.send_video(
-                callback_query.from_user.id,
-                FSInputFile(str(final_video_path)),
-                caption=caption,
-                parse_mode="HTML",
-            )
+            if callback_query.message:
+                await callback_query.message.answer_video(
+                    video=FSInputFile(str(final_video_path)),
+                    caption=caption,
+                    parse_mode="HTML",
+                )
+            else:
+                await bot.send_video(
+                    callback_query.from_user.id,
+                    FSInputFile(str(final_video_path)),
+                    caption=caption,
+                    parse_mode="HTML",
+                )
 
         with contextlib.suppress(Exception):
             await progress_msg.delete()

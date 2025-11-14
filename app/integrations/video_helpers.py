@@ -15,6 +15,7 @@ import aiofiles
 import shutil
 import time
 from functools import lru_cache
+from dataclasses import dataclass
 
 from app.core.config import settings
 
@@ -251,6 +252,59 @@ def compress_video_if_needed(video_path: Path, max_size_mb: float = 45.0) -> Pat
     except Exception as e:
         logger.error(f"Error compressing video: {e}")
         return video_path
+
+
+@dataclass
+class VideoDeliveryPreparation:
+    video_path: Path
+    size_mb: float
+    fallback_message: Optional[str]
+    was_compressed: bool = False
+
+
+async def prepare_video_for_delivery(
+    video_path: Path,
+    dropbox_path: Optional[str] = None,
+    max_size_mb: float = 45.0,
+    initial_size_mb: Optional[float] = None,
+) -> VideoDeliveryPreparation:
+    """
+    Ensure a video is ready to be delivered via Telegram by enforcing file-size limits.
+
+    Returns a dataclass with the potentially updated video path, its size, and an optional
+    fallback message when the file still exceeds the limit even after compression.
+    """
+    size_mb = initial_size_mb if initial_size_mb is not None else get_file_size_mb(video_path)
+    was_compressed = False
+
+    if size_mb > max_size_mb:
+        video_path = await asyncio.to_thread(
+            compress_video_if_needed,
+            video_path,
+            max_size_mb,
+        )
+        size_mb = get_file_size_mb(video_path)
+        was_compressed = True
+
+    fallback_message = None
+    if size_mb > max_size_mb:
+        location_hint = (
+            f"<code>{dropbox_path}</code>"
+            if dropbox_path
+            else f"<code>{video_path}</code>"
+        )
+        fallback_message = (
+            "⚠️ Preview video is ready but still too large to send via Telegram "
+            f"({size_mb:.1f} MB > {max_size_mb:.0f} MB).\n"
+            f"Please download it manually:\n{location_hint}"
+        )
+
+    return VideoDeliveryPreparation(
+        video_path=video_path,
+        size_mb=size_mb,
+        fallback_message=fallback_message,
+        was_compressed=was_compressed,
+    )
 
 def cleanup_job_files(job_id: str):
     """

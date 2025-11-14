@@ -36,7 +36,7 @@ from apscheduler.triggers.cron import CronTrigger
 from app.core.config import settings
 from app.core.bot_core import bot, dp, init_aiosession, close_aiosession
 from app.core.database import init_db, close_db
-from app.integrations.video_helpers import compress_video_if_needed, get_file_size_mb
+from app.integrations.video_helpers import prepare_video_for_delivery
 
 logger = logging.getLogger(__name__)
 
@@ -253,10 +253,14 @@ async def _notify_preview_job_completion(
         final_path = local_path
         dropbox_path = dropbox_path or dropbox_path_hint
 
-    size_mb = get_file_size_mb(final_path)
-    if size_mb > 45.0:
-        final_path = await asyncio.to_thread(compress_video_if_needed, final_path, 45.0)
-        size_mb = get_file_size_mb(final_path)
+    max_video_size_mb = 45.0
+    preparation = await prepare_video_for_delivery(
+        final_path,
+        dropbox_path,
+        max_size_mb=max_video_size_mb,
+    )
+    final_path = preparation.video_path
+    size_mb = preparation.size_mb
 
     caption_parts = [f"📁 {final_path.name}"]
     if dropbox_path:
@@ -288,12 +292,24 @@ async def _notify_preview_job_completion(
             target_chat_id,
             ready_text,
         )
-    await bot.send_video(
-        target_chat_id,
-        FSInputFile(str(final_path)),
-        caption=caption,
-        parse_mode="HTML",
-    )
+    if preparation.fallback_message is None:
+        await bot.send_video(
+            target_chat_id,
+            FSInputFile(str(final_path)),
+            caption=caption,
+            parse_mode="HTML",
+        )
+    else:
+        logger.warning(
+            "Preview video %s is still %.1f MB after compression; sending fallback message",
+            final_path,
+            size_mb,
+        )
+        await bot.send_message(
+            target_chat_id,
+            preparation.fallback_message,
+            parse_mode="HTML",
+        )
 
     if downloaded_temp:
         await asyncio.to_thread(final_path.unlink, missing_ok=True)
