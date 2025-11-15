@@ -8,6 +8,7 @@ This module initializes both the Telegram bot and FastAPI server for mini app su
 import asyncio
 import logging
 import uvicorn
+from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -101,10 +102,18 @@ async def health():
 
 if __name__ == "__main__":
     # Run with uvicorn
+    reload_enabled = settings.dev_mode
+    reload_kwargs = {}
+    if reload_enabled:
+        # Limit watch scope to source directories to avoid reloading on storage/temp writes
+        reload_kwargs["reload_dirs"] = ["app", str(Path(__file__).resolve().parent)]
+
+    logger.info("Starting uvicorn (reload=%s)", reload_enabled)
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=8000,
-        reload=settings.dev_mode,
-        log_level="info"
+        reload=reload_enabled,
+        log_level="info",
+        **reload_kwargs,
     )
