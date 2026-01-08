@@ -96,7 +96,7 @@ class Settings(BaseSettings):
 
     # Job monitoring intervals (seconds)
     job_watcher_interval_normal: int = Field(60, ge=5, description="Job monitoring interval in seconds (normal mode)")
-    job_watcher_interval_preview: int = Field(15, ge=5, description="Job monitoring interval in seconds (when preview jobs are active)")
+    job_watcher_interval_preview: int = Field(5, ge=5, description="Job monitoring interval in seconds (when preview jobs are active)")
 
     # Development mode
     dev_mode: bool = Field(False, description="Enable development mode (disables some security checks)")

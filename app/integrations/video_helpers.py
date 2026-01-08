@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import os
 import logging
+import contextlib
 import gc
 from typing import Optional, List, Tuple, Union
 from PIL import Image
@@ -218,40 +219,106 @@ def compress_video_if_needed(video_path: Path, max_size_mb: float = 45.0) -> Pat
         
     # Calculate target bitrate (in kbps) based on desired file size
     # Formula: bitrate = target_size_bytes * 8 / duration_seconds / 1000
-    from .utils import get_video_duration
+    from app.core.utils import get_video_duration
     duration = get_video_duration(video_path)
-    if not duration:
-        logger.error(f"Could not get duration for {video_path}")
-        return video_path
-        
-    target_size_bytes = max_size_mb * 1024 * 1024
-    target_bitrate = int((target_size_bytes * 8) / duration / 1000)
-    
-    # Create compressed version
-    compressed_path = video_path.parent / f"{video_path.stem}_compressed.mp4"
-    try:
+
+    target_bitrate = None
+    min_bitrate = 200
+    if duration and duration > 0:
+        target_size_bytes = max_size_mb * 1024 * 1024 * 0.92
+        target_bitrate = int((target_size_bytes * 8) / duration / 1000)
+
+    def _run_two_pass(
+        output_path: Path,
+        bitrate_k: int,
+        passlogfile: Path,
+    ) -> Optional[Path]:
+        base_cmd = [
+            "ffmpeg", "-y",
+            "-i", str(video_path),
+            "-c:v", "libx264",
+            "-b:v", f"{bitrate_k}k",
+            "-maxrate", f"{int(bitrate_k * 1.2)}k",
+            "-bufsize", f"{int(bitrate_k * 2)}k",
+            "-preset", "medium",
+            "-pix_fmt", "yuv420p",
+            "-an",
+        ]
+        passlog_arg = str(passlogfile)
+        cmd_pass1 = base_cmd + ["-pass", "1", "-passlogfile", passlog_arg, "-f", "mp4", os.devnull]
+        cmd_pass2 = base_cmd + ["-pass", "2", "-passlogfile", passlog_arg, str(output_path)]
+        subprocess.run(cmd_pass1, check=True, capture_output=True)
+        subprocess.run(cmd_pass2, check=True, capture_output=True)
+        return output_path
+
+    def _run_crf(
+        output_path: Path,
+        crf: int,
+        preset: str = "slow",
+    ) -> Optional[Path]:
         cmd = [
             "ffmpeg", "-y",
             "-i", str(video_path),
             "-c:v", "libx264",
-            "-b:v", f"{target_bitrate}k",
-            "-maxrate", f"{target_bitrate * 1.5}k",  # Allow some flexibility
-            "-bufsize", f"{target_bitrate * 2}k",
-            "-preset", "medium",  # Balance between speed and compression
-            "-crf", "23",  # Maintain good quality
-            str(compressed_path)
+            "-crf", str(crf),
+            "-preset", preset,
+            "-pix_fmt", "yuv420p",
+            "-an",
+            str(output_path),
         ]
         subprocess.run(cmd, check=True, capture_output=True)
-        
-        # Verify compressed size
-        compressed_size = get_file_size_mb(compressed_path)
-        if compressed_size > max_size_mb:
-            logger.warning(f"Compressed video still too large: {compressed_size:.1f}MB > {max_size_mb}MB")
-            
-        return compressed_path
+        return output_path
+
+    compressed_path = video_path.parent / f"{video_path.stem}_compressed.mp4"
+    best_path: Optional[Path] = None
+    try:
+        if target_bitrate is not None:
+            attempts = [1.0, 0.85, 0.7, 0.55]
+            for idx, factor in enumerate(attempts, start=1):
+                bitrate_k = max(int(target_bitrate * factor), min_bitrate)
+                output_path = (
+                    compressed_path
+                    if idx == 1
+                    else video_path.parent / f"{video_path.stem}_compressed_{idx}.mp4"
+                )
+                passlogfile = video_path.parent / f"{video_path.stem}_passlog_{idx}"
+                try:
+                    best_path = _run_two_pass(output_path, bitrate_k, passlogfile)
+                finally:
+                    for suffix in (".log", ".log.mbtree", "-0.log", "-0.log.mbtree"):
+                        path = Path(f"{passlogfile}{suffix}")
+                        if path.exists():
+                            with contextlib.suppress(Exception):
+                                path.unlink()
+                if best_path and get_file_size_mb(best_path) <= max_size_mb:
+                    best_path.replace(video_path)
+                    return video_path
+
+        crf_values = [24, 26, 28, 30, 32, 34]
+        for crf in crf_values:
+            output_path = video_path.parent / f"{video_path.stem}_compressed_crf{crf}.mp4"
+            best_path = _run_crf(output_path, crf=crf)
+            if best_path and get_file_size_mb(best_path) <= max_size_mb:
+                best_path.replace(video_path)
+                return video_path
+
+        if best_path:
+            compressed_size = get_file_size_mb(best_path)
+            if compressed_size > max_size_mb:
+                logger.warning(
+                    "Compressed video still too large: %.1fMB > %.0fMB",
+                    compressed_size,
+                    max_size_mb,
+                )
+        return video_path
     except Exception as e:
         logger.error(f"Error compressing video: {e}")
         return video_path
+    finally:
+        for candidate in video_path.parent.glob(f"{video_path.stem}_compressed*.mp4"):
+            if candidate.exists():
+                with contextlib.suppress(Exception):
+                    candidate.unlink()
 
 
 @dataclass
@@ -525,43 +592,53 @@ async def convert_exr_folder_to_srgb_optimized(
 
 def assemble_video_from_jpg(conv_root: Path, exr_folder_name: str) -> Path:
     """
-    Assembles MP4 from converted JPG files using ffmpeg.
+    Assembles MP4 from converted JPG/PNG files using ffmpeg.
     
     Args:
-        conv_root (Path): Directory with converted JPG files
+        conv_root (Path): Directory with converted frames
         exr_folder_name (str): Folder name used for output video name
     
     Returns:
         Path: Path to the generated video file
     
     Raises:
-        RuntimeError: if no JPG files found or ffmpeg error occurs
+        RuntimeError: if no frames found or ffmpeg error occurs
     """
     video_path = conv_root / f"{exr_folder_name}.mp4"
-    jpg_pattern = str(conv_root / "*.jpg")
-    if not any(conv_root.glob("*.jpg")):
+    jpg_files = list(conv_root.glob("*.jpg"))
+    jpeg_files = list(conv_root.glob("*.jpeg"))
+    png_files = list(conv_root.glob("*.png"))
+    if not jpg_files and not jpeg_files and not png_files:
         raise RuntimeError("No frames found for video assembly.")
+    if (jpg_files or jpeg_files) and png_files:
+        raise RuntimeError("Mixed JPG and PNG sequences are not supported.")
+    if jpg_files and jpeg_files:
+        raise RuntimeError("Mixed JPG and JPEG sequences are not supported.")
+    if jpg_files:
+        pattern = str(conv_root / "*.jpg")
+    elif jpeg_files:
+        pattern = str(conv_root / "*.jpeg")
+    else:
+        pattern = str(conv_root / "*.png")
     
-    # Use more efficient settings for JPG
     cmd = [
         "ffmpeg",
         "-y",
         "-pattern_type", "glob",
-        "-i", jpg_pattern,
+        "-i", pattern,
         "-c:v", "libx264",
-        "-preset", "fast",  # Fast encoding
-        "-crf", "23",      # Good quality with reasonable size
+        "-preset", "fast",
+        "-crf", "23",
         "-pix_fmt", "yuv420p",
         str(video_path)
     ]
     subprocess.run(cmd, check=True)
     
-    # Delete JPG files after video creation
     try:
-        for jpg_file in conv_root.glob("*.jpg"):
-            jpg_file.unlink()
-        logger.debug("Deleted intermediate JPG files")
+        for frame_file in conv_root.glob(Path(pattern).name):
+            frame_file.unlink()
+        logger.debug("Deleted intermediate frame files")
     except Exception as e:
-        logger.warning(f"Failed to cleanup JPG files: {e}")
+        logger.warning(f"Failed to cleanup frame files: {e}")
     
     return video_path 

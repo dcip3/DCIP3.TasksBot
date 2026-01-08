@@ -20,7 +20,7 @@ HELP_TEXT = (
     "📂 Jobs — browse jobs and actions.\n"
     "🖥️ Workers — check render node status.\n"
     "⚙️ Settings — notifications and preview defaults.\n"
-    "ℹ️ Help — show this help.\n\n"
+    "\n"
     "Commands:\n"
     "/start — start the bot.\n"
     "/login — authenticate.\n"
@@ -41,12 +41,6 @@ async def cmd_start(message: Message) -> None:
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     """Show help text."""
-    await message.answer(HELP_TEXT, reply_markup=get_main_keyboard())
-
-
-@router.message(F.text == "ℹ️ Help")
-async def help_button(message: Message) -> None:
-    """Show help text from the keyboard."""
     await message.answer(HELP_TEXT, reply_markup=get_main_keyboard())
 
 

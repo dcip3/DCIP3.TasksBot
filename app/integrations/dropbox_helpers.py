@@ -17,6 +17,10 @@ from app.core.config import settings
 from app.core.utils import make_progress_bar
 
 logger = logging.getLogger(__name__)
+PREVIEW_FRAME_EXTS = {".exr", ".jpg", ".jpeg", ".png"}
+
+def _is_preview_frame(name: str) -> bool:
+    return Path(name).suffix.lower() in PREVIEW_FRAME_EXTS
 
 # Cached Dropbox access token details
 _dropbox_access_token = None
@@ -121,7 +125,7 @@ async def list_folder_cached(session_dbx, path, headers_dbx):
 
 async def count_exr_files(session_dbx: aiohttp.ClientSession, path: str, headers_dbx: dict) -> int:
     """
-    Counts EXR files recursively in a Dropbox folder (excluding cryptomatte and conflicted copies).
+    Counts EXR/JPG/PNG files recursively in a Dropbox folder (excluding cryptomatte and conflicted copies).
     """
     list_url = "https://api.dropboxapi.com/2/files/list_folder"
     
@@ -143,7 +147,7 @@ async def count_exr_files(session_dbx: aiohttp.ClientSession, path: str, headers
         # Skip cryptomatte and conflicted copy files
         if "cryptomatte" in name or "conflicted copy" in name:
             continue
-        if entry[".tag"] == "file" and name.endswith(".exr"):
+        if entry[".tag"] == "file" and _is_preview_frame(entry["name"]):
             count += 1
         elif entry[".tag"] == "folder":
             count += await count_exr_files(session_dbx, entry["path_display"], headers_dbx)
@@ -263,7 +267,12 @@ async def process_file_batch(
     
     # Prepare download tasks for all files in batch
     for file_info in batch:
-        local_file = local_folder / file_info["name"]
+        suffix = Path(file_info["name"]).suffix.lower()
+        if suffix == ".exr":
+            local_file = local_folder / file_info["name"]
+        else:
+            normalized_name = f"{Path(file_info['name']).stem}{suffix}"
+            local_file = conv_folder / normalized_name
         file_queue.mark_processing(str(local_file))
         
         dl_headers = {
@@ -291,13 +300,18 @@ async def process_file_batch(
                 logger.error(f"Failed to download {local_file}")
                 continue
             
-            # Convert file after successful download
-            success, _, error = await asyncio.to_thread(convert_single_exr_file_streaming, (local_file, conv_folder, None, None, None, None, None))
-            if success:
-                file_queue.mark_completed(str(local_file))
+            if local_file.suffix.lower() == ".exr":
+                success, _, error = await asyncio.to_thread(
+                    convert_single_exr_file_streaming,
+                    (local_file, conv_folder, None, None, None, None, None),
+                )
+                if success:
+                    file_queue.mark_completed(str(local_file))
+                else:
+                    file_queue.mark_failed(str(local_file))
+                    logger.error(f"Failed to convert {local_file}: {error}")
             else:
-                file_queue.mark_failed(str(local_file))
-                logger.error(f"Failed to convert {local_file}: {error}")
+                file_queue.mark_completed(str(local_file))
                 
         except Exception as e:
             file_queue.mark_failed(str(local_file))
@@ -334,7 +348,7 @@ async def download_exr_folder_parallel(
     max_concurrent: int = 8
 ):
     """
-    Recursively downloads EXR files from Dropbox folder with parallel processing.
+    Recursively downloads preview frames from Dropbox folder with parallel processing.
     """
     # Use cached list-folder response instead of direct request
     result = await list_folder_cached(session_dbx, path, headers_dbx)
@@ -348,7 +362,7 @@ async def download_exr_folder_parallel(
         # Skip cryptomatte and conflicted copy files
         if "cryptomatte" in name or "conflicted copy" in name:
             continue
-        if entry[".tag"] == "file" and name.endswith(".exr"):
+        if entry[".tag"] == "file" and _is_preview_frame(entry["name"]):
             await file_queue.add(entry)
         elif entry[".tag"] == "folder":
             subfolder = local_folder / entry["name"]
@@ -396,7 +410,7 @@ async def download_exr_folder(
     stop_downloads: dict
 ):
     """
-    Download and convert EXR files from Dropbox folder.
+    Download and convert preview frames from Dropbox folder.
     Uses parallel processing with batching for efficiency.
     """
     # Use cached list-folder response instead of direct request
@@ -418,7 +432,7 @@ async def download_exr_folder(
         if "cryptomatte" in name or "conflicted copy" in name:
             continue
             
-        if entry[".tag"] == "file" and name.endswith(".exr"):
+        if entry[".tag"] == "file" and _is_preview_frame(entry["name"]):
             await file_queue.add(entry)
             
         elif entry[".tag"] == "folder":
@@ -445,7 +459,12 @@ async def download_exr_folder(
         download_tasks = []
         
         for file_info in batch:
-            local_file = local_folder / file_info["name"]
+            suffix = Path(file_info["name"]).suffix.lower()
+            if suffix == ".exr":
+                local_file = local_folder / file_info["name"]
+            else:
+                normalized_name = f"{Path(file_info['name']).stem}{suffix}"
+                local_file = conv_folder / normalized_name
             file_queue.mark_processing(str(local_file))
             
             dl_headers = {
@@ -469,16 +488,22 @@ async def download_exr_folder(
         
         # Process downloaded files
         conversion_tasks = []
+        conversion_items = []
         from app.integrations.video_helpers import convert_single_exr_file_streaming
         
         for success, (_, local_file, file_info) in zip(download_results, download_tasks):
             if success:
-                # Convert file immediately after successful download
-                conversion_tasks.append(
-                    asyncio.create_task(
-                        asyncio.to_thread(convert_single_exr_file_streaming, (local_file, conv_folder, None, None, None, None, None))
+                if Path(file_info["name"]).suffix.lower() == ".exr":
+                    conversion_task = asyncio.create_task(
+                        asyncio.to_thread(
+                            convert_single_exr_file_streaming,
+                            (local_file, conv_folder, None, None, None, None, None),
+                        )
                     )
-                )
+                    conversion_tasks.append(conversion_task)
+                    conversion_items.append(local_file)
+                else:
+                    file_queue.mark_completed(str(local_file))
             else:
                 file_queue.mark_failed(str(local_file))
                 logger.error(f"Failed to download {local_file.name}")
@@ -488,7 +513,7 @@ async def download_exr_folder(
             conversion_results = await asyncio.gather(*conversion_tasks, return_exceptions=True)
             
             # Process conversion results
-            for result, (_, local_file, _) in zip(conversion_results, download_tasks):
+            for result, local_file in zip(conversion_results, conversion_items):
                 if isinstance(result, Exception):
                     file_queue.mark_failed(str(local_file))
                     logger.error(f"Error converting {local_file}: {result}")
@@ -524,7 +549,7 @@ async def download_exr_folder(
 
 async def upload_video_to_dropbox(video_path: Path, metadata: dict, job_id: Optional[str] = None) -> str:
     """
-    Upload a rendered video file back to the Dropbox folder containing the source EXRs.
+    Upload a rendered video file back to the Dropbox folder containing the source frames.
     """
     filename = video_path.name
     exr_parent = str(PurePosixPath(metadata["path_display"]).parent)

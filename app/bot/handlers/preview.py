@@ -609,7 +609,7 @@ async def preview_job_cancel_callback(callback_query: CallbackQuery) -> None:
 
 
 async def render_preview_via_server(callback_query: CallbackQuery, job_id: str) -> None:
-    """Replicate the optimized local render pipeline: download EXRs, convert, assemble, and deliver."""
+    """Replicate the optimized local render pipeline: download frames, convert if needed, assemble, and deliver."""
     if callback_query.from_user is None:
         await callback_query.answer("Error: user not found.", show_alert=True)
         return
@@ -720,16 +720,17 @@ async def render_preview_via_server(callback_query: CallbackQuery, job_id: str) 
                 return
             list_result = await list_resp.json()
 
+        preview_exts = (".exr", ".jpg", ".jpeg", ".png")
         total_files = sum(
             1
             for entry in list_result.get("entries", [])
             if entry.get(".tag") == "file"
-            and entry["name"].lower().endswith(".exr")
+            and entry["name"].lower().endswith(preview_exts)
             and "cryptomatte" not in entry["name"].lower()
             and "conflicted copy" not in entry["name"].lower()
         )
         if total_files <= 0:
-            await progress_msg.edit_text("⚠️ No usable EXR files found for conversion.")
+            await progress_msg.edit_text("⚠️ No usable image files found for conversion.")
             await callback_query.answer("No frames available for preview build.", show_alert=True)
             return
 
@@ -752,7 +753,7 @@ async def render_preview_via_server(callback_query: CallbackQuery, job_id: str) 
 
         conv_dir = Path(settings.conv_dir) / f"{exr_folder_name}_{job_id}"
         await progress_msg.edit_text(
-            "🎬 Step 2: Converting EXR files and creating video...",
+            "🎬 Step 2: Processing frames and creating video...",
             reply_markup=cancel_keyboard,
         )
         if await finalize_cancellation():

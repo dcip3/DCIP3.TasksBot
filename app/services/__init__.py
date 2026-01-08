@@ -815,11 +815,12 @@ async def download_job_folder(login: str, password: str, job_id: str) -> Optiona
         download_url = "https://content.dropboxapi.com/2/files/download"
         file_list = []
             
+        preview_exts = (".exr", ".jpg", ".jpeg", ".png")
         for entry in result.get("entries", []):
             name = entry["name"].lower()
             if "cryptomatte" in name or "conflicted copy" in name:
                 continue
-            if entry[".tag"] == "file" and name.endswith(".exr"):
+            if entry[".tag"] == "file" and name.endswith(preview_exts):
                 api_args = {"path": entry["path_display"]}
                 headers = {
                     "Authorization": f"Bearer {get_fresh_access_token()}",
@@ -831,10 +832,10 @@ async def download_job_folder(login: str, password: str, job_id: str) -> Optiona
                 file_list.append((download_url, headers, local_path))
         
         if not file_list:
-            logger.error("No valid EXR files found in folder")
+            logger.error("No valid image files found in folder")
             return None
                 
-        logger.info(f"Found {len(file_list)} valid EXR files to download")
+        logger.info(f"Found {len(file_list)} valid image files to download")
         return file_list
             
     except Exception as e:
@@ -926,15 +927,20 @@ async def create_video_from_job(
 
     pattern_fmt = re.sub(r"#+", replace_hashes, pattern)
 
+    output_path_clean = output_path.rstrip("\\/") or output_path
+    is_windows_path = "\\" in output_path_clean or ":" in output_path_clean
+
     video_base = Path(template_name).stem if template_name else props.get("Name") or props.get("Batch") or job_id
     video_base = re.sub(r'#+', '', video_base)
     video_base = re.sub(r'%0\d+d', '', video_base)
     video_base = video_base.rstrip('. _')
+    if template_name and Path(template_name).suffix.lower() in {".jpg", ".jpeg", ".png"}:
+        if is_windows_path:
+            video_base = ntpath.basename(output_path_clean)
+        else:
+            video_base = posixpath.basename(output_path_clean)
     video_base = _sanitize_windows_filename(video_base or job_id)
     video_filename = f"{video_base}.mp4"
-
-    output_path_clean = output_path.rstrip("\\/") or output_path
-    is_windows_path = "\\" in output_path_clean or ":" in output_path_clean
 
     if is_windows_path:
         render_output_dir = ntpath.dirname(output_path_clean) or output_path_clean
@@ -999,6 +1005,13 @@ async def create_video_from_job(
             remote_config_path = str(ocio_candidate) if ocio_candidate.is_absolute() else None
 
     apply_color = settings.preview_apply_color_transform
+    input_ext = Path(str(input_sequence_path)).suffix.lower()
+    if input_ext in {".jpg", ".jpeg", ".png"} and apply_color:
+        logger.info(
+            "Disabling preview color transform for non-EXR input pattern: %s",
+            input_sequence_path,
+        )
+        apply_color = False
     if apply_color and not remote_config_path:
         logger.warning(
             "Preview color transform enabled but no OCIO config path available; disabling color transform for job %s",
@@ -1023,6 +1036,8 @@ async def create_video_from_job(
         "medium",
         "--crf",
         "20",
+        "--max-size-mb",
+        "45",
     ]
     script_args.extend(["--color-mode", color_mode])
 

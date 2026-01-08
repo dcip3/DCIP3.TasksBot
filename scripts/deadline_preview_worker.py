@@ -4,7 +4,7 @@ Helper script executed on Deadline workers to build preview videos with proper O
 
 Steps:
 1. Optionally bake a temporary LUT using the supplied OCIO config / display / view.
-2. Invoke ffmpeg to convert the EXR sequence to an MP4 using the baked LUT.
+2. Invoke ffmpeg to convert the image sequence to an MP4 using the baked LUT.
 
 The script expects that PyOpenColorIO, OpenEXR and NumPy (indirectly via PyOpenColorIO) are installed
 in the Python environment available on the worker.
@@ -23,6 +23,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import contextlib
 from pathlib import Path
 from typing import Optional, List, Tuple, Set, Union
 
@@ -384,6 +385,123 @@ def run_ffmpeg(command: list[str]) -> None:
     if completed.returncode != 0:
         raise RuntimeError(f"ffmpeg exited with status {completed.returncode}")
 
+def _resolve_ffprobe_path(ffmpeg_path: str) -> str:
+    if not ffmpeg_path or ffmpeg_path == "ffmpeg":
+        return "ffprobe"
+    ffmpeg_path_obj = Path(ffmpeg_path)
+    if ffmpeg_path_obj.name.lower().endswith("ffmpeg"):
+        return str(ffmpeg_path_obj.with_name("ffprobe"))
+    return "ffprobe"
+
+def _get_video_duration_seconds(video_path: Path, ffprobe_path: str) -> Optional[float]:
+    try:
+        cmd = [
+            ffprobe_path,
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(video_path),
+        ]
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        return float(result.stdout.strip())
+    except Exception as exc:
+        logging.warning("Failed to read duration via ffprobe: %s", exc)
+        return None
+
+def _get_file_size_mb(video_path: Path) -> float:
+    return video_path.stat().st_size / (1024 * 1024)
+
+def _compress_if_needed(
+    video_path: Path,
+    ffmpeg_path: str,
+    max_size_mb: float,
+) -> None:
+    current_size = _get_file_size_mb(video_path)
+    if current_size <= max_size_mb:
+        return
+
+    ffprobe_path = _resolve_ffprobe_path(ffmpeg_path)
+    duration = _get_video_duration_seconds(video_path, ffprobe_path)
+    target_bitrate = None
+    min_bitrate = 200
+    if duration and duration > 0:
+        target_size_bytes = max_size_mb * 1024 * 1024 * 0.92
+        target_bitrate = int((target_size_bytes * 8) / duration / 1000)
+
+    def run_two_pass(output_path: Path, bitrate_k: int, passlogfile: Path) -> None:
+        base_cmd = [
+            ffmpeg_path, "-y",
+            "-i", str(video_path),
+            "-c:v", "libx264",
+            "-b:v", f"{bitrate_k}k",
+            "-maxrate", f"{int(bitrate_k * 1.2)}k",
+            "-bufsize", f"{int(bitrate_k * 2)}k",
+            "-preset", "medium",
+            "-pix_fmt", "yuv420p",
+            "-an",
+        ]
+        passlog_arg = str(passlogfile)
+        cmd_pass1 = base_cmd + ["-pass", "1", "-passlogfile", passlog_arg, "-f", "mp4", os.devnull]
+        cmd_pass2 = base_cmd + ["-pass", "2", "-passlogfile", passlog_arg, str(output_path)]
+        run_ffmpeg(cmd_pass1)
+        run_ffmpeg(cmd_pass2)
+
+    def run_crf(output_path: Path, crf: int) -> None:
+        cmd = [
+            ffmpeg_path, "-y",
+            "-i", str(video_path),
+            "-c:v", "libx264",
+            "-crf", str(crf),
+            "-preset", "slow",
+            "-pix_fmt", "yuv420p",
+            "-an",
+            str(output_path),
+        ]
+        run_ffmpeg(cmd)
+
+    attempts = [1.0, 0.85, 0.7, 0.55]
+    best_path: Optional[Path] = None
+    try:
+        if target_bitrate is not None:
+            for idx, factor in enumerate(attempts, start=1):
+                bitrate_k = max(int(target_bitrate * factor), min_bitrate)
+                output_path = video_path.with_name(f"{video_path.stem}_compressed_{idx}.mp4")
+                passlogfile = video_path.with_name(f"{video_path.stem}_passlog_{idx}")
+                try:
+                    run_two_pass(output_path, bitrate_k, passlogfile)
+                finally:
+                    for suffix in (".log", ".log.mbtree", "-0.log", "-0.log.mbtree"):
+                        path = Path(f"{passlogfile}{suffix}")
+                        if path.exists():
+                            with contextlib.suppress(Exception):
+                                path.unlink()
+                best_path = output_path
+                if _get_file_size_mb(best_path) <= max_size_mb:
+                    break
+
+        if best_path is None or _get_file_size_mb(best_path) > max_size_mb:
+            for crf in (24, 26, 28, 30, 32, 34):
+                output_path = video_path.with_name(f"{video_path.stem}_compressed_crf{crf}.mp4")
+                run_crf(output_path, crf)
+                best_path = output_path
+                if _get_file_size_mb(best_path) <= max_size_mb:
+                    break
+
+        if best_path and best_path.exists():
+            best_path.replace(video_path)
+            logging.info(
+                "Compressed preview to %.1f MB and replaced output at %s",
+                _get_file_size_mb(video_path),
+                video_path,
+            )
+        else:
+            logging.warning(
+                "Compression did not produce a replacement file for %s",
+                video_path,
+            )
+    except Exception as exc:
+        logging.warning("Compression attempt failed: %s", exc)
+
 
 def resolve_config_path(args: argparse.Namespace) -> Optional[Path]:
     if args.disable_color:
@@ -401,13 +519,14 @@ def resolve_config_path(args: argparse.Namespace) -> Optional[Path]:
 
 def parse_arguments(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Deadline preview conversion helper.")
-    parser.add_argument("--input-pattern", required=True, help="EXR sequence pattern, e.g. path/to/shot.%04d.exr")
+    parser.add_argument("--input-pattern", required=True, help="Sequence pattern, e.g. path/to/shot.%04d.exr")
     parser.add_argument("--output-path", required=True, help="Destination MP4 path")
     parser.add_argument("--start-number", type=int, default=0, help="First frame number in the sequence")
     parser.add_argument("--frame-rate", type=float, default=25.0, help="Playback frame rate")
     parser.add_argument("--ffmpeg-path", default="ffmpeg", help="ffmpeg executable available on the worker")
     parser.add_argument("--preset", default="medium", help="ffmpeg libx264 preset")
     parser.add_argument("--crf", type=int, default=20, help="ffmpeg CRF value")
+    parser.add_argument("--max-size-mb", type=float, default=45.0, help="Max MP4 size in MB for delivery")
     parser.add_argument(
         "--temp-dir",
         default=None,
@@ -452,6 +571,11 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         color_mode = args.color_mode.lower()
         apply_color = not args.disable_color
+        input_ext = Path(args.input_pattern).suffix.lower()
+        is_exr_input = input_ext == ".exr"
+        if not is_exr_input and apply_color:
+            logging.warning("Non-EXR input detected; disabling color transform.")
+            apply_color = False
         config_path: Optional[Path] = None
         if apply_color:
             config_path_optional = resolve_config_path(args)
@@ -506,6 +630,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             crf=args.crf,
         )
         run_ffmpeg(command)
+        _compress_if_needed(Path(args.output_path), args.ffmpeg_path, args.max_size_mb)
         logging.info("Preview video successfully written to %s", args.output_path)
 
         if apply_color and color_mode == "lut" and args.keep_lut:

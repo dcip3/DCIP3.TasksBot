@@ -34,7 +34,7 @@ from apscheduler.triggers.cron import CronTrigger
 from app.core.config import settings
 from app.core.bot_core import bot, dp, init_aiosession, close_aiosession
 from app.core.database import init_db, close_db
-from app.integrations.video_helpers import prepare_video_for_delivery
+from app.integrations.video_helpers import prepare_video_for_delivery, get_file_size_mb
 
 logger = logging.getLogger(__name__)
 
@@ -208,16 +208,21 @@ async def _notify_preview_job_completion(
         try:
             from app.services import download_video_from_dropbox
 
-            result = await download_video_from_dropbox(
-                login,
-                password,
-                job_id,
-                dropbox_path_hint=dropbox_path_hint,
-            )
-            if result:
-                final_path = Path(result[0])
-                dropbox_path = result[1]
-                downloaded_temp = True
+            retry_delays = [0, 2, 4, 6, 30]
+            for delay in retry_delays:
+                if delay:
+                    await asyncio.sleep(delay)
+                result = await download_video_from_dropbox(
+                    login,
+                    password,
+                    job_id,
+                    dropbox_path_hint=dropbox_path_hint,
+                )
+                if result:
+                    final_path = Path(result[0])
+                    dropbox_path = result[1]
+                    downloaded_temp = True
+                    break
         except Exception as download_error:
             logger.warning(
                 "Failed to download preview video from Dropbox for job %s: %s",
@@ -235,10 +240,13 @@ async def _notify_preview_job_completion(
             logger.warning("Preview job %s has no recorded paths", job_id)
             return None
 
-        for _ in range(6):
-            if local_path.exists():
-                break
-            await asyncio.sleep(5)
+        if not local_path.exists():
+            preview_temp_mode = (settings.preview_temp_dir or "").strip().lower()
+            if preview_temp_mode == "local":
+                for _ in range(6):
+                    if local_path.exists():
+                        break
+                    await asyncio.sleep(5)
 
         if not local_path.exists():
             await bot.send_message(
@@ -255,13 +263,19 @@ async def _notify_preview_job_completion(
         dropbox_path = dropbox_path or dropbox_path_hint
 
     max_video_size_mb = 45.0
-    preparation = await prepare_video_for_delivery(
-        final_path,
-        dropbox_path,
-        max_size_mb=max_video_size_mb,
-    )
-    final_path = preparation.video_path
-    size_mb = preparation.size_mb
+    size_mb = get_file_size_mb(final_path)
+    fallback_message = None
+    if size_mb > max_video_size_mb:
+        location_hint = (
+            f"<code>{dropbox_path}</code>"
+            if dropbox_path
+            else f"<code>{final_path}</code>"
+        )
+        fallback_message = (
+            "⚠️ Preview video is ready but too large to send via Telegram "
+            f"({size_mb:.1f} MB > {max_video_size_mb:.0f} MB).\n"
+            f"Please download it manually:\n{location_hint}"
+        )
 
     caption_parts = [f"📁 {final_path.name}"]
     if dropbox_path:
@@ -293,7 +307,7 @@ async def _notify_preview_job_completion(
             target_chat_id,
             ready_text,
         )
-    if preparation.fallback_message is None:
+    if fallback_message is None:
         await bot.send_video(
             target_chat_id,
             FSInputFile(str(final_path)),
@@ -302,13 +316,13 @@ async def _notify_preview_job_completion(
         )
     else:
         logger.warning(
-            "Preview video %s is still %.1f MB after compression; sending fallback message",
+            "Preview video %s is %.1f MB; sending fallback message",
             final_path,
             size_mb,
         )
         await bot.send_message(
             target_chat_id,
-            preparation.fallback_message,
+            fallback_message,
             parse_mode="HTML",
         )
 
@@ -522,7 +536,6 @@ def get_main_keyboard():
         ],
         [
             KeyboardButton(text="⚙️ Settings", request_contact=False, request_location=False),
-            KeyboardButton(text="ℹ️ Help", request_contact=False, request_location=False),
         ],
     ]
     return ReplyKeyboardMarkup(
