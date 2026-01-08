@@ -5,7 +5,6 @@ from datetime import datetime, timedelta, timezone
 from aiogram import F, Router
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from app.bot.handlers.realtime import stop_realtime_for_chat
 from app.bot.job_helpers import (
     BATCH_COLUMN_WIDTH,
     JOBS_PAGE_SIZE,
@@ -30,12 +29,10 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 
-@router.message(F.text == "Jobs")
+@router.message(F.text == "📂 Jobs")
 @authorized_only
 async def handle_jobs(message: Message, page: int = 0) -> None:
     """Display list of jobs with pagination."""
-    stop_realtime_for_chat(message.chat.id)
-
     if message.from_user is None:
         await message.answer("Error: User information not available.")
         return
@@ -59,9 +56,16 @@ async def handle_jobs(message: Message, page: int = 0) -> None:
         messages = []
         buttons = []
 
+        def resolve_batch_label(props: dict) -> str:
+            batch = (props.get("Batch") or "").strip()
+            if batch:
+                return batch
+            name = (props.get("Name") or "Untitled").strip()
+            return name or "Untitled"
+
         for job in jobs_slice:
             props = job.get("Props", {})
-            batch = props.get("Batch", "Untitled")
+            batch = resolve_batch_label(props)
             display_batch = truncate_cell(batch)
             total_tasks = props.get("Tasks", 0)
             completed_chunks = job.get("CompletedChunks", 0)
@@ -160,9 +164,16 @@ async def jobs_page_callback(callback_query: CallbackQuery) -> None:
         messages = []
         buttons = []
 
+        def resolve_batch_label(props: dict) -> str:
+            batch = (props.get("Batch") or "").strip()
+            if batch:
+                return batch
+            name = (props.get("Name") or "Untitled").strip()
+            return name or "Untitled"
+
         for job in jobs_slice:
             props = job.get("Props", {})
-            batch = props.get("Batch", "Untitled")
+            batch = resolve_batch_label(props)
             display_batch = truncate_cell(batch)
             total_tasks = props.get("Tasks", 0)
             completed_chunks = job.get("CompletedChunks", 0)
@@ -249,9 +260,16 @@ async def jobs_back_callback(callback_query: CallbackQuery) -> None:
         messages = []
         buttons = []
 
+        def resolve_batch_label(props: dict) -> str:
+            batch = (props.get("Batch") or "").strip()
+            if batch:
+                return batch
+            name = (props.get("Name") or "Untitled").strip()
+            return name or "Untitled"
+
         for job in jobs_slice:
             props = job.get("Props", {})
-            batch = props.get("Batch", "Untitled")
+            batch = resolve_batch_label(props)
             display_batch = truncate_cell(batch)
             total_tasks = props.get("Tasks", 0)
             completed_chunks = job.get("CompletedChunks", 0)
@@ -330,6 +348,13 @@ async def job_info_callback(callback_query: CallbackQuery) -> None:
     try:
         from app.services import get_jobs_list as fetch_jobs_list
 
+        def resolve_batch_label(props: dict) -> str:
+            batch = (props.get("Batch") or "").strip()
+            if batch:
+                return batch
+            name = (props.get("Name") or "Untitled").strip()
+            return name or "Untitled"
+
         all_jobs = await fetch_jobs_list(callback_query.from_user.id)
         if not all_jobs:
             await callback_query.answer("Failed to get jobs list.", show_alert=True)
@@ -340,12 +365,13 @@ async def job_info_callback(callback_query: CallbackQuery) -> None:
             await callback_query.answer("Job not found.", show_alert=True)
             return
 
-        batch_name = selected_job.get("Props", {}).get("Batch")
-        if not batch_name:
-            await callback_query.answer("Invalid job data.", show_alert=True)
-            return
+        props = selected_job.get("Props", {})
+        batch_name = resolve_batch_label(props)
 
-        batch_jobs = [j for j in all_jobs if j.get("Props", {}).get("Batch") == batch_name]
+        batch_jobs = [
+            j for j in all_jobs
+            if resolve_batch_label(j.get("Props", {})) == batch_name
+        ]
 
         await callback_query.message.delete()
 
@@ -484,12 +510,10 @@ async def job_info_callback(callback_query: CallbackQuery) -> None:
         await callback_query.answer("Error occurred while fetching job info.", show_alert=True)
 
 
-@router.message(F.text == "Workers")
+@router.message(F.text == "🖥️ Workers")
 @authorized_only
 async def handle_workers(message: Message) -> None:
     """Display worker list."""
-    stop_realtime_for_chat(message.chat.id)
-
     if message.from_user is None:
         await message.answer("Error: User information not available.")
         return

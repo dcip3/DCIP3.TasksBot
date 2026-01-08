@@ -47,9 +47,8 @@ ehthumbs.db
 Thumbs.db
 
 # Project specific
-conv/
-temp/
-tasks_bot.db
+data/*
+!data/config.ocio
 .env
 node_modules/
 mini-app/dist/

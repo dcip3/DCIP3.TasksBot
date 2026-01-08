@@ -17,7 +17,6 @@ from app.auth import (
     set_preview_default_method,
     set_preview_default_worker,
 )
-from app.bot.handlers.realtime import stop_realtime_for_chat
 from app.core.utils import authorized_only
 from app.services import get_workers_list
 
@@ -41,14 +40,8 @@ def _build_settings_root_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    text="🎬 Preview Worker",
-                    callback_data="settings:preview_worker",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🎛 Preview Method",
-                    callback_data="settings:preview_method",
+                    text="🎬 Preview",
+                    callback_data="settings:preview",
                 )
             ],
             [
@@ -126,8 +119,6 @@ def _build_notification_keyboard(enabled: bool, scope: str) -> InlineKeyboardMar
 @authorized_only
 async def handle_settings_menu(message: Message) -> None:
     """Display the settings menu with inline navigation."""
-    stop_realtime_for_chat(message.chat.id)
-
     if message.from_user is None:
         await message.answer("Error: User information not available.")
         return
@@ -191,9 +182,15 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
             text_lines.append(f"Default worker: {default_worker}")
         else:
             text_lines.append("Default worker: Not set (will show menu)")
-        text_lines.append("")
-        text_lines.append(
-            "Choose a worker to set as default, or select 'None' to always show the selection menu."
+        text_lines.extend(
+            [
+                "",
+                "This setting applies only to Deadline previews.",
+                "If preview method is set to Server, this worker is ignored.",
+                "",
+                "Pick a worker that should render previews on the Deadline farm.",
+                "Select 'None' to always show the worker selection menu.",
+            ]
         )
 
         keyboard_rows = []
@@ -211,7 +208,7 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
                     row.append(
                         InlineKeyboardButton(
                             text=display_name,
-                            callback_data=f"settings:preview_worker:set:{worker_name}",
+                            callback_data=f"settings:preview:worker:set:{worker_name}",
                         )
                     )
                 keyboard_rows.append(row)
@@ -222,7 +219,7 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
                     text="✅ None (Always ask)"
                     if not default_worker
                     else "None (Always ask)",
-                    callback_data="settings:preview_worker:set:none",
+                    callback_data="settings:preview:worker:set:none",
                 )
             ]
         )
@@ -230,7 +227,7 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
             [
                 InlineKeyboardButton(
                     text="⬅️ Back",
-                    callback_data="settings:back:root",
+                    callback_data="settings:preview",
                 )
             ]
         )
@@ -265,7 +262,7 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
             prefix = "✅ " if selected else ""
             return InlineKeyboardButton(
                 text=f"{prefix}{label}",
-                callback_data=f"settings:preview_method:set:{method_value}",
+                callback_data=f"settings:preview:method:set:{method_value}",
             )
 
         keyboard_rows = [
@@ -283,11 +280,45 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
             [
                 InlineKeyboardButton(
                     text="⬅️ Back",
-                    callback_data="settings:back:root",
+                    callback_data="settings:preview",
                 )
             ],
         ]
 
+        try:
+            await callback_query.message.edit_text(
+                "\n".join(text_lines),
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+            )
+        except TelegramBadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                raise
+
+    async def show_preview_menu() -> None:
+        text_lines = [
+            "Preview Settings",
+            "Choose what to configure for previews.",
+        ]
+        keyboard_rows = [
+            [
+                InlineKeyboardButton(
+                    text="🎛 Default Method",
+                    callback_data="settings:preview:method",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🖥️ Default Worker",
+                    callback_data="settings:preview:worker",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Back",
+                    callback_data="settings:back:root",
+                )
+            ],
+        ]
         try:
             await callback_query.message.edit_text(
                 "\n".join(text_lines),
@@ -307,50 +338,52 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
         await callback_query.answer()
         return
 
-    if action == "preview_worker":
+    if action == "preview":
         if len(parts) == 2:
-            await show_preview_worker()
+            await show_preview_menu()
             await callback_query.answer()
             return
         if len(parts) > 2:
             sub_action = parts[2]
-            if sub_action == "set" and len(parts) > 3:
-                worker_name = parts[3]
-                if worker_name == "none":
-                    await set_preview_default_worker(user_id, None)
-                    await callback_query.answer(
-                        "Default worker cleared. Menu will be shown for each preview."
-                    )
-                else:
-                    await set_preview_default_worker(user_id, worker_name)
-                    await callback_query.answer(f"Default worker set to: {worker_name}")
-                await show_preview_worker()
-                return
-
-    if action == "preview_method":
-        if len(parts) == 2:
-            await show_preview_method()
-            await callback_query.answer()
-            return
-        if len(parts) > 2:
-            sub_action = parts[2]
-            if sub_action == "set" and len(parts) > 3:
-                method_value = parts[3]
-                if method_value == "none":
-                    await set_preview_default_method(user_id, None)
-                    await callback_query.answer("Preview method set to: Always ask")
-                elif method_value in {"server", "deadline"}:
-                    await set_preview_default_method(user_id, method_value)
-                    await callback_query.answer(
-                        "Preview method set to: Server"
-                        if method_value == "server"
-                        else "Preview method set to: Deadline"
-                    )
-                else:
-                    await callback_query.answer("Unsupported option.", show_alert=True)
+            if sub_action == "worker":
+                if len(parts) == 3:
+                    await show_preview_worker()
+                    await callback_query.answer()
                     return
-                await show_preview_method()
-                return
+                if len(parts) > 3 and parts[3] == "set" and len(parts) > 4:
+                    worker_name = parts[4]
+                    if worker_name == "none":
+                        await set_preview_default_worker(user_id, None)
+                        await callback_query.answer(
+                            "Default worker cleared. Menu will be shown for each preview."
+                        )
+                    else:
+                        await set_preview_default_worker(user_id, worker_name)
+                        await callback_query.answer(f"Default worker set to: {worker_name}")
+                    await show_preview_worker()
+                    return
+            if sub_action == "method":
+                if len(parts) == 3:
+                    await show_preview_method()
+                    await callback_query.answer()
+                    return
+                if len(parts) > 3 and parts[3] == "set" and len(parts) > 4:
+                    method_value = parts[4]
+                    if method_value == "none":
+                        await set_preview_default_method(user_id, None)
+                        await callback_query.answer("Preview method set to: Always ask")
+                    elif method_value in {"server", "deadline"}:
+                        await set_preview_default_method(user_id, method_value)
+                        await callback_query.answer(
+                            "Preview method set to: Server"
+                            if method_value == "server"
+                            else "Preview method set to: Deadline"
+                        )
+                    else:
+                        await callback_query.answer("Unsupported option.", show_alert=True)
+                        return
+                    await show_preview_method()
+                    return
 
     if action == "setup_script":
         script_path = Path(__file__).resolve().parents[3] / "scripts" / "worker_setup.ps1"

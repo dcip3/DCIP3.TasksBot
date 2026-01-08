@@ -29,7 +29,6 @@ stop_downloads: Dict[str, asyncio.Event] = {}
 # After 1 hour, notifications for the same job can be sent again
 notified_jobs = TTLCache(ttl_seconds=3600, max_size=10000)
 
-active_realtime_tasks: Dict[str, asyncio.Task] = {}
 current_downloads: int = 0
 conversion_semaphore = asyncio.Semaphore(1)
 

@@ -1,28 +1,26 @@
 # TasksBot
 
-TasksBot is a Telegram bot with a companion web app for monitoring Deadline render jobs, managing queues, and distributing previews via Dropbox. The project bundles an asynchronous Python backend, a React mini-app, and pipeline integrations for EXR-to-video processing.
+TasksBot is a Telegram bot for monitoring Deadline render jobs, managing queues, and distributing previews via Dropbox. The project bundles an asynchronous Python backend and pipeline integrations for EXR-to-video processing.
 
 ## Key Features
-- aiogram 3.x bot with FSM-based flows for authentication, job control, and realtime monitoring
-- FastAPI REST API powering the web app and external integrations
+- aiogram 3.x bot with FSM-based flows for authentication and job control
+- Telegram bot backend with integrations for Deadline and Dropbox
 - EXR → MP4 conversion with OCIO color management and Dropbox upload
 - Two preview pipelines: render via Deadline or locally on the bot host
 - Granular notification settings (all jobs vs. owned jobs)
-- Docker Compose stack with Nginx reverse proxy
+- Docker Compose stack for containerized deployment
 
 ## Architecture Overview
-- **Telegram bot** (`app/bot/handlers/`) — modular routers (`auth`, `jobs`, `preview`, `settings`, `realtime`, `common`)
-- **Core services** (`app/services/`, `app/core/`) — Deadline, Dropbox, storage utilities
+- **Telegram bot** (`app/bot/handlers/`) — modular routers (`auth`, `jobs`, `preview`, `settings`, `common`)
+- **Core services** (`app/services/`, `app/core/`) — Deadline, Dropbox, data utilities
 - **Integrations** (`app/integrations/`) — video helpers, Dropbox SDK clients, external APIs
-- **REST API** (`main.py`, `app/integrations/api_routes.py`) — FastAPI app serving the mini-app and bot webhook
-- **Mini App** (`mini-app/`) — React/Vite Telegram WebApp
-- **Infrastructure** (`infra/`, `docker-compose.yml`) — Docker images, Nginx config, deployment scripts
+- **Entry point** (`main.py`) — starts the bot and lifecycle hooks
+- **Infrastructure** (`docker-compose.yml`, `Dockerfile`) — container build and deployment
 
 ## Getting Started
 
 ### Prerequisites
 - Python ≥ 3.11
-- Node.js ≥ 18 (for the mini-app)
 - FFmpeg available in `$PATH` (or set `FFMPEG_PATH`)
 - Docker & Docker Compose for containerized deployment
 
@@ -34,7 +32,7 @@ cp .env.example .env
 ```
 Fill in `.env` (see [Configuration](#configuration)).
 
-### 2. Run with Docker (all services)
+### 2. Run with Docker
 ```bash
 docker compose up --build
 docker compose logs -f backend   # follow bot logs
@@ -49,29 +47,15 @@ pip install -r requirements.txt
 python main.py
 ```
 
-Mini App:
-```bash
-cd mini-app
-npm install
-npm run dev
-```
-
-Bot only (no web app):
-```bash
-python scripts/run_bot_local.py
-```
-
 ## Configuration
 All configuration lives in `.env`. Use the tables below as a checklist.
 
 ### Core / Security
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `APP_DOMAIN` | Public hostname used by the backend | `tasks.example.com` |
 | `BASE_API_URL` | Deadline REST endpoint (should include scheme + port) | `https://deadline.local:8443/api` |
 | `HTTP_TIMEOUT` | Timeout (seconds) for external HTTP calls | `30` |
 | `DEV_MODE` | Development flag (must be `false` in production) | `false` |
-| `CORS_ORIGINS` | Comma-separated list of allowed origins | `https://tasks.example.com` |
 | `PASSWORD_SALT` | Salt for hashing stored credentials | `change-me` |
 | `ENCRYPTION_KEY` | Fernet key for secrets in storage | `generated-with-fernet` |
 
@@ -87,17 +71,6 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 ```bash
 TG_API_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
-```
-
-### Mini App
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `MINI_APP_ENABLED` | `true` to register the Tasks mini app/menu button | `true` |
-| `MINI_APP_URL` | HTTPS URL of the deployed mini-app | `https://tasks.example.com/app` |
-
-```bash
-MINI_APP_ENABLED=true
-MINI_APP_URL=https://tasks.example.com/app
 ```
 
 ### Dropbox
@@ -117,18 +90,18 @@ MINI_APP_URL=https://tasks.example.com/app
 ### Storage & Media
 | Variable | Description | Default / Example |
 |----------|-------------|-------------------|
-| `DB_PATH` | SQLite database location | `storage/tasks_bot.db` |
-| `TEMP_DIR` | Temporary downloads | `storage/temp` |
-| `CONV_DIR` | Converted previews | `storage/conv` |
-| `OCIO_CONFIG_PATH` | Path to OCIO config used during previews | `storage/config.ocio` |
+| `DB_PATH` | SQLite database location | `data/app.db` |
+| `TEMP_DIR` | Temporary downloads | `data/temp` |
+| `CONV_DIR` | Converted previews | `data/conv` |
+| `OCIO_CONFIG_PATH` | Path to OCIO config used during previews | `data/config.ocio` |
 | `FFMPEG_PATH` | FFmpeg binary (local or on workers) | `ffmpeg` |
 | `PREVIEW_*` | Fine-tunes color pipeline (apply transform, LUT size, etc.) | see `.env.example` |
 | `MAX_CONCURRENT_DOWNLOADS` | Parallel Dropbox downloads | `2` |
 | `MIN_FREE_SPACE_BYTES` | Minimum disk space before aborting (bytes) | `10737418240` |
 
 ```bash
-mkdir -p storage/temp storage/conv
-cp /path/to/config.ocio storage/config.ocio
+mkdir -p data/temp data/conv
+cp /path/to/config.ocio data/config.ocio
 ```
 
 Restart the service after any configuration change (`docker compose restart backend` or relaunch `python main.py`).
@@ -144,11 +117,10 @@ Restart the service after any configuration change (`docker compose restart back
 | `/cancel` | Abort the current FSM step |
 
 ### Main Menu
-- **Jobs** — paginated batch list with actions (preview, suspend/resume, requeue, delete, tasks)
-- **Workers** — render node status overview
-- **Realtime** — auto-refresh table every 5 seconds
-- **⚙️ Settings** — notification preferences and default preview worker
-- **🧹 Clear** — remove recent chat history (up to ~1000 messages)
+- **📂 Jobs** — paginated batch list with actions (preview, suspend/resume, requeue, delete, tasks)
+- **🖥️ Workers** — render node status overview
+- **⚙️ Settings** — notification preferences and preview defaults
+- **ℹ️ Help** — show help and commands
 
 ### Preview Workflow
 1. Check Dropbox for existing preview video.  
@@ -168,8 +140,8 @@ Restart the service after any configuration change (`docker compose restart back
 │   ├── integrations/          # Dropbox, video processing, external clients
 │   ├── services/              # Deadline access, business logic
 │   └── storage/               # Data access objects and persistence helpers
-├── infra/                     # Dockerfiles, Nginx config templates
-├── mini-app/                  # React/Vite web app
+├── data/                      # App data (db, temp, converted previews)
+├── Dockerfile
 ├── scripts/                   # Local run and maintenance scripts
 ├── docker-compose.yml
 ├── main.py
@@ -180,13 +152,12 @@ Restart the service after any configuration change (`docker compose restart back
 - **Formatting**: `black app/`
 - **Linting**: `flake8 app/`
 - **Tests**: `pytest`
-- **Quick bot run**: `python scripts/run_bot_local.py`
+- **Quick bot run**: `python main.py`
 - **Handlers**: add routers under `app/bot/handlers/` and register them via `register_handlers()` in `__init__.py`.
 
 ## Troubleshooting
 - **Bot fails to start** — inspect `docker compose logs backend`, verify `.env`, confirm Telegram token.
 - **Authentication issues** — ensure Deadline API (`BASE_API_URL`) is reachable and credentials are valid.
-- **Mini-app CORS errors** — `MINI_APP_URL` and `CORS_ORIGINS` must share scheme/domain.
 - **Preview failures** — check `OCIO_CONFIG_PATH`, `FFMPEG_PATH`, free space (`MIN_FREE_SPACE_BYTES`), and Dropbox EXR availability.
 
 ## Support & License

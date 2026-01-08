@@ -37,13 +37,13 @@ class Settings(BaseSettings):
     dropbox_root_marker: str = "Team Folder"
     
     # Local Application Settings
-    db_path: str = Field("storage/tasks_bot.db", description="SQLite database file path")
+    db_path: str = Field("data/app.db", description="SQLite database file path")
     credentials_file: str = Field("credentials.json", description="Fallback credentials storage file")
-    temp_dir: str = Field("storage/temp", description="Temp directory for intermediate files")
-    conv_dir: str = Field("storage/conv", description="Directory for converted files")
+    temp_dir: str = Field("data/temp", description="Temp directory for intermediate files")
+    conv_dir: str = Field("data/conv", description="Directory for converted files")
     http_timeout: int = Field(30, description="HTTP timeout for external requests in seconds")
 
-    ocio_config_path: str = Field("storage/config.ocio", description="Path to OCIO configuration file")
+    ocio_config_path: str = Field("data/config.ocio", description="Path to OCIO configuration file")
     preview_apply_color_transform: bool = Field(
         True,
         description="Apply OCIO color transform when generating preview videos",
@@ -97,16 +97,6 @@ class Settings(BaseSettings):
     # Job monitoring intervals (seconds)
     job_watcher_interval_normal: int = Field(60, ge=5, description="Job monitoring interval in seconds (normal mode)")
     job_watcher_interval_preview: int = Field(15, ge=5, description="Job monitoring interval in seconds (when preview jobs are active)")
-
-    # Mini App Configuration
-    mini_app_enabled: bool = Field(True, description="Enable Telegram mini app integration")
-    mini_app_url: str = Field("http://localhost:3000", description="URL for the Telegram mini app")
-
-    # CORS Configuration
-    cors_origins: str = Field(
-        "http://localhost:3000",
-        description="Comma-separated list of allowed CORS origins"
-    )
 
     # Development mode
     dev_mode: bool = Field(False, description="Enable development mode (disables some security checks)")

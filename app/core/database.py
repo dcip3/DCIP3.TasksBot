@@ -33,7 +33,7 @@ async def init_db():
         error_message = (
             f"Configured DB_PATH '{db_path}' points to a directory. "
             "If you're running via Docker, ensure the bind mount targets a file "
-            "or mount the entire storage directory (e.g. ./storage:/app/storage)."
+            "or mount the entire data directory (e.g. ./data:/app/data)."
         )
         logger.error(error_message)
         raise RuntimeError(error_message)

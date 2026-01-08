@@ -16,6 +16,9 @@ __pycache__/
 storage/conv/
 storage/temp/
 storage/tasks_bot.db*
+data/conv/
+data/temp/
+data/*.db*
 
 # Secrets
 credentials.json

@@ -26,8 +26,6 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    MenuButtonWebApp,
-    WebAppInfo,
     FSInputFile,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -46,6 +44,9 @@ logger = logging.getLogger(__name__)
 
 # Scheduler for automated tasks
 scheduler = AsyncIOScheduler(timezone="Europe/Moscow", job_defaults={'coalesce': True, 'max_instances': 1})
+
+# Background task handle for job watcher
+job_watcher_task: Optional[asyncio.Task] = None
 
 # Track preview submission progress messages (preview_job_id -> (chat_id, message_id))
 preview_message_registry: dict[str, tuple[int, int]] = {}
@@ -516,15 +517,12 @@ def get_main_keyboard():
     """
     kb = [
         [
-            KeyboardButton(text="Jobs", request_contact=False, request_location=False),
-            KeyboardButton(text="Workers", request_contact=False, request_location=False),
+            KeyboardButton(text="📂 Jobs", request_contact=False, request_location=False),
+            KeyboardButton(text="🖥️ Workers", request_contact=False, request_location=False),
         ],
         [
-            KeyboardButton(text="Realtime", request_contact=False, request_location=False),
             KeyboardButton(text="⚙️ Settings", request_contact=False, request_location=False),
-        ],
-        [
-            KeyboardButton(text="🧹 Clear", request_contact=False, request_location=False),
+            KeyboardButton(text="ℹ️ Help", request_contact=False, request_location=False),
         ],
     ]
     return ReplyKeyboardMarkup(
@@ -535,71 +533,6 @@ def get_main_keyboard():
         is_persistent=False,
         input_field_placeholder=""
     )
-
-async def setup_menu_button():
-    """
-    Setup the menu button for Mini App.
-    This creates a button in the chat menu that opens the Mini App.
-    """
-    if not settings.mini_app_enabled:
-        logger.info("Skipping menu button setup because MINI_APP_ENABLED is false")
-        return
-
-    try:
-        # Mini App URL: use localhost for development, HTTPS domain for production
-        # mini_app_url defaults to the value provided in settings
-        mini_app_url = settings.mini_app_url
-
-        # Skip setup if URL is not HTTPS (Telegram requires HTTPS for menu buttons)
-        from urllib.parse import urlparse
-        parsed_url = urlparse(mini_app_url)
-        if parsed_url.scheme.lower() != "https":
-            logger.warning(
-                "Skipping menu button setup because MINI_APP_URL is not HTTPS: %s",
-                mini_app_url,
-            )
-            return
-        
-        logger.info(f"Setting up menu button with URL: {mini_app_url}")
-        
-        # Use the default aiogram 3.x method
-        await bot.set_chat_menu_button(
-            menu_button=MenuButtonWebApp(
-                text="Tasks",
-                web_app=WebAppInfo(url=mini_app_url)
-            )
-        )
-        logger.info("Menu button setup successfully")
-    except Exception as e:
-        logger.error(f"Failed to setup menu button: {e}")
-        # Try an alternative approach
-        try:
-            logger.info("Trying alternative method...")
-            await bot.set_chat_menu_button(
-                menu_button=MenuButtonWebApp(
-                    text="Tasks",
-                    web_app=WebAppInfo(url=mini_app_url)
-                ),
-                chat_id=None  # Apply for all users
-            )
-            logger.info("Menu button setup successfully (alternative method)")
-        except Exception as e2:
-            logger.error(f"Alternative method also failed: {e2}")
-            # Try a third approach using the BotFather API
-            try:
-                logger.info("Trying BotFather API method...")
-                # This method might not work in aiogram 3.x, but it is worth a try
-                await bot.set_chat_menu_button(
-                    menu_button=MenuButtonWebApp(
-                        text="Tasks",
-                        web_app=WebAppInfo(url=mini_app_url)
-                    ),
-                    chat_id=0  # Global setting
-                )
-                logger.info("Menu button setup successfully (BotFather API method)")
-            except Exception as e3:
-                logger.error(f"All methods failed: {e3}")
-                return
 
 # ============================================================================
 # === UTILITY FUNCTIONS ===
@@ -966,15 +899,12 @@ async def on_startup(bot):
     cleanup_temp_and_conv()
     logger.info("Startup cleanup completed")
     
-    # Setup menu button for Mini App
-    await setup_menu_button()
-    logger.info("Menu button setup completed")
-
     await bot.set_my_commands(
         [
             BotCommand(command="start", description="Start the bot"),
             BotCommand(command="login", description="Authenticate to the bot"),
             BotCommand(command="logout", description="End the current session"),
+            BotCommand(command="help", description="Show help"),
         ]
     )
     logger.info("Bot commands registered")
@@ -1017,8 +947,10 @@ async def on_startup(bot):
     logger.info("Scheduled cleanup tasks added")
     
     # Start job progress watcher
-    asyncio.create_task(job_progress_watcher(bot))
-    logger.info("Job progress watcher started")
+    global job_watcher_task
+    if job_watcher_task is None or job_watcher_task.done():
+        job_watcher_task = asyncio.create_task(job_progress_watcher(bot))
+        logger.info("Job progress watcher started")
 
 
 async def on_shutdown(bot):
@@ -1033,6 +965,18 @@ async def on_shutdown(bot):
     # Shutdown scheduler
     scheduler.shutdown()
     logger.info("Scheduler shutdown")
+
+    # Stop job progress watcher
+    global job_watcher_task
+    if job_watcher_task and not job_watcher_task.done():
+        job_watcher_task.cancel()
+        try:
+            await job_watcher_task
+        except asyncio.CancelledError:
+            logger.info("Job progress watcher cancelled")
+        except Exception as exc:
+            logger.warning("Job progress watcher failed during shutdown: %s", exc)
+    job_watcher_task = None
     
     # Close database connection
     await close_db()
@@ -1067,53 +1011,39 @@ async def job_progress_watcher(bot):
     from app.core.bot_core import notified_jobs, get_aiosession
     from app.core.database import get_db_connection
 
-    while True:
-        # Adaptive polling interval based on active preview jobs
-        has_active_previews = len(preview_message_registry) > 0
-        sleep_interval = settings.job_watcher_interval_preview if has_active_previews else settings.job_watcher_interval_normal
+    try:
+        while True:
+            # Adaptive polling interval based on active preview jobs
+            has_active_previews = len(preview_message_registry) > 0
+            sleep_interval = settings.job_watcher_interval_preview if has_active_previews else settings.job_watcher_interval_normal
 
-        if has_active_previews:
-            logger.debug(f"Active preview jobs: {len(preview_message_registry)}, using fast polling ({sleep_interval}s)")
+            if has_active_previews:
+                logger.debug(f"Active preview jobs: {len(preview_message_registry)}, using fast polling ({sleep_interval}s)")
 
-        await asyncio.sleep(sleep_interval)
+            await asyncio.sleep(sleep_interval)
 
-        # Get users with notifications enabled for regular jobs
-        users_with_notifications = await get_all_users_with_notifications()
-        logger.info(f"Job progress watcher: Found {len(users_with_notifications)} users with notifications enabled")
+            # Get users with notifications enabled for regular jobs
+            users_with_notifications = await get_all_users_with_notifications()
+            logger.info(f"Job progress watcher: Found {len(users_with_notifications)} users with notifications enabled")
 
-        # Get ALL users with credentials to monitor preview jobs
-        conn = get_db_connection()
-        all_users_for_preview = []
-        if conn:
-            try:
-                async with conn.execute(
-                    "SELECT telegram_user_id, deadline_login, deadline_password FROM user_sessions"
-                ) as cursor:
-                    all_users_for_preview = await cursor.fetchall()
-            except Exception as e:
-                logger.error(f"Error fetching users for preview monitoring: {e}")
+            # Get ALL users with credentials to monitor preview jobs
+            conn = get_db_connection()
+            all_users_for_preview = []
+            if conn:
+                try:
+                    async with conn.execute(
+                        "SELECT telegram_user_id, deadline_login, deadline_password FROM user_sessions"
+                    ) as cursor:
+                        all_users_for_preview = await cursor.fetchall()
+                except Exception as e:
+                    logger.error(f"Error fetching users for preview monitoring: {e}")
 
-        # Decrypt passwords and combine lists (use telegram_user_id as key to avoid duplicates)
-        from app.auth import _decrypt_password
-        users_dict = {}
+            # Decrypt passwords and combine lists (use telegram_user_id as key to avoid duplicates)
+            from app.auth import _decrypt_password
+            users_dict = {}
 
-        # Add users with notifications
-        for user_id, login, password, scope in users_with_notifications:
-            try:
-                decrypted_password = _decrypt_password(password)
-            except Exception:
-                decrypted_password = password
-            users_dict[user_id] = (
-                user_id,
-                login,
-                decrypted_password,
-                True,
-                scope,
-            )  # True = has notifications
-
-        # Add all users for preview monitoring
-        for user_id, login, password in all_users_for_preview:
-            if user_id not in users_dict:
+            # Add users with notifications
+            for user_id, login, password, scope in users_with_notifications:
                 try:
                     decrypted_password = _decrypt_password(password)
                 except Exception:
@@ -1122,18 +1052,33 @@ async def job_progress_watcher(bot):
                     user_id,
                     login,
                     decrypted_password,
-                    False,
-                    "all",
-                )  # False = no notifications
+                    True,
+                    scope,
+                )  # True = has notifications
 
-        logger.info(f"Job progress watcher: Monitoring {len(users_dict)} total users (notifications + preview)")
+            # Add all users for preview monitoring
+            for user_id, login, password in all_users_for_preview:
+                if user_id not in users_dict:
+                    try:
+                        decrypted_password = _decrypt_password(password)
+                    except Exception:
+                        decrypted_password = password
+                    users_dict[user_id] = (
+                        user_id,
+                        login,
+                        decrypted_password,
+                        False,
+                        "all",
+                    )  # False = no notifications
 
-        for telegram_user_id, login, decrypted_password, has_notifications, scope in users_dict.values():
+            logger.info(f"Job progress watcher: Monitoring {len(users_dict)} total users (notifications + preview)")
 
-            try:
-                session = await get_aiosession()
-                headers = aiohttp.BasicAuth(login, decrypted_password)
-                async with session.get(f"{settings.base_api_url}/jobs", auth=headers, ssl=False) as resp:
+            for telegram_user_id, login, decrypted_password, has_notifications, scope in users_dict.values():
+
+                try:
+                    session = await get_aiosession()
+                    headers = aiohttp.BasicAuth(login, decrypted_password)
+                    async with session.get(f"{settings.base_api_url}/jobs", auth=headers, ssl=False) as resp:
                         if resp.status == 200:
                             jobs = await resp.json()
                             for job in jobs:
@@ -1303,5 +1248,7 @@ async def job_progress_watcher(bot):
                             )
                         else:
                             logger.error(f"Watcher: Error requesting jobs for user {telegram_user_id}: {resp.status}")
-            except Exception as e:
-                logger.error(f"Watcher: Error monitoring jobs for user {telegram_user_id}: {e}", exc_info=True) 
+                except Exception as e:
+                    logger.error(f"Watcher: Error monitoring jobs for user {telegram_user_id}: {e}", exc_info=True)
+    except asyncio.CancelledError:
+        logger.info("Job progress watcher cancelled")

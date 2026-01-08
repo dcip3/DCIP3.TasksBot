@@ -54,7 +54,10 @@ def group_and_combine_jobs(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     # Group jobs by batch name
     grouped_jobs = defaultdict(list)
     for job in jobs:
-        batch = job.get("Props", {}).get("Batch", "Untitled")
+        props = job.get("Props", {})
+        batch = (props.get("Batch") or "").strip()
+        if not batch:
+            batch = (props.get("Name") or "Untitled").strip() or "Untitled"
         grouped_jobs[batch].append(job)
 
     # Combine jobs by batch

@@ -11,7 +11,6 @@ from app.auth import (
     logout_user,
     save_deadline_credentials,
 )
-from app.bot.handlers.realtime import stop_realtime_for_chat
 from app.core.utils import get_main_keyboard
 
 logger = logging.getLogger(__name__)
@@ -91,8 +90,6 @@ async def process_login_password(message: Message, state: FSMContext) -> None:
 @router.message(Command("logout"))
 async def cmd_logout(message: Message) -> None:
     """Logout the current user."""
-    stop_realtime_for_chat(message.chat.id)
-
     if message.from_user is None:
         await message.answer("Error: User information not available.")
         return
