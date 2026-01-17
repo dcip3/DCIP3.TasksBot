@@ -1,9 +1,9 @@
 import logging
-from aiogram import Router
+from aiogram import F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from app.auth import (
     authenticate_user,
@@ -17,6 +17,13 @@ logger = logging.getLogger(__name__)
 
 router = Router()
 
+def build_login_cancel_keyboard() -> InlineKeyboardMarkup:
+    """Inline keyboard to cancel login flow."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✖️ Cancel", callback_data="login_cancel")]
+        ]
+    )
 
 class LoginStates(StatesGroup):
     """State machine for user login process."""
@@ -38,7 +45,10 @@ async def cmd_login_start(message: Message, state: FSMContext) -> None:
 
     await state.clear()
     await state.set_state(LoginStates.USERNAME)
-    await message.answer("Enter your Deadline login:")
+    await message.answer(
+        "Enter your Deadline login:",
+        reply_markup=build_login_cancel_keyboard(),
+    )
 
 
 @router.message(StateFilter(LoginStates.USERNAME))
@@ -49,7 +59,10 @@ async def process_login_username(message: Message, state: FSMContext) -> None:
         return
 
     await state.update_data(username=message.text.strip())
-    await message.answer("Enter your Deadline password:")
+    await message.answer(
+        "Enter your Deadline password:",
+        reply_markup=build_login_cancel_keyboard(),
+    )
     await state.set_state(LoginStates.PASSWORD)
 
 
@@ -87,6 +100,18 @@ async def process_login_password(message: Message, state: FSMContext) -> None:
     await state.clear()
 
 
+@router.callback_query(F.data == "login_cancel")
+async def login_cancel_callback(callback_query: CallbackQuery, state: FSMContext) -> None:
+    """Cancel the login flow and clear state."""
+    await state.clear()
+    if callback_query.message:
+        try:
+            await callback_query.message.edit_text("Login cancelled.")
+        except Exception:
+            await callback_query.message.answer("Login cancelled.")
+    await callback_query.answer("Login cancelled.", show_alert=False)
+
+
 @router.message(Command("logout"))
 async def cmd_logout(message: Message) -> None:
     """Logout the current user."""
@@ -100,15 +125,3 @@ async def cmd_logout(message: Message) -> None:
 
     await logout_user(message.from_user.id)
     await message.answer("You have been logged out.")
-
-
-@router.message(Command("cancel"))
-async def cmd_cancel(message: Message, state: FSMContext) -> None:
-    """Cancel the current operation and clear state."""
-    current_state = await state.get_state()
-    if current_state is None:
-        await message.answer("No active operation to cancel.")
-        return
-
-    await state.clear()
-    await message.answer("Operation cancelled. You can start over with /login or /start.")

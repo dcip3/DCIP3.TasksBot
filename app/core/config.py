@@ -6,9 +6,7 @@ This module provides a centralized configuration system using Pydantic Settings
 for environment variable management and validation.
 """
 
-import json
-from pathlib import Path
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Optional
 from pydantic_settings import BaseSettings
 from pydantic import Field, field_validator
 from pydantic_settings import SettingsConfigDict
@@ -23,10 +21,13 @@ class Settings(BaseSettings):
     """
     
     # Telegram Bot Configuration
-    tg_api_token: str
+    telegram_bot_token: str
     
     # Deadline API Configuration
-    base_api_url: str = Field(..., description="Base URL for the Deadline API")
+    deadline_api_url: str = Field(
+        ...,
+        description="Base URL for the Deadline API",
+    )
     
     # Dropbox API Configuration
     dropbox_app_key: str
@@ -37,8 +38,7 @@ class Settings(BaseSettings):
     dropbox_root_marker: str = "Team Folder"
     
     # Local Application Settings
-    db_path: str = Field("data/app.db", description="SQLite database file path")
-    credentials_file: str = Field("credentials.json", description="Fallback credentials storage file")
+    sqlite_db_path: str = Field("data/app.db", description="SQLite database file path")
     temp_dir: str = Field("data/temp", description="Temp directory for intermediate files")
     conv_dir: str = Field("data/conv", description="Directory for converted files")
     http_timeout: int = Field(30, description="HTTP timeout for external requests in seconds")
@@ -133,92 +133,20 @@ class Settings(BaseSettings):
             raise ValueError("DROPBOX_ROOT_MARKER must not be empty")
         return v
 
+    @field_validator("preview_ocio_remote_config", mode="before")
+    def normalize_preview_ocio_remote_config(cls, v):
+        """Normalize optional OCIO config path sent via env."""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            raw = v.strip()
+            if not raw:
+                return None
+            if raw.lower() in {"auto", "default", "system", "none", "local"}:
+                return None
+            return raw
+        return v
+
 
 # Global settings instance
 settings = Settings()  # type: ignore[reportCallIssue]
-
-
-def load_credentials() -> Dict[str, Tuple[str, str, bool]]:
-    """
-    Load stored user credentials from JSON file.
-    
-    Returns:
-        Dictionary mapping user_id to (login, password, notifications_enabled)
-    """
-    credentials_path = Path(settings.credentials_file)
-    if credentials_path.exists():
-        try:
-            with credentials_path.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-                # Convert to proper format: user_id -> (login, password, notifications)
-                result = {}
-                for user_id, creds in data.items():
-                    if isinstance(creds, list) and len(creds) >= 2:
-                        login, password = creds[0], creds[1]
-                        notifications = creds[2] if len(creds) > 2 else False
-                        result[user_id] = (login, password, notifications)
-                return result
-        except Exception as e:
-            print(f"Error loading credentials: {e}")
-    return {}
-
-
-def save_credentials(data: Dict[str, Tuple[str, str, bool]]) -> None:
-    """
-    Save user credentials to JSON file.
-    
-    Args:
-        data: Dictionary mapping user_id to (login, password, notifications_enabled)
-    """
-    credentials_path = Path(settings.credentials_file)
-    try:
-        # Convert to list format for JSON serialization
-        json_data = {}
-        for user_id, (login, password, notifications) in data.items():
-            json_data[user_id] = [login, password, notifications]
-        
-        with credentials_path.open("w", encoding="utf-8") as f:
-            json.dump(json_data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"Error saving credentials: {e}")
-
-
-def get_auth_credentials(user_id: str) -> Tuple[Optional[str], Optional[str], bool]:
-    """
-    Retrieve stored credentials for a given user.
-    
-    Args:
-        user_id: Telegram user ID as string
-        
-    Returns:
-        Tuple of (login, password, notifications_enabled) or (None, None, False) if missing
-    """
-    credentials = load_credentials()
-    creds = credentials.get(user_id)
-    if creds and len(creds) >= 2:
-        login, password = creds[0], creds[1]
-        notifications = creds[2] if len(creds) > 2 else False
-        return login, password, notifications
-    return None, None, False
-
-
-def remove_auth_credentials(user_id: str) -> bool:
-    """
-    Remove stored credentials for a given user.
-    
-    Args:
-        user_id: Telegram user ID as string
-        
-    Returns:
-        True if credentials were removed, False otherwise
-    """
-    credentials = load_credentials()
-    if user_id in credentials:
-        del credentials[user_id]
-        save_credentials(credentials)
-        return True
-    return False
-
-
-# Initialize global credentials
-user_credentials = load_credentials() 

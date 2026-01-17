@@ -11,6 +11,7 @@ This module provides core utilities for the Telegram bot including:
 """
 
 import asyncio
+import contextlib
 import html
 import logging
 import os
@@ -32,7 +33,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from app.core.config import settings
-from app.core.bot_core import bot, dp, init_aiosession, close_aiosession
+from app.core.bot_core import bot, dp, init_aiosession, close_aiosession, auto_preview_jobs
 from app.core.database import init_db, close_db
 from app.integrations.video_helpers import prepare_video_for_delivery, get_file_size_mb
 
@@ -208,7 +209,7 @@ async def _notify_preview_job_completion(
         try:
             from app.services import download_video_from_dropbox
 
-            retry_delays = [0, 2, 4, 6, 30]
+            retry_delays = [0, 2, 4, 6, 10, 20, 40, 80, 138]
             for delay in retry_delays:
                 if delay:
                     await asyncio.sleep(delay)
@@ -241,12 +242,12 @@ async def _notify_preview_job_completion(
             return None
 
         if not local_path.exists():
-            preview_temp_mode = (settings.preview_temp_dir or "").strip().lower()
-            if preview_temp_mode == "local":
-                for _ in range(6):
-                    if local_path.exists():
-                        break
-                    await asyncio.sleep(5)
+            retry_delays = [0, 2, 4, 6, 10, 15, 20]
+            for delay in retry_delays:
+                if delay:
+                    await asyncio.sleep(delay)
+                if local_path.exists():
+                    break
 
         if not local_path.exists():
             await bot.send_message(
@@ -495,6 +496,217 @@ async def _notify_preview_job_failure(
 # ============================================================================
 # === DECORATORS ===
 # ============================================================================
+
+
+async def _send_dropbox_video_to_user(
+    telegram_user_id: int,
+    login: str,
+    password: str,
+    job_id: str,
+    dropbox_path_hint: Optional[str] = None,
+) -> bool:
+    """Download a preview from Dropbox and deliver it to the user."""
+    from app.services import download_video_from_dropbox
+    from app.integrations.video_helpers import cleanup_job_files
+
+    progress_msg = await bot.send_message(
+        telegram_user_id,
+        "📥 Auto preview: downloading existing video from Dropbox...",
+    )
+    try:
+        download_result = await download_video_from_dropbox(
+            login,
+            password,
+            job_id,
+            dropbox_path_hint=dropbox_path_hint,
+        )
+    except Exception as exc:
+        logger.error("Auto preview Dropbox download failed for job %s: %s", job_id, exc)
+        with contextlib.suppress(Exception):
+            await progress_msg.edit_text("❌ Auto preview: failed to download from Dropbox.")
+        return False
+
+    if not download_result:
+        with contextlib.suppress(Exception):
+            await progress_msg.delete()
+        return False
+
+    video_path, dropbox_path = download_result
+    video_path_obj = Path(video_path)
+    try:
+        preparation = await prepare_video_for_delivery(
+            video_path_obj,
+            dropbox_path,
+        )
+        caption_lines = [f"📁 {video_path_obj.stem}"]
+        if dropbox_path:
+            caption_lines.append(f"<code>{dropbox_path}</code>")
+        else:
+            caption_lines.append(f"<code>{video_path}</code>")
+        caption = "\n".join(caption_lines)
+
+        if preparation.fallback_message:
+            await bot.send_message(
+                telegram_user_id,
+                preparation.fallback_message,
+                parse_mode="HTML",
+            )
+        else:
+            await bot.send_video(
+                telegram_user_id,
+                FSInputFile(str(preparation.video_path)),
+                caption=caption,
+                parse_mode="HTML",
+            )
+        with contextlib.suppress(Exception):
+            await progress_msg.delete()
+        return True
+    except Exception as exc:
+        logger.error("Auto preview send failed for job %s: %s", job_id, exc)
+        with contextlib.suppress(Exception):
+            await progress_msg.edit_text("❌ Auto preview: failed to send video.")
+        return False
+    finally:
+        with contextlib.suppress(Exception):
+            video_path_obj.unlink()
+        with contextlib.suppress(Exception):
+            cleanup_job_files(job_id)
+        with contextlib.suppress(Exception):
+            cleanup_old_files(max_age_hours=6)
+
+
+async def _submit_auto_preview_deadline(
+    telegram_user_id: int,
+    job_id: str,
+    job_name: str,
+    default_worker: Optional[str],
+) -> None:
+    """Submit a Deadline preview job and register progress tracking."""
+    from app.services import create_video_from_job, WorkerStatusError
+
+    result = None
+    fallback_used = False
+    try:
+        result = await create_video_from_job(
+            telegram_user_id,
+            job_id,
+            specific_worker=default_worker,
+        )
+    except WorkerStatusError as worker_error:
+        logger.warning(
+            "Auto preview default worker unavailable for job %s: %s",
+            job_id,
+            worker_error,
+        )
+        if default_worker:
+            fallback_used = True
+        try:
+            result = await create_video_from_job(
+                telegram_user_id,
+                job_id,
+                use_any_machine=True,
+                skip_worker_validation=True,
+            )
+        except Exception as exc:
+            logger.error("Auto preview fallback submission failed for job %s: %s", job_id, exc)
+            result = None
+    except Exception as exc:
+        logger.error("Auto preview submission failed for job %s: %s", job_id, exc)
+        result = None
+
+    if not result:
+        await bot.send_message(
+            telegram_user_id,
+            "❌ Auto preview: failed to submit preview job.",
+        )
+        return
+
+    preview_id = result.get("preview_job_id")
+    header = f"🧾 Auto preview queued for {job_name}"
+    if fallback_used:
+        header += " (any worker)"
+    message_text = f"{header}\n□ □ □"
+    cancel_keyboard = (
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✖️ Cancel",
+                        callback_data=f"preview_job_cancel:{preview_id}",
+                    )
+                ]
+            ]
+        )
+        if preview_id
+        else None
+    )
+    progress_msg = await bot.send_message(
+        telegram_user_id,
+        message_text,
+        reply_markup=cancel_keyboard,
+    )
+    if preview_id:
+        register_preview_message(preview_id, progress_msg.chat.id, progress_msg.message_id)
+
+
+async def _run_auto_preview_for_job(
+    telegram_user_id: int,
+    job_id: str,
+    job_name: str,
+    login: str,
+    password: str,
+    preview_method: Optional[str],
+    default_worker: Optional[str],
+) -> None:
+    """Dispatch auto preview creation based on the user's configured method."""
+    if preview_method not in {"server", "deadline"}:
+        logger.info(
+            "Auto preview skipped for job %s: no default method set for user %s",
+            job_id,
+            telegram_user_id,
+        )
+        return
+
+    try:
+        sent_existing = await _send_dropbox_video_to_user(
+            telegram_user_id,
+            login,
+            password,
+            job_id,
+        )
+        if sent_existing:
+            return
+    except Exception as exc:
+        logger.warning("Auto preview Dropbox send failed for job %s: %s", job_id, exc)
+
+    try:
+        from types import SimpleNamespace
+        from app.bot.handlers.preview import render_preview_via_server, _maybe_send_single_frame_preview
+
+        class _AutoCallback:
+            def __init__(self, user_id: int) -> None:
+                self.from_user = SimpleNamespace(id=user_id)
+                self.message = None
+
+            async def answer(self, *args, **kwargs) -> None:
+                return None
+
+        auto_callback = _AutoCallback(telegram_user_id)
+
+        if preview_method == "deadline":
+            if await _maybe_send_single_frame_preview(auto_callback, job_id):
+                return
+            await _submit_auto_preview_deadline(
+                telegram_user_id,
+                job_id,
+                job_name,
+                default_worker,
+            )
+            return
+
+        await render_preview_via_server(auto_callback, job_id)
+    except Exception as exc:
+        logger.error("Auto preview workflow failed for job %s: %s", job_id, exc)
 
 def authorized_only(handler):
     """
@@ -1018,10 +1230,12 @@ async def job_progress_watcher(bot):
     import aiohttp
     from datetime import datetime, timezone, timedelta
     from app.auth import (
-        get_all_users_with_notifications,
+        _decrypt_password,
+        _normalize_scope,
+        VALID_PREVIEW_RENDER_METHODS,
         disable_notifications_for_user,
     )
-    from app.core.bot_core import notified_jobs, get_aiosession
+    from app.core.bot_core import notified_jobs, get_aiosession, auto_preview_jobs
     from app.core.database import get_db_connection
 
     try:
@@ -1035,63 +1249,96 @@ async def job_progress_watcher(bot):
 
             await asyncio.sleep(sleep_interval)
 
-            # Get users with notifications enabled for regular jobs
-            users_with_notifications = await get_all_users_with_notifications()
-            logger.info(f"Job progress watcher: Found {len(users_with_notifications)} users with notifications enabled")
-
-            # Get ALL users with credentials to monitor preview jobs
             conn = get_db_connection()
-            all_users_for_preview = []
+            user_rows = []
             if conn:
                 try:
                     async with conn.execute(
-                        "SELECT telegram_user_id, deadline_login, deadline_password FROM user_sessions"
+                        """
+                        SELECT telegram_user_id,
+                               deadline_login,
+                               deadline_password,
+                               notifications_enabled,
+                               notification_scope,
+                               preview_default_method,
+                               preview_default_worker,
+                               preview_auto_enabled
+                        FROM user_sessions
+                        """
                     ) as cursor:
-                        all_users_for_preview = await cursor.fetchall()
+                        user_rows = await cursor.fetchall()
                 except Exception as e:
-                    logger.error(f"Error fetching users for preview monitoring: {e}")
+                    logger.error("Error fetching users for monitoring: %s", e)
 
-            # Decrypt passwords and combine lists (use telegram_user_id as key to avoid duplicates)
-            from app.auth import _decrypt_password
-            users_dict = {}
-
-            # Add users with notifications
-            for user_id, login, password, scope in users_with_notifications:
+            users = []
+            for row in user_rows:
+                (
+                    user_id,
+                    login,
+                    password,
+                    notifications_enabled,
+                    scope_raw,
+                    preview_method_raw,
+                    preview_worker,
+                    preview_auto_enabled,
+                ) = row
                 try:
                     decrypted_password = _decrypt_password(password)
                 except Exception:
                     decrypted_password = password
-                users_dict[user_id] = (
-                    user_id,
-                    login,
-                    decrypted_password,
-                    True,
-                    scope,
-                )  # True = has notifications
 
-            # Add all users for preview monitoring
-            for user_id, login, password in all_users_for_preview:
-                if user_id not in users_dict:
-                    try:
-                        decrypted_password = _decrypt_password(password)
-                    except Exception:
-                        decrypted_password = password
-                    users_dict[user_id] = (
+                scope = _normalize_scope(scope_raw)
+                preview_method = (preview_method_raw or "").strip().lower()
+                if preview_method not in VALID_PREVIEW_RENDER_METHODS:
+                    preview_method = None
+
+                users.append(
+                    (
                         user_id,
                         login,
                         decrypted_password,
-                        False,
-                        "all",
-                    )  # False = no notifications
+                        bool(notifications_enabled),
+                        scope,
+                        preview_method,
+                        preview_worker,
+                        bool(preview_auto_enabled),
+                    )
+                )
 
-            logger.info(f"Job progress watcher: Monitoring {len(users_dict)} total users (notifications + preview)")
+            notify_count = sum(1 for item in users if item[3])
+            auto_preview_count = sum(1 for item in users if item[7])
+            logger.info(
+                "Job progress watcher: Monitoring %d users (%d notifications, %d auto previews)",
+                len(users),
+                notify_count,
+                auto_preview_count,
+            )
 
-            for telegram_user_id, login, decrypted_password, has_notifications, scope in users_dict.values():
+            def job_matches_scope(scope_value: str, login_value: str, props: dict, job_entry: dict) -> bool:
+                if scope_value != "own":
+                    return True
+                job_owner = props.get("User") or job_entry.get("UserName") or ""
+                if not job_owner:
+                    return False
+                normalized_login = str(login_value).split("\\")[-1].split("/")[-1].lower()
+                normalized_owner = str(job_owner).split("\\")[-1].split("/")[-1].lower()
+                return normalized_owner == normalized_login
+
+            for (
+                telegram_user_id,
+                login,
+                decrypted_password,
+                has_notifications,
+                scope,
+                preview_method,
+                preview_worker,
+                auto_preview_enabled,
+            ) in users:
 
                 try:
                     session = await get_aiosession()
                     headers = aiohttp.BasicAuth(login, decrypted_password)
-                    async with session.get(f"{settings.base_api_url}/jobs", auth=headers, ssl=False) as resp:
+                    async with session.get(f"{settings.deadline_api_url}/jobs", auth=headers, ssl=False) as resp:
                         if resp.status == 200:
                             jobs = await resp.json()
                             for job in jobs:
@@ -1169,9 +1416,6 @@ async def job_progress_watcher(bot):
                                 if stat != 3:
                                     continue
 
-                                if notified_key in notified_jobs:
-                                    continue
-
                                 date_comp_str = job.get("DateComp") or props.get("DateComp")
                                 if not date_comp_str or date_comp_str == "0001-01-01T00:00:00Z":
                                     continue
@@ -1186,6 +1430,8 @@ async def job_progress_watcher(bot):
                                     continue
 
                                 if is_preview_job:
+                                    if notified_key in notified_jobs:
+                                        continue
                                     notified_user_id = await _notify_preview_job_completion(
                                         telegram_user_id,
                                         job,
@@ -1199,25 +1445,30 @@ async def job_progress_watcher(bot):
                                     notified_jobs.add((job_id, resolved_user_id))
                                     continue
 
+                                if not job_matches_scope(scope, login, props, job):
+                                    continue
+
+                                if auto_preview_enabled and preview_method in {"server", "deadline"}:
+                                    auto_key = (job_id, telegram_user_id)
+                                    if auto_key not in auto_preview_jobs:
+                                        auto_preview_jobs.add(auto_key)
+                                        asyncio.create_task(
+                                            _run_auto_preview_for_job(
+                                                telegram_user_id,
+                                                job_id,
+                                                name,
+                                                login,
+                                                decrypted_password,
+                                                preview_method,
+                                                preview_worker,
+                                            )
+                                        )
+
                                 if not has_notifications:
                                     continue
 
-                                if scope == "own":
-                                    job_owner = (
-                                        props.get("User")
-                                        or job.get("UserName")
-                                        or ""
-                                    )
-                                    if not job_owner:
-                                        continue
-                                    normalized_login = (
-                                        str(login).split("\\")[-1].split("/")[-1].lower()
-                                    )
-                                    normalized_owner = (
-                                        str(job_owner).split("\\")[-1].split("/")[-1].lower()
-                                    )
-                                    if normalized_owner != normalized_login:
-                                        continue
+                                if notified_key in notified_jobs:
+                                    continue
 
                                 batch = props.get("Batch") or "No Batch"
                                 message_text = (

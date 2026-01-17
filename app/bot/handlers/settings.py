@@ -11,9 +11,11 @@ from app.auth import (
     get_notification_settings,
     get_preview_default_method,
     get_preview_default_worker,
+    get_preview_auto_enabled,
     is_authorized,
     set_notification_enabled,
     set_notification_scope,
+    set_preview_auto_enabled,
     set_preview_default_method,
     set_preview_default_worker,
 )
@@ -295,11 +297,21 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
                 raise
 
     async def show_preview_menu() -> None:
+        auto_enabled = await get_preview_auto_enabled(user_id)
         text_lines = [
             "Preview Settings",
+            f"Auto preview: {'enabled' if auto_enabled else 'disabled'}",
             "Choose what to configure for previews.",
+            "Auto preview uses your notification scope and default method.",
         ]
+        auto_toggle_label = "✅ Auto preview on completion" if auto_enabled else "☐ Auto preview on completion"
         keyboard_rows = [
+            [
+                InlineKeyboardButton(
+                    text=auto_toggle_label,
+                    callback_data="settings:preview:auto:toggle",
+                ),
+            ],
             [
                 InlineKeyboardButton(
                     text="🎛 Default Method",
@@ -384,6 +396,14 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
                         return
                     await show_preview_method()
                     return
+            if sub_action == "auto" and len(parts) > 3 and parts[3] == "toggle":
+                current_enabled = await get_preview_auto_enabled(user_id)
+                await set_preview_auto_enabled(user_id, not current_enabled)
+                await show_preview_menu()
+                await callback_query.answer(
+                    "Auto preview enabled" if not current_enabled else "Auto preview disabled"
+                )
+                return
 
     if action == "setup_script":
         script_path = Path(__file__).resolve().parents[3] / "scripts" / "worker_setup.ps1"

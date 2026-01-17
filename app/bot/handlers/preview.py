@@ -14,6 +14,7 @@ from app.core.config import settings
 from app.core.utils import cleanup_temp_and_conv, register_preview_message, pop_preview_message
 from app.integrations.dropbox_helpers import (
     download_exr_folder,
+    count_exr_files,
     fetch_dropbox_metadata,
     get_fresh_access_token,
     upload_video_to_dropbox,
@@ -40,6 +41,54 @@ from app.services import (
 logger = logging.getLogger(__name__)
 
 router = Router()
+
+def _resolve_dropbox_path(job_info: dict) -> Optional[str]:
+    outdirs = job_info.get("OutDir", [])
+    if not outdirs:
+        return None
+    fullpath = outdirs[0]
+    idx = fullpath.find(settings.dropbox_root_marker)
+    if idx == -1:
+        return None
+    trimmed = fullpath[idx:]
+    return "/" + trimmed.replace("\\", "/").lstrip("/")
+
+
+async def _maybe_send_single_frame_preview(
+    callback_query: CallbackQuery,
+    job_id: str,
+) -> bool:
+    if callback_query.from_user is None:
+        return False
+
+    job_info = await get_job_info_by_user_id(callback_query.from_user.id, job_id)
+    if not job_info:
+        return False
+
+    dropbox_path = _resolve_dropbox_path(job_info)
+    if not dropbox_path:
+        return False
+
+    headers_dbx = {
+        "Authorization": f"Bearer {get_fresh_access_token()}",
+        "Dropbox-API-Select-User": settings.dropbox_team_member_id,
+        "Dropbox-API-Path-Root": json.dumps(
+            {".tag": "root", "root": settings.dropbox_root_namespace_id}
+        ),
+        "Content-Type": "application/json",
+    }
+    session_dbx = await get_dropbox_session()
+    try:
+        total_files = await count_exr_files(session_dbx, dropbox_path, headers_dbx)
+    except Exception as exc:
+        logger.warning("Single-frame check failed for job %s: %s", job_id, exc)
+        return False
+
+    if total_files != 1:
+        return False
+
+    await render_preview_via_server(callback_query, job_id)
+    return True
 
 
 def _build_render_method_keyboard(job_id: str) -> InlineKeyboardMarkup:
@@ -96,6 +145,9 @@ async def _prompt_render_method(
 async def _start_deadline_preview(callback_query: CallbackQuery, job_id: str) -> None:
     if callback_query.from_user is None:
         await callback_query.answer("Error: user not found.", show_alert=True)
+        return
+
+    if await _maybe_send_single_frame_preview(callback_query, job_id):
         return
 
     default_worker = await get_preview_default_worker(callback_query.from_user.id)
@@ -234,6 +286,9 @@ async def create_new_video_process(
     """Submit a Deadline job that generates a preview video via ffmpeg."""
     if callback_query.from_user is None:
         await callback_query.answer("Error: user not found.", show_alert=True)
+        return
+
+    if await _maybe_send_single_frame_preview(callback_query, job_id):
         return
 
     if specific_worker:
@@ -752,6 +807,55 @@ async def render_preview_via_server(callback_query: CallbackQuery, job_id: str) 
             return
 
         conv_dir = Path(settings.conv_dir) / f"{exr_folder_name}_{job_id}"
+        image_files = []
+        for pattern in ("*.jpg", "*.jpeg", "*.png"):
+            image_files.extend(conv_dir.rglob(pattern))
+        if len(image_files) == 1:
+            await progress_msg.edit_text(
+                "🖼️ Step 2: Sending single frame...",
+                reply_markup=cancel_keyboard,
+            )
+            if await finalize_cancellation():
+                return
+
+            image_path = image_files[0]
+            project_name = image_path.stem
+            try:
+                path_parts = (dropbox_path or "").split("/")
+                for idx_part, part in enumerate(path_parts):
+                    if part == "render" and idx_part + 1 < len(path_parts):
+                        project_name = path_parts[idx_part + 1]
+                        break
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+            caption_lines = [f"🖼️ {project_name}"]
+            if dropbox_path:
+                caption_lines.append(f"<code>{dropbox_path}</code>")
+            caption = "\n".join(caption_lines)
+
+            if callback_query.message:
+                await callback_query.message.answer_photo(
+                    photo=FSInputFile(str(image_path)),
+                    caption=caption,
+                    parse_mode="HTML",
+                )
+            else:
+                await bot.send_photo(
+                    callback_query.from_user.id,
+                    FSInputFile(str(image_path)),
+                    caption=caption,
+                    parse_mode="HTML",
+                )
+
+            with contextlib.suppress(Exception):
+                await progress_msg.delete()
+            try:
+                await callback_query.answer("Frame sent successfully!")
+            except Exception as answer_error:  # pragma: no cover - telegram timing
+                logger.warning("Could not answer callback query: %s", answer_error)
+            return
+
         await progress_msg.edit_text(
             "🎬 Step 2: Processing frames and creating video...",
             reply_markup=cancel_keyboard,

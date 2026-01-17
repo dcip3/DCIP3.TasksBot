@@ -16,7 +16,7 @@ import aiohttp
 import logging
 
 # Bot and dispatcher instances
-bot = Bot(token=settings.tg_api_token)
+bot = Bot(token=settings.telegram_bot_token)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
@@ -28,6 +28,7 @@ stop_downloads: Dict[str, asyncio.Event] = {}
 # Stores (job_id, user_id) pairs with 1 hour TTL
 # After 1 hour, notifications for the same job can be sent again
 notified_jobs = TTLCache(ttl_seconds=3600, max_size=10000)
+auto_preview_jobs = TTLCache(ttl_seconds=3600, max_size=10000)
 
 current_downloads: int = 0
 conversion_semaphore = asyncio.Semaphore(1)

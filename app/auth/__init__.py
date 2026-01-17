@@ -138,7 +138,7 @@ async def authenticate_user(username: str, password: str, telegram_user_id: int)
     try:
         async with aiohttp.ClientSession() as session:
             auth = aiohttp.BasicAuth(username, password)
-            async with session.get(f"{settings.base_api_url}/jobs", auth=auth, ssl=False) as resp:
+            async with session.get(f"{settings.deadline_api_url}/jobs", auth=auth, ssl=False) as resp:
                 if resp.status == 200:
                     return True
                 else:
@@ -175,18 +175,6 @@ async def is_authorized(telegram_user_id: int) -> bool:
     else:
         logger.warning("Database connection not available")
     
-    # Fallback: check credentials.json if used
-    try:
-        from app.core.config import get_auth_credentials
-        login, password, _ = get_auth_credentials(str(telegram_user_id))
-        if login and password:
-            logger.info(f"User {telegram_user_id} is authorized (found in credentials.json)")
-            return True
-        else:
-            logger.info(f"User {telegram_user_id} not found in credentials.json")
-    except Exception as e:
-        logger.error(f"Error checking credentials.json for {telegram_user_id}: {e}")
-    
     logger.info(f"User {telegram_user_id} is not authorized")
     return False
 
@@ -215,14 +203,6 @@ async def logout_user(telegram_user_id: int) -> bool:
         except Exception as e:
             logger.error(f"Failed to remove user_sessions for {telegram_user_id}: {e}")
             success = False
-    
-    # Remove from credentials.json if exists
-    try:
-        from app.core.config import remove_auth_credentials
-        remove_auth_credentials(str(telegram_user_id))
-    except Exception as e:
-        logger.error(f"Failed to remove credentials.json for {telegram_user_id}: {e}")
-        success = False
     
     if success:
         logger.info(f"User with telegram_id {telegram_user_id} logged out")
@@ -515,6 +495,53 @@ async def set_preview_default_method(telegram_user_id: int, method: Optional[str
     """
     conn = get_db_connection()
     if conn is None:
+        return False
+
+
+async def get_preview_auto_enabled(telegram_user_id: int) -> bool:
+    """
+    Get the auto-preview enabled flag for a user.
+    """
+    conn = get_db_connection()
+    if conn is None:
+        return False
+
+    try:
+        async with conn.execute(
+            "SELECT preview_auto_enabled FROM user_sessions WHERE telegram_user_id = ?",
+            (telegram_user_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return False
+            return bool(row[0])
+    except Exception as e:
+        logger.error("Failed to fetch preview auto flag for user %s: %s", telegram_user_id, e)
+        return False
+
+
+async def set_preview_auto_enabled(telegram_user_id: int, enabled: bool) -> bool:
+    """
+    Enable or disable auto-preview for a user.
+    """
+    conn = get_db_connection()
+    if conn is None:
+        return False
+
+    try:
+        await conn.execute(
+            """
+            UPDATE user_sessions
+            SET preview_auto_enabled = ?
+            WHERE telegram_user_id = ?
+            """,
+            (1 if enabled else 0, telegram_user_id),
+        )
+        await conn.commit()
+        logger.info("User %s preview auto flag set to %s", telegram_user_id, enabled)
+        return True
+    except Exception as e:
+        logger.error("Failed to set preview auto flag for user %s: %s", telegram_user_id, e)
         return False
 
     normalized: Optional[str]

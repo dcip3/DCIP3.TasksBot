@@ -5,9 +5,10 @@ TasksBot is a Telegram bot for monitoring Deadline render jobs, managing queues,
 ## Key Features
 - aiogram 3.x bot with FSM-based flows for authentication and job control
 - Telegram bot backend with integrations for Deadline and Dropbox
-- EXR → MP4 conversion with OCIO color management and Dropbox upload
+- EXR → MP4 conversion with OCIO color management (server pipeline uploads to Dropbox)
 - Two preview pipelines: render via Deadline or locally on the bot host
 - Granular notification settings (all jobs vs. owned jobs)
+- Auto preview on job completion (per-user scope and default method)
 - Docker Compose stack for containerized deployment
 
 ## Architecture Overview
@@ -21,7 +22,7 @@ TasksBot is a Telegram bot for monitoring Deadline render jobs, managing queues,
 
 ### Prerequisites
 - Python ≥ 3.11
-- FFmpeg available in `$PATH` (or set `FFMPEG_PATH`)
+- FFmpeg available in `$PATH` on the bot host; Deadline workers need ffmpeg in `$PATH` or `FFMPEG_PATH`
 - Docker & Docker Compose for containerized deployment
 
 ### 1. Clone & Configure Environment
@@ -35,11 +36,11 @@ Fill in `.env` (see [Configuration](#configuration)).
 ### 2. Run with Docker
 ```bash
 docker compose up --build
-docker compose logs -f backend   # follow bot logs
+docker compose logs -f tasksbot   # follow bot logs
 ```
 
 ### 3. Local Development
-Backend + bot:
+Bot:
 ```bash
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
@@ -53,9 +54,7 @@ All configuration lives in `.env`. Use the tables below as a checklist.
 ### Core / Security
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `BASE_API_URL` | Deadline REST endpoint (should include scheme + port) | `https://deadline.local:8443/api` |
-| `HTTP_TIMEOUT` | Timeout (seconds) for external HTTP calls | `30` |
-| `DEV_MODE` | Development flag (must be `false` in production) | `false` |
+| `DEADLINE_API_URL` | Deadline REST endpoint (should include scheme + port) | `https://renderfarm.local:4434/api` |
 | `PASSWORD_SALT` | Salt for hashing stored credentials | `change-me` |
 | `ENCRYPTION_KEY` | Fernet key for secrets in storage | `generated-with-fernet` |
 
@@ -67,10 +66,10 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 ### Telegram
 | Variable | Description | How to obtain | Example |
 |----------|-------------|---------------|---------|
-| `TG_API_TOKEN` | Telegram bot token | @BotFather | `123456789:ABCdef...` |
+| `TELEGRAM_BOT_TOKEN` | Telegram bot token | @BotFather | `123456789:ABCdef...` |
 
 ```bash
-TG_API_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
+TELEGRAM_BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
 ```
 
 ### Dropbox
@@ -90,21 +89,18 @@ TG_API_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
 ### Storage & Media
 | Variable | Description | Default / Example |
 |----------|-------------|-------------------|
-| `DB_PATH` | SQLite database location | `data/app.db` |
+| `SQLITE_DB_PATH` | SQLite database location | `data/app.db` |
 | `TEMP_DIR` | Temporary downloads | `data/temp` |
 | `CONV_DIR` | Converted previews | `data/conv` |
 | `OCIO_CONFIG_PATH` | Path to OCIO config used during previews | `data/config.ocio` |
-| `FFMPEG_PATH` | FFmpeg binary (local or on workers) | `ffmpeg` |
+| `FFMPEG_PATH` | FFmpeg binary on Deadline workers | `ffmpeg` |
 | `PREVIEW_*` | Fine-tunes color pipeline (apply transform, LUT size, etc.) | see `.env.example` |
-| `MAX_CONCURRENT_DOWNLOADS` | Parallel Dropbox downloads | `2` |
-| `MIN_FREE_SPACE_BYTES` | Minimum disk space before aborting (bytes) | `10737418240` |
-
 ```bash
 mkdir -p data/temp data/conv
 cp /path/to/config.ocio data/config.ocio
 ```
 
-Restart the service after any configuration change (`docker compose restart backend` or relaunch `python main.py`).
+Restart the service after any configuration change (`docker compose restart tasksbot` or relaunch `python main.py`).
 
 ## Telegram Bot Usage
 
@@ -114,19 +110,22 @@ Restart the service after any configuration change (`docker compose restart back
 | `/start` | Show main menu |
 | `/login` | Authenticate with Deadline credentials |
 | `/logout` | Sign out and clear session |
-| `/cancel` | Abort the current FSM step |
+| `/help` | Show help |
 
 ### Main Menu
 - **📂 Jobs** — paginated batch list with actions (preview, suspend/resume, requeue, delete, tasks)
 - **🖥️ Workers** — render node status overview
-- **⚙️ Settings** — notification preferences and preview defaults
-- **ℹ️ Help** — show help and commands
+- **⚙️ Settings** — notification preferences, preview defaults, auto preview
 
 ### Preview Workflow
 1. Check Dropbox for existing preview video.  
 2. If absent, let the user choose between Deadline render or local server workflow.  
 3. For the local workflow: download EXRs, assemble MP4, upload to Dropbox, send to chat.  
 4. Clean up temporary files when finished.
+
+Single-frame outputs are sent as photos instead of videos.
+
+Auto preview can be enabled in Settings; it uses the notification scope and default preview method.
 
 ## Project Structure
 ```
@@ -156,9 +155,9 @@ Restart the service after any configuration change (`docker compose restart back
 - **Handlers**: add routers under `app/bot/handlers/` and register them via `register_handlers()` in `__init__.py`.
 
 ## Troubleshooting
-- **Bot fails to start** — inspect `docker compose logs backend`, verify `.env`, confirm Telegram token.
-- **Authentication issues** — ensure Deadline API (`BASE_API_URL`) is reachable and credentials are valid.
-- **Preview failures** — check `OCIO_CONFIG_PATH`, `FFMPEG_PATH`, free space (`MIN_FREE_SPACE_BYTES`), and Dropbox EXR availability.
+- **Bot fails to start** — check `docker compose logs tasksbot`, confirm `.env` keys are present, and verify the Telegram token.
+- **Authorization errors** — confirm `DEADLINE_API_URL` is reachable and credentials are correct.
+- **Preview generation issues** — verify `OCIO_CONFIG_PATH` and `FFMPEG_PATH`, and ensure Dropbox paths resolve for the render outputs.
 
-## Support & License
-Open issues or PRs in the repository or contact the team directly. Specify the project license here (e.g., MIT) once finalized.
+## Support
+Open issues or PRs in the repository or contact the team directly.

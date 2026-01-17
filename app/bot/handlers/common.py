@@ -5,7 +5,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
-from app.bot.handlers.auth import LoginStates
+from app.bot.handlers.auth import LoginStates, build_login_cancel_keyboard
 from app.core.bot_core import bot
 from app.core.utils import get_main_keyboard
 
@@ -52,11 +52,13 @@ async def handle_unknown_message(message: Message, state: FSMContext) -> None:
     if current_state in [LoginStates.USERNAME, LoginStates.PASSWORD]:
         if current_state == LoginStates.USERNAME:
             await message.answer(
-                "Please enter your Deadline login, or use /cancel to stop the login process."
+                "Please enter your Deadline login.",
+                reply_markup=build_login_cancel_keyboard(),
             )
         elif current_state == LoginStates.PASSWORD:
             await message.answer(
-                "Please enter your Deadline password, or use /cancel to stop the login process."
+                "Please enter your Deadline password.",
+                reply_markup=build_login_cancel_keyboard(),
             )
         return
 

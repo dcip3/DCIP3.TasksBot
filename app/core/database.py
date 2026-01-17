@@ -26,12 +26,12 @@ async def init_db():
     - user_sessions: Stores user session data and credentials
     """
     global tasks_db_conn
-    db_path = Path(settings.db_path)
+    db_path = Path(settings.sqlite_db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     if db_path.exists() and db_path.is_dir():
         error_message = (
-            f"Configured DB_PATH '{db_path}' points to a directory. "
+            f"Configured SQLITE_DB_PATH '{db_path}' points to a directory. "
             "If you're running via Docker, ensure the bind mount targets a file "
             "or mount the entire data directory (e.g. ./data:/app/data)."
         )
@@ -42,7 +42,7 @@ async def init_db():
         db_path.touch()
         logger.info("Created new SQLite database file at %s", db_path)
 
-    tasks_db_conn = await aiosqlite.connect(settings.db_path)
+    tasks_db_conn = await aiosqlite.connect(settings.sqlite_db_path)
     
     # Create users table for authentication and user management
     await tasks_db_conn.execute("""
@@ -68,6 +68,7 @@ async def init_db():
             notification_scope TEXT DEFAULT 'all',
             preview_default_worker TEXT,
             preview_default_method TEXT,
+            preview_auto_enabled INTEGER DEFAULT 0,
             last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (telegram_user_id) REFERENCES users(telegram_user_id)
         )
@@ -131,6 +132,21 @@ async def init_db():
             logger.debug("preview_default_method column already exists on user_sessions table")
         else:
             logger.error("Failed to ensure preview_default_method column: %s", column_error)
+            raise
+
+    # Ensure preview_auto_enabled column exists for legacy databases
+    try:
+        await tasks_db_conn.execute(
+            "ALTER TABLE user_sessions ADD COLUMN preview_auto_enabled INTEGER DEFAULT 0"
+        )
+        await tasks_db_conn.commit()
+        logger.info("Added preview_auto_enabled column to user_sessions table")
+    except aiosqlite.OperationalError as column_error:
+        message = str(column_error).lower()
+        if "duplicate column name" in message:
+            logger.debug("preview_auto_enabled column already exists on user_sessions table")
+        else:
+            logger.error("Failed to ensure preview_auto_enabled column: %s", column_error)
             raise
 
     await tasks_db_conn.commit()
