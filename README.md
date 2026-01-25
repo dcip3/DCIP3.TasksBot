@@ -100,6 +100,24 @@ mkdir -p data/temp data/conv
 cp /path/to/config.ocio data/config.ocio
 ```
 
+### Preview Upload (Worker -> Bot)
+Enable this if you want Deadline workers to POST the finished preview directly to the bot host.
+This is useful when renders are stored on worker-local disks.
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `PREVIEW_UPLOAD_ENABLED` | Enable preview upload endpoint | `true` |
+| `PREVIEW_UPLOAD_URL` | Public URL workers POST to | `http://your-public-ip:8081/preview-upload` |
+| `PREVIEW_UPLOAD_BIND_HOST` | Bind host on the bot container | `0.0.0.0` |
+| `PREVIEW_UPLOAD_PORT` | Port for upload endpoint | `8081` |
+| `PREVIEW_UPLOAD_TOKEN_TTL` | Token TTL in seconds | `1800` |
+| `PREVIEW_UPLOAD_MAX_MB` | Max upload size | `100` |
+| `PREVIEW_UPLOAD_INSECURE` | Allow insecure TLS (self-signed) | `false` |
+
+Open the upload port in your firewall, and keep the endpoint private to your workers.
+If you do not have TLS, the upload will be plain HTTP; tokens are short-lived but still sensitive.
+Ensure Docker exposes `PREVIEW_UPLOAD_PORT` so workers can reach the endpoint.
+
 Restart the service after any configuration change (`docker compose restart tasksbot` or relaunch `python main.py`).
 
 ## Telegram Bot Usage

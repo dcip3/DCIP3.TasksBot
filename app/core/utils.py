@@ -263,15 +263,15 @@ async def _notify_preview_job_completion(
         final_path = local_path
         dropbox_path = dropbox_path or dropbox_path_hint
 
+    from app.core.path_utils import normalize_display_path
+
     max_video_size_mb = 45.0
     size_mb = get_file_size_mb(final_path)
+    path_hint = dropbox_path if dropbox_path else str(final_path)
+    display_path = normalize_display_path(path_hint) or str(final_path)
     fallback_message = None
     if size_mb > max_video_size_mb:
-        location_hint = (
-            f"<code>{dropbox_path}</code>"
-            if dropbox_path
-            else f"<code>{final_path}</code>"
-        )
+        location_hint = f"<code>{display_path}</code>"
         fallback_message = (
             "⚠️ Preview video is ready but too large to send via Telegram "
             f"({size_mb:.1f} MB > {max_video_size_mb:.0f} MB).\n"
@@ -279,8 +279,8 @@ async def _notify_preview_job_completion(
         )
 
     caption_parts = [f"📁 {final_path.name}"]
-    if dropbox_path:
-        caption_parts.append(f"<code>{dropbox_path}</code>")
+    if display_path:
+        caption_parts.append(f"<code>{display_path}</code>")
     caption = "\n".join(caption_parts)
 
     ready_text = f"🎬 Preview for {job_name} is ready."
@@ -1115,7 +1115,10 @@ async def on_startup(bot):
     # Initialize database
     await init_db()
     logger.info("Database initialized")
-    
+
+    from app.core.preview_upload import start_preview_upload_server
+    await start_preview_upload_server()
+
     # Initialize directories
     ensure_temp_dir()
     Path(settings.conv_dir).mkdir(exist_ok=True)
@@ -1202,6 +1205,9 @@ async def on_shutdown(bot):
         except Exception as exc:
             logger.warning("Job progress watcher failed during shutdown: %s", exc)
     job_watcher_task = None
+
+    from app.core.preview_upload import stop_preview_upload_server
+    await stop_preview_upload_server()
     
     # Close database connection
     await close_db()

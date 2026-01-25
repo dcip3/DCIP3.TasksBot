@@ -15,15 +15,18 @@ from __future__ import annotations
 import argparse
 import atexit
 import gc
+import http.client
 import logging
 import os
 import re
 import shutil
 import signal
+import ssl
 import subprocess
 import sys
 import tempfile
 import contextlib
+import urllib.parse
 from pathlib import Path
 from typing import Optional, List, Tuple, Set, Union
 
@@ -560,6 +563,92 @@ def parse_arguments(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _env_flag(name: str) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _maybe_upload_preview(output_path: Path) -> None:
+    upload_url = os.environ.get("PREVIEW_UPLOAD_URL", "").strip()
+    token = os.environ.get("PREVIEW_UPLOAD_TOKEN", "").strip()
+    if not upload_url or not token:
+        return
+
+    try:
+        ok = _upload_preview_file(output_path, upload_url, token, _env_flag("PREVIEW_UPLOAD_INSECURE"))
+        if ok:
+            logging.info("Preview upload succeeded")
+        else:
+            logging.warning("Preview upload failed")
+    except Exception as exc:
+        logging.warning("Preview upload error: %s", exc)
+
+
+def _upload_preview_file(
+    output_path: Path,
+    upload_url: str,
+    token: str,
+    insecure: bool,
+    timeout: int = 120,
+) -> bool:
+    parsed = urllib.parse.urlparse(upload_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        logging.warning("Preview upload URL has unsupported format: %s", upload_url)
+        return False
+
+    if not output_path.exists():
+        logging.warning("Preview upload file not found: %s", output_path)
+        return False
+
+    path = parsed.path or "/preview-upload"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+
+    file_size = output_path.stat().st_size
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    if parsed.scheme == "https":
+        context = ssl._create_unverified_context() if insecure else None
+        connection: http.client.HTTPConnection = http.client.HTTPSConnection(
+            parsed.hostname,
+            port,
+            timeout=timeout,
+            context=context,
+        )
+    else:
+        connection = http.client.HTTPConnection(parsed.hostname, port, timeout=timeout)
+
+    try:
+        connection.putrequest("POST", path)
+        connection.putheader("Content-Type", "application/octet-stream")
+        connection.putheader("Content-Length", str(file_size))
+        connection.putheader("X-Preview-Token", token)
+        connection.putheader("X-Preview-Filename", output_path.name)
+        connection.endheaders()
+
+        with open(output_path, "rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                connection.send(chunk)
+
+        response = connection.getresponse()
+        response_body = response.read(200)
+        if 200 <= response.status < 300:
+            return True
+        logging.warning(
+            "Preview upload responded with %s: %s",
+            response.status,
+            response_body.decode("utf-8", errors="ignore"),
+        )
+        return False
+    finally:
+        try:
+            connection.close()
+        except Exception:
+            pass
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_arguments(argv)
     configure_logging(args.verbose)
@@ -632,6 +721,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         run_ffmpeg(command)
         _compress_if_needed(Path(args.output_path), args.ffmpeg_path, args.max_size_mb)
         logging.info("Preview video successfully written to %s", args.output_path)
+        _maybe_upload_preview(Path(args.output_path))
 
         if apply_color and color_mode == "lut" and args.keep_lut:
             logging.info("LUT kept at %s", lut_path)

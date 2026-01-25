@@ -85,6 +85,36 @@ class Settings(BaseSettings):
         description="Color transform mode for previews: 'lut' generates a LUT, 'cpu' applies OCIO on CPU",
     )
     ffmpeg_path: str = Field("ffmpeg", description="Path to ffmpeg executable on Deadline workers")
+    preview_upload_enabled: bool = Field(
+        False,
+        description="Enable worker-to-bot preview upload endpoint",
+    )
+    preview_upload_bind_host: str = Field(
+        "0.0.0.0",
+        description="Bind host for preview upload HTTP server",
+    )
+    preview_upload_port: int = Field(
+        8081,
+        description="Port for preview upload HTTP server",
+    )
+    preview_upload_url: Optional[str] = Field(
+        default=None,
+        description="Public URL that workers should POST previews to",
+    )
+    preview_upload_token_ttl: int = Field(
+        1800,
+        ge=60,
+        description="One-time preview upload token TTL in seconds",
+    )
+    preview_upload_max_mb: int = Field(
+        100,
+        ge=1,
+        description="Max upload size for preview videos in MB",
+    )
+    preview_upload_insecure: bool = Field(
+        False,
+        description="Allow insecure TLS for worker uploads (self-signed certs)",
+    )
 
     # Security Settings
     password_salt: str = Field(..., description="Salt for password hashing")

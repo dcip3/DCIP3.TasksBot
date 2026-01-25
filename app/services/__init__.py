@@ -911,6 +911,7 @@ async def create_video_from_job(
 
     output_path = outdirs[0]
     idx = output_path.find(settings.dropbox_root_marker)
+    dropbox_marker_found = idx != -1
     if idx == -1:
         logger.warning("Dropbox root marker not found in path: %s", output_path)
         dropbox_folder = output_path.replace("\\", "/")
@@ -962,6 +963,28 @@ async def create_video_from_job(
             expected_dropbox_video = str(dropbox_parent / video_filename)
     else:
         expected_dropbox_video = video_filename
+
+    upload_token: Optional[str] = None
+    upload_url: Optional[str] = None
+    if settings.preview_upload_enabled:
+        from app.core.preview_upload import (
+            PreviewUploadPayload,
+            get_preview_upload_url,
+            issue_preview_upload_token,
+        )
+
+        upload_url = get_preview_upload_url()
+        if upload_url:
+            dropbox_hint = expected_dropbox_video if dropbox_marker_found else None
+            payload = PreviewUploadPayload(
+                telegram_user_id=telegram_user_id,
+                job_name=str(props.get("Name") or props.get("Batch") or job_id),
+                expected_dropbox_path=dropbox_hint,
+                expected_filename=video_filename,
+                expected_local_path=expected_local_path,
+                source_job_id=job_id,
+            )
+            upload_token = issue_preview_upload_token(payload)
 
     frames_str = props.get("Frames", "")
     start_match = re.search(r"-?\d+", frames_str)
@@ -1170,6 +1193,11 @@ async def create_video_from_job(
         "PREVIEW_ARGV_B64": argv_b64,
         "PREVIEW_STUB": stub_code,
     }
+    if upload_token and upload_url:
+        environment_pairs["PREVIEW_UPLOAD_URL"] = upload_url
+        environment_pairs["PREVIEW_UPLOAD_TOKEN"] = upload_token
+        if settings.preview_upload_insecure:
+            environment_pairs["PREVIEW_UPLOAD_INSECURE"] = "1"
     if apply_color and remote_config_path:
         environment_pairs["OCIO"] = remote_config_path
 
@@ -1269,6 +1297,14 @@ async def create_video_from_job(
         command_line,
         preferred_slaves,
     )
+
+    if upload_token:
+        from app.core.preview_upload import drop_preview_upload_token, update_preview_upload_token
+
+        if preview_job_id:
+            update_preview_upload_token(upload_token, str(preview_job_id))
+        else:
+            drop_preview_upload_token(upload_token)
 
     return {
         "preview_job_id": preview_job_id,
