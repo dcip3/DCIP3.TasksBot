@@ -73,6 +73,20 @@ async def init_db():
             FOREIGN KEY (telegram_user_id) REFERENCES users(telegram_user_id)
         )
     """)
+
+    # Store preview upload tokens to survive bot restarts
+    await tasks_db_conn.execute("""
+        CREATE TABLE IF NOT EXISTS preview_upload_tokens (
+            token TEXT PRIMARY KEY,
+            expires_at INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            payload_json TEXT NOT NULL
+        )
+    """)
+    await tasks_db_conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_preview_upload_tokens_expires
+        ON preview_upload_tokens(expires_at)
+    """)
     
     # Create indexes for better performance
     await tasks_db_conn.execute("""

@@ -5,13 +5,15 @@ Preview upload endpoint and token helpers for worker-to-bot delivery.
 from __future__ import annotations
 
 import html
+import json
 import logging
 import secrets
+import sqlite3
+import time
 import urllib.parse
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Dict, Tuple
+from typing import Optional
 
 from aiohttp import web
 from aiogram.types import FSInputFile
@@ -39,61 +41,155 @@ class PreviewUploadPayload:
 
 class PreviewUploadTokenStore:
     def __init__(self, ttl_seconds: int, max_size: int = 10000) -> None:
-        self._ttl = timedelta(seconds=ttl_seconds)
+        self._ttl_seconds = int(ttl_seconds)
         self._max_size = max_size
-        self._entries: Dict[str, Tuple[datetime, PreviewUploadPayload]] = {}
+
+    def _open_db(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(settings.sqlite_db_path)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS preview_upload_tokens (
+                token TEXT PRIMARY KEY,
+                expires_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                payload_json TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_preview_upload_tokens_expires
+            ON preview_upload_tokens(expires_at)
+            """
+        )
+        return conn
+
+    def _serialize_payload(self, payload: PreviewUploadPayload) -> str:
+        data = {
+            "telegram_user_id": payload.telegram_user_id,
+            "job_name": payload.job_name,
+            "expected_dropbox_path": payload.expected_dropbox_path,
+            "expected_filename": payload.expected_filename,
+            "expected_local_path": payload.expected_local_path,
+            "preview_job_id": payload.preview_job_id,
+            "source_job_id": payload.source_job_id,
+        }
+        return json.dumps(data, ensure_ascii=True)
+
+    def _deserialize_payload(self, raw: str) -> Optional[PreviewUploadPayload]:
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        try:
+            return PreviewUploadPayload(
+                telegram_user_id=int(data.get("telegram_user_id")),
+                job_name=str(data.get("job_name") or ""),
+                expected_dropbox_path=data.get("expected_dropbox_path"),
+                expected_filename=data.get("expected_filename"),
+                expected_local_path=data.get("expected_local_path"),
+                preview_job_id=data.get("preview_job_id"),
+                source_job_id=data.get("source_job_id"),
+            )
+        except Exception:
+            return None
+
+    def _cleanup(self, conn: sqlite3.Connection) -> None:
+        now = int(time.time())
+        conn.execute("DELETE FROM preview_upload_tokens WHERE expires_at <= ?", (now,))
+        if self._max_size <= 0:
+            return
+        cur = conn.execute("SELECT COUNT(*) FROM preview_upload_tokens")
+        row = cur.fetchone()
+        total = row[0] if row else 0
+        overflow = total - self._max_size
+        if overflow > 0:
+            conn.execute(
+                """
+                DELETE FROM preview_upload_tokens
+                WHERE token IN (
+                    SELECT token FROM preview_upload_tokens
+                    ORDER BY created_at ASC
+                    LIMIT ?
+                )
+                """,
+                (overflow,),
+            )
 
     def issue(self, payload: PreviewUploadPayload) -> str:
         token = secrets.token_urlsafe(32)
-        self._entries[token] = (datetime.utcnow() + self._ttl, payload)
-        self._cleanup()
+        now = int(time.time())
+        expires_at = now + self._ttl_seconds
+        with self._open_db() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO preview_upload_tokens
+                (token, expires_at, created_at, payload_json)
+                VALUES (?, ?, ?, ?)
+                """,
+                (token, expires_at, now, self._serialize_payload(payload)),
+            )
+            self._cleanup(conn)
         return token
 
     def update(self, token: str, **updates: object) -> bool:
-        entry = self._entries.get(token)
-        if not entry:
-            return False
-        expires_at, payload = entry
-        if self._is_expired(expires_at):
-            self._entries.pop(token, None)
-            return False
-        for key, value in updates.items():
-            if hasattr(payload, key):
-                setattr(payload, key, value)
-        return True
+        with self._open_db() as conn:
+            cur = conn.execute(
+                "SELECT expires_at, payload_json FROM preview_upload_tokens WHERE token = ?",
+                (token,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
+            expires_at, payload_json = row
+            if int(expires_at) <= int(time.time()):
+                conn.execute("DELETE FROM preview_upload_tokens WHERE token = ?", (token,))
+                return False
+            payload = self._deserialize_payload(payload_json)
+            if payload is None:
+                conn.execute("DELETE FROM preview_upload_tokens WHERE token = ?", (token,))
+                return False
+            for key, value in updates.items():
+                if hasattr(payload, key):
+                    setattr(payload, key, value)
+            conn.execute(
+                "UPDATE preview_upload_tokens SET payload_json = ? WHERE token = ?",
+                (self._serialize_payload(payload), token),
+            )
+            return True
 
     def get(self, token: str) -> Optional[PreviewUploadPayload]:
-        entry = self._entries.get(token)
-        if not entry:
-            return None
-        expires_at, payload = entry
-        if self._is_expired(expires_at):
-            self._entries.pop(token, None)
-            return None
-        return payload
+        with self._open_db() as conn:
+            cur = conn.execute(
+                "SELECT expires_at, payload_json FROM preview_upload_tokens WHERE token = ?",
+                (token,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            expires_at, payload_json = row
+            if int(expires_at) <= int(time.time()):
+                conn.execute("DELETE FROM preview_upload_tokens WHERE token = ?", (token,))
+                return None
+            return self._deserialize_payload(payload_json)
 
     def consume(self, token: str) -> Optional[PreviewUploadPayload]:
         payload = self.get(token)
         if payload is None:
             return None
-        self._entries.pop(token, None)
+        with self._open_db() as conn:
+            conn.execute("DELETE FROM preview_upload_tokens WHERE token = ?", (token,))
         return payload
 
     def drop(self, token: str) -> None:
-        self._entries.pop(token, None)
+        with self._open_db() as conn:
+            conn.execute("DELETE FROM preview_upload_tokens WHERE token = ?", (token,))
 
-    def _is_expired(self, expires_at: datetime) -> bool:
-        return datetime.utcnow() >= expires_at
-
-    def _cleanup(self) -> None:
-        now = datetime.utcnow()
-        expired = [token for token, (expires_at, _) in self._entries.items() if expires_at <= now]
-        for token in expired:
-            self._entries.pop(token, None)
-        if len(self._entries) > self._max_size:
-            overflow = len(self._entries) - self._max_size
-            for token in list(self._entries.keys())[:overflow]:
-                self._entries.pop(token, None)
+    def cleanup(self) -> None:
+        with self._open_db() as conn:
+            self._cleanup(conn)
 
 
 _token_store = PreviewUploadTokenStore(
@@ -130,6 +226,10 @@ def update_preview_upload_token(token: str, preview_job_id: str) -> None:
 
 def drop_preview_upload_token(token: str) -> None:
     _token_store.drop(token)
+
+
+def cleanup_preview_upload_tokens() -> None:
+    _token_store.cleanup()
 
 
 async def start_preview_upload_server() -> None:

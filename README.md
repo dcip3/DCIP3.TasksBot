@@ -110,7 +110,7 @@ This is useful when renders are stored on worker-local disks.
 | `PREVIEW_UPLOAD_URL` | Public URL workers POST to | `http://your-public-ip:8081/preview-upload` |
 | `PREVIEW_UPLOAD_BIND_HOST` | Bind host on the bot container | `0.0.0.0` |
 | `PREVIEW_UPLOAD_PORT` | Port for upload endpoint | `8081` |
-| `PREVIEW_UPLOAD_TOKEN_TTL` | Token TTL in seconds | `1800` |
+| `PREVIEW_UPLOAD_TOKEN_TTL` | Token TTL in seconds | `43200` |
 | `PREVIEW_UPLOAD_MAX_MB` | Max upload size | `100` |
 | `PREVIEW_UPLOAD_INSECURE` | Allow insecure TLS (self-signed) | `false` |
 

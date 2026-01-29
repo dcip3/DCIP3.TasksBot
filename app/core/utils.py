@@ -129,11 +129,11 @@ async def _run_preview_animation(preview_job_id: str, chat_id: int, message_id: 
 def _extract_preview_context(
     props: Dict[str, Any],
     default_user_id: int,
-) -> Tuple[str, str, int, Dict[str, Any]]:
+) -> Tuple[str, str, int, Dict[str, Any], Optional[str]]:
     """Extract preview metadata from job properties.
 
     Returns local/dropbox path hints, resolved target Telegram user ID,
-    and a sanitized copy of the Extra dictionary.
+    a sanitized copy of the Extra dictionary, and optional source job ID.
     """
 
     local_path_hint = props.get("Ex0") or ""
@@ -146,6 +146,7 @@ def _extract_preview_context(
     local_path_hint = extra_dict.get("PreviewLocal", local_path_hint)
     dropbox_path_hint = extra_dict.get("PreviewDropbox", dropbox_path_hint)
     preview_user_id_str = extra_dict.get("PreviewTelegram")
+    preview_source_id = extra_dict.get("PreviewSource")
 
     for key in (
         "ExtraInfoKeyValue0",
@@ -165,6 +166,8 @@ def _extract_preview_context(
             dropbox_path_hint = payload
         elif prefix == "PreviewTelegram":
             preview_user_id_str = payload
+        elif prefix == "PreviewSource":
+            preview_source_id = payload
 
     target_user_id = default_user_id
     if preview_user_id_str:
@@ -176,7 +179,11 @@ def _extract_preview_context(
                 preview_user_id_str,
             )
 
-    return local_path_hint, dropbox_path_hint, target_user_id, extra_dict
+    source_job_id: Optional[str] = None
+    if preview_source_id:
+        source_job_id = str(preview_source_id).strip() or None
+
+    return local_path_hint, dropbox_path_hint, target_user_id, extra_dict, source_job_id
 
 
 async def _notify_preview_job_completion(
@@ -199,6 +206,7 @@ async def _notify_preview_job_completion(
         dropbox_path_hint,
         target_user_id,
         extra_dict,
+        source_job_id,
     ) = _extract_preview_context(props, telegram_user_id)
 
     final_path: Optional[Path] = None
@@ -250,15 +258,71 @@ async def _notify_preview_job_completion(
                     break
 
         if not local_path.exists():
-            await bot.send_message(
-                target_user_id,
-                (
-                    f"⚠️ Preview for {job_name} finished, but the file is still not available at:\n"
-                    f"{local_path}"
-                ),
+            retry_markup = None
+            if source_job_id:
+                retry_markup = InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="🔁 Recreate preview",
+                                callback_data=f"preview_render_options:{source_job_id}",
+                            )
+                        ]
+                    ]
+                )
+
+            message_text = (
+                f"⚠️ Preview for {job_name} finished, but the file is still not available at:\n"
+                f"{local_path}\n\n"
+                "Possible reasons: the preview upload token expired or the path is not accessible "
+                "from the bot host. The preview job will be removed."
             )
+
+            stored_message = pop_preview_message(job_id)
+            if stored_message:
+                chat_id, message_id = stored_message
+                try:
+                    await bot.edit_message_text(
+                        message_text,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        reply_markup=retry_markup,
+                    )
+                except Exception as edit_error:
+                    logger.warning(
+                        "Failed to edit preview progress message for job %s: %s",
+                        job_id,
+                        edit_error,
+                    )
+                    await bot.send_message(
+                        target_user_id,
+                        message_text,
+                        reply_markup=retry_markup,
+                    )
+            else:
+                await bot.send_message(
+                    target_user_id,
+                    message_text,
+                    reply_markup=retry_markup,
+                )
+
+            try:
+                from app.services import delete_job
+
+                deleted = await delete_job(login, password, job_id)
+                if deleted:
+                    logger.info("Preview job %s deleted after missing output", job_id)
+                else:
+                    logger.warning("Failed to delete preview job %s after missing output", job_id)
+            except Exception as delete_error:
+                logger.warning(
+                    "Error deleting preview job %s after missing output: %s",
+                    job_id,
+                    delete_error,
+                )
+
             logger.warning("Preview file %s not found after job %s", local_path, job_id)
-            return None
+            return target_user_id
 
         final_path = local_path
         dropbox_path = dropbox_path or dropbox_path_hint
@@ -365,6 +429,7 @@ async def _notify_preview_job_failure(
         _dropbox_hint,
         target_user_id,
         _extra_dict,
+        source_job_id,
     ) = _extract_preview_context(props, telegram_user_id)
 
     safe_name = html.escape(job_name)
@@ -448,6 +513,18 @@ async def _notify_preview_job_failure(
         body = "No worker error logs were retrieved."
 
     full_message = f"{failure_title}\n\n{body}"
+    retry_markup = None
+    if source_job_id:
+        retry_markup = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="🔁 Recreate preview",
+                        callback_data=f"preview_render_options:{source_job_id}",
+                    )
+                ]
+            ]
+        )
     if edited_progress is not None:
         chat_id, message_id = edited_progress
         try:
@@ -456,6 +533,7 @@ async def _notify_preview_job_failure(
                 chat_id=chat_id,
                 message_id=message_id,
                 parse_mode="HTML",
+                reply_markup=retry_markup,
             )
         except Exception as edit_error:
             logger.warning(
@@ -467,12 +545,14 @@ async def _notify_preview_job_failure(
                 target_user_id,
                 full_message,
                 parse_mode="HTML",
+                reply_markup=retry_markup,
             )
     else:
         await bot.send_message(
             target_user_id,
             full_message,
             parse_mode="HTML",
+            reply_markup=retry_markup,
         )
 
     try:
@@ -1169,6 +1249,18 @@ async def on_startup(bot):
         log_cache_stats,
         CronTrigger(minute=0),  # Every hour at minute 0
         id="log_cache_stats",
+        replace_existing=True
+    )
+
+    # Clean up expired preview upload tokens every hour
+    def cleanup_preview_tokens():
+        from app.core.preview_upload import cleanup_preview_upload_tokens
+        cleanup_preview_upload_tokens()
+
+    scheduler.add_job(
+        cleanup_preview_tokens,
+        CronTrigger(minute=0),  # Every hour at minute 0
+        id="cleanup_preview_tokens",
         replace_existing=True
     )
 
