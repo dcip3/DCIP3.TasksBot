@@ -29,6 +29,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     FSInputFile,
 )
+from aiogram.exceptions import TelegramRetryAfter
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -84,6 +85,7 @@ async def _run_preview_animation(preview_job_id: str, chat_id: int, message_id: 
 
     frames = ["□ □ □", "■ □ □", "■ ■ □", "■ ■ ■"]
     index = 1  # start from next frame to avoid "message is not modified"
+    sleep_seconds = 4
 
     # Create cancel keyboard
     cancel_keyboard = InlineKeyboardMarkup(
@@ -103,6 +105,14 @@ async def _run_preview_animation(preview_job_id: str, chat_id: int, message_id: 
                     message_id=message_id,
                     reply_markup=cancel_keyboard,
                 )
+            except TelegramRetryAfter as rate_exc:
+                logger.warning(
+                    "Preview animation rate limited for job %s: retry in %s seconds",
+                    preview_job_id,
+                    rate_exc.retry_after,
+                )
+                await asyncio.sleep(rate_exc.retry_after)
+                continue
             except Exception as edit_error:
                 message = str(edit_error).lower()
                 if "message is not modified" in message:
@@ -116,7 +126,7 @@ async def _run_preview_animation(preview_job_id: str, chat_id: int, message_id: 
                 )
                 return
             index += 1
-            await asyncio.sleep(2)
+            await asyncio.sleep(sleep_seconds)
     except asyncio.CancelledError:
         logger.debug("Preview animation task cancelled for job %s", preview_job_id)
         return

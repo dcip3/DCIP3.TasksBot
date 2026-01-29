@@ -84,6 +84,24 @@ class TTLCache:
 list_folder_cache = TTLCache(ttl_seconds=180)
 metadata_cache = TTLCache(ttl_seconds=180)
 
+PROGRESS_EDIT_MIN_INTERVAL = 1.5
+PROGRESS_MIN_PERCENT_STEP = 1
+
+def _should_update_progress(state: dict, percent: int) -> bool:
+    """Throttle progress updates to avoid Telegram edit rate limits."""
+    now = time.monotonic()
+    last_ts = float(state.get("last_progress_ts", 0.0) or 0.0)
+    last_percent = int(state.get("last_progress_percent", -1) or -1)
+    if percent >= 100:
+        state["last_progress_ts"] = now
+        state["last_progress_percent"] = percent
+        return True
+    if (now - last_ts) < PROGRESS_EDIT_MIN_INTERVAL and abs(percent - last_percent) < PROGRESS_MIN_PERCENT_STEP:
+        return False
+    state["last_progress_ts"] = now
+    state["last_progress_percent"] = percent
+    return True
+
 def cache_key_list_folder(path):
     return f"list_folder:{path}"
 
@@ -326,7 +344,7 @@ async def process_file_batch(
             
             progress_msg = state.get("progress_msg")
             try:
-                if progress_msg:
+                if progress_msg and _should_update_progress(state, percent):
                     stop_kb = state.get("stop_kb")
                     bar = make_progress_bar(percent)
                     await progress_msg.edit_text(
@@ -534,7 +552,7 @@ async def download_exr_folder(
             
             progress_msg = state.get("progress_msg")
             try:
-                if progress_msg:
+                if progress_msg and _should_update_progress(state, percent):
                     stop_kb = state.get("stop_kb")
                     bar = make_progress_bar(percent)
                     await progress_msg.edit_text(

@@ -2,10 +2,12 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Optional
 
 from aiogram import Router
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from app.auth import get_deadline_credentials, get_preview_default_method, get_preview_default_worker
@@ -41,6 +43,134 @@ from app.services import (
 logger = logging.getLogger(__name__)
 
 router = Router()
+
+_worker_menu_cooldowns: dict[int, float] = {}
+
+
+def _hit_worker_menu_cooldown(chat_id: int, window_seconds: float = 3.0) -> bool:
+    now = time.monotonic()
+    last = _worker_menu_cooldowns.get(chat_id)
+    if last is not None and (now - last) < window_seconds:
+        return True
+    _worker_menu_cooldowns[chat_id] = now
+    return False
+
+
+async def _answer_rate_limit(callback_query: CallbackQuery, retry_after: int) -> None:
+    try:
+        await callback_query.answer(
+            f"Too many requests. Please retry in {retry_after} seconds.",
+            show_alert=True,
+        )
+    except Exception:
+        pass
+
+
+async def _try_edit_text(
+    callback_query: CallbackQuery,
+    message: Message,
+    text: str,
+    *,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    parse_mode: str | None = None,
+) -> tuple[bool, bool]:
+    try:
+        await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        return True, False
+    except TelegramRetryAfter as rate_exc:
+        logger.warning("Rate limited on edit_text: retry in %s seconds", rate_exc.retry_after)
+        await _answer_rate_limit(callback_query, int(rate_exc.retry_after))
+        return False, True
+    except Exception as exc:
+        logger.warning("Error editing message text: %s", exc)
+        return False, False
+
+
+async def _try_send_message(
+    callback_query: CallbackQuery,
+    text: str,
+    *,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    parse_mode: str | None = None,
+) -> Message | None:
+    try:
+        return await callback_query.message.answer(
+            text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+        )
+    except TelegramRetryAfter as rate_exc:
+        logger.warning("Rate limited on send_message: retry in %s seconds", rate_exc.retry_after)
+        await _answer_rate_limit(callback_query, int(rate_exc.retry_after))
+        return None
+    except Exception as exc:
+        logger.error("Error sending message: %s", exc)
+        return None
+
+async def _set_progress_message(
+    callback_query: CallbackQuery,
+    message: Optional[Message],
+    text: str,
+    *,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    parse_mode: str | None = None,
+) -> tuple[Optional[Message], bool]:
+    """Update a progress message, falling back to sending a new one if needed."""
+    if message is None:
+        sent = await _try_send_message(
+            callback_query, text, reply_markup=reply_markup, parse_mode=parse_mode
+        )
+        return sent, sent is None
+
+    edited, rate_limited = await _try_edit_text(
+        callback_query,
+        message,
+        text,
+        reply_markup=reply_markup,
+        parse_mode=parse_mode,
+    )
+    if edited:
+        return message, False
+    if rate_limited:
+        return message, True
+
+    sent = await _try_send_message(
+        callback_query, text, reply_markup=reply_markup, parse_mode=parse_mode
+    )
+    return sent, sent is None
+
+
+async def _show_worker_menu(
+    callback_query: CallbackQuery,
+    text: str,
+    keyboard: InlineKeyboardMarkup,
+) -> None:
+    """Render worker selection menu with shared cooldown and rate-limit handling."""
+    if callback_query.message is None:
+        await callback_query.answer("Error: message not found.", show_alert=True)
+        return
+
+    if _hit_worker_menu_cooldown(callback_query.message.chat.id):
+        await callback_query.answer("Please wait a few seconds and try again.", show_alert=False)
+        return
+
+    try:
+        await callback_query.message.edit_text(text, reply_markup=keyboard)
+        await callback_query.answer()
+    except TelegramRetryAfter as rate_exc:
+        logger.warning("Worker selection rate limited: retry in %s seconds", rate_exc.retry_after)
+        await _answer_rate_limit(callback_query, int(rate_exc.retry_after))
+    except Exception as exc:
+        logger.warning("Error editing worker selection message: %s", exc)
+        try:
+            await callback_query.message.answer(text, reply_markup=keyboard)
+            await callback_query.answer()
+        except TelegramRetryAfter as rate_exc:
+            logger.warning("Worker selection send rate limited: retry in %s seconds", rate_exc.retry_after)
+            await _answer_rate_limit(callback_query, int(rate_exc.retry_after))
+        except Exception as fallback_exc:
+            logger.error("Error showing worker selection: %s", fallback_exc)
+            await callback_query.answer("Failed to load workers.", show_alert=True)
 
 def _resolve_dropbox_path(job_info: dict) -> Optional[str]:
     outdirs = job_info.get("OutDir", [])
@@ -188,9 +318,8 @@ async def _start_deadline_preview(callback_query: CallbackQuery, job_id: str) ->
         return
 
     default_worker = await get_preview_default_worker(callback_query.from_user.id)
-    progress_msg = (
-        callback_query.message if isinstance(callback_query.message, Message) else None
-    )
+    # Use a fresh progress message to avoid editing the job card message.
+    progress_msg: Optional[Message] = None
 
     if default_worker:
         try:
@@ -352,13 +481,12 @@ async def create_new_video_process(
         initial_text = "🧾 Submitting preview job to Deadline..."
 
     progress_msg = progress_message
-    if progress_msg is None:
-        progress_msg = await callback_query.message.answer(initial_text)
-    else:
-        try:
-            await progress_msg.edit_text(initial_text, reply_markup=None)
-        except Exception:
-            progress_msg = await callback_query.message.answer(initial_text)
+    progress_msg, _ = await _set_progress_message(
+        callback_query,
+        progress_msg,
+        initial_text,
+        reply_markup=None,
+    )
 
     try:
         result = await create_video_from_job(
@@ -369,7 +497,12 @@ async def create_new_video_process(
             specific_worker=specific_worker,
         )
         if not result:
-            await progress_msg.edit_text("❌ Failed to submit the job to Deadline.")
+            if progress_msg:
+                await _set_progress_message(
+                    callback_query,
+                    progress_msg,
+                    "❌ Failed to submit the job to Deadline.",
+                )
             await callback_query.answer("Failed to submit the job.", show_alert=True)
             return
 
@@ -389,9 +522,17 @@ async def create_new_video_process(
             else None
         )
 
-        await progress_msg.edit_text("✅ Preview job queued\n□ □ □", reply_markup=cancel_keyboard)
-        if preview_id:
-            register_preview_message(preview_id, progress_msg.chat.id, progress_msg.message_id)
+        if progress_msg:
+            progress_msg, rate_limited = await _set_progress_message(
+                callback_query,
+                progress_msg,
+                "✅ Preview job queued\n□ □ □",
+                reply_markup=cancel_keyboard,
+            )
+            if rate_limited:
+                return
+            if preview_id and progress_msg:
+                register_preview_message(preview_id, progress_msg.chat.id, progress_msg.message_id)
         await callback_query.answer("Preview job queued!", show_alert=False)
     except WorkerStatusError as worker_error:
         status_lines = []
@@ -425,7 +566,15 @@ async def create_new_video_process(
                 [InlineKeyboardButton(text="✖️ Cancel", callback_data="preview_cancel")],
             ]
         )
-        await progress_msg.edit_text(message_text, reply_markup=keyboard)
+        if progress_msg:
+            progress_msg, rate_limited = await _set_progress_message(
+                callback_query,
+                progress_msg,
+                message_text,
+                reply_markup=keyboard,
+            )
+            if rate_limited:
+                return
         await callback_query.answer("Preferred workers are unavailable.", show_alert=False)
     except Exception as exc:
         logger.error(
@@ -433,7 +582,12 @@ async def create_new_video_process(
             callback_query.from_user.id if callback_query.from_user else "unknown",
             exc,
         )
-        await progress_msg.edit_text("❌ An error occurred while submitting the job.")
+        if progress_msg:
+            await _set_progress_message(
+                callback_query,
+                progress_msg,
+                "❌ An error occurred while submitting the job.",
+            )
         try:
             await callback_query.answer("Failed to submit the job.", show_alert=True)
         except Exception:
@@ -604,11 +758,11 @@ async def preview_select_worker_callback(callback_query: CallbackQuery) -> None:
         )
 
         keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
-        await callback_query.message.edit_text(
+        await _show_worker_menu(
+            callback_query,
             "🖥️ Select a worker for preview rendering:",
-            reply_markup=keyboard,
+            keyboard,
         )
-        await callback_query.answer()
     except Exception as exc:
         logger.error("Error showing worker selection: %s", exc)
         await callback_query.answer("Failed to load workers.", show_alert=True)
@@ -745,6 +899,8 @@ async def render_preview_via_server(callback_query: CallbackQuery, job_id: str) 
             "progress_msg": progress_msg,
             "total_files": 0,
             "stop_kb": cancel_keyboard,
+            "last_progress_ts": 0.0,
+            "last_progress_percent": -1,
         }
         state = download_states[job_id]
 
@@ -1100,15 +1256,11 @@ async def show_worker_selection_for_preview(callback_query: CallbackQuery, job_i
         ]
     )
 
-    try:
-        await callback_query.message.edit_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
-        )
-        await callback_query.answer()
-    except Exception as exc:
-        logger.error("Error showing worker selection: %s", exc)
-        await callback_query.answer("Failed to load workers.", show_alert=True)
+    await _show_worker_menu(
+        callback_query,
+        text,
+        InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+    )
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("send_dbx_video:"))
