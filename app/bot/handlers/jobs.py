@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -478,13 +479,17 @@ async def job_info_callback(callback_query: CallbackQuery) -> None:
                 logger.error("Error calculating ETA for job %s: %s", job.get("_id"), exc)
                 eta_str = "N/A"
 
-            info_text = f"<pre>Job Info:\n{'-'*40}\n"
-            info_text += f"Batch: {batch_name}\n"
-            info_text += f"Name: {name}\n"
-            info_text += f"Status: {stat_name}\n"
-            info_text += f"Progress: {progress_str}\n"
-            info_text += f"ETA: {eta_str}\n"
-            info_text += f"{'-'*40}</pre>"
+            indent = ""
+            info_lines = [
+                "Job Info:",
+                f"{indent}🗂️ Batch: <code>{html.escape(str(batch_name))}</code>",
+                f"{indent}🏷️ Name: <code>{html.escape(str(name))}</code>",
+                f"{indent}⚙️ Status: <code>{html.escape(str(stat_name))}</code>",
+                f"{indent}⏳ Progress: <code>{html.escape(str(progress_str))}</code>",
+            ]
+            if stat in {1, 6}:
+                info_lines.append(f"{indent}⏱️ ETA: <code>{html.escape(str(eta_str))}</code>")
+            info_text = "\n".join(info_lines)
 
             current_job_id = job.get("_id")
             is_preview_job, preview_source_id = extract_preview_meta(props)
@@ -556,7 +561,7 @@ async def job_info_callback(callback_query: CallbackQuery) -> None:
             keyboard = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
 
             await callback_query.message.answer(
-                info_text + "\nActions:", parse_mode="HTML", reply_markup=keyboard
+                info_text, parse_mode="HTML", reply_markup=keyboard
             )
 
         await callback_query.answer()

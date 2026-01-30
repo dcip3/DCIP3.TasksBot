@@ -327,7 +327,9 @@ async def _handle_preview_upload(request: web.Request) -> web.Response:
     filename = header_name or payload.expected_filename or "preview.mp4"
     filename = _sanitize_filename(filename)
 
-    temp_path = temp_dir / f"upload_{token}_{filename}"
+    upload_dir = temp_dir / f"upload_{token}"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    temp_path = upload_dir / filename
     bytes_written = 0
     try:
         with open(temp_path, "wb") as handle:
@@ -431,5 +433,11 @@ async def _deliver_preview(payload: PreviewUploadPayload, temp_path: Path) -> No
     for path in {temp_path, preparation.video_path}:
         try:
             path.unlink(missing_ok=True)
+        except Exception:
+            pass
+    for folder in {temp_path.parent, preparation.video_path.parent}:
+        try:
+            if folder.name.startswith("upload_"):
+                folder.rmdir()
         except Exception:
             pass
