@@ -118,6 +118,8 @@ async def group_and_sort_jobs(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]
 
     # Sort by DateParsed descending (newest first)
     combined_jobs.sort(key=lambda j: j["DateParsed"], reverse=True)
+    # Render-active batches first (stable sort keeps DateParsed ordering within groups)
+    combined_jobs.sort(key=lambda j: 0 if j.get("Stat") == 1 else 1)
 
     return combined_jobs
 

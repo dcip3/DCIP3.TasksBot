@@ -1,6 +1,7 @@
 import asyncio
 import html
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 from aiogram import F, Router
@@ -30,8 +31,90 @@ logger = logging.getLogger(__name__)
 
 router = Router()
 
+_PROGRESS_RE = re.compile(r"(\d+(?:\.\d+)?)")
+_FRAMES_RE = re.compile(r"^\s*(-?\d+)(?:\s*-\s*(-?\d+)(?:\s*x\s*(\d+))?)?\s*$")
+
 def _escape_pre(value: object) -> str:
     return html.escape(str(value))
+
+def _parse_progress_ratio(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        pct = float(value)
+    else:
+        match = _PROGRESS_RE.search(str(value))
+        if not match:
+            return None
+        try:
+            pct = float(match.group(1))
+        except ValueError:
+            return None
+    if pct > 1.0:
+        pct = pct / 100.0
+    return max(0.0, min(pct, 1.0))
+
+def _count_frames(value: object) -> int | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    total = 0
+    for segment in text.split(","):
+        seg = segment.strip()
+        if not seg:
+            continue
+        match = _FRAMES_RE.match(seg)
+        if not match:
+            return None
+        start = int(match.group(1))
+        end_raw = match.group(2)
+        step_raw = match.group(3)
+        if end_raw is None:
+            total += 1
+            continue
+        end = int(end_raw)
+        step = int(step_raw) if step_raw else 1
+        if step <= 0:
+            return None
+        if end < start:
+            start, end = end, start
+        total += ((end - start) // step) + 1
+    return total or None
+
+def _compute_progress_from_tasks(tasks: list[dict], total_tasks: int) -> str | None:
+    if not tasks:
+        return None
+    frame_counts: list[int] = []
+    for task in tasks:
+        frames = _count_frames(task.get("Frames"))
+        if frames is None:
+            return None
+        frame_counts.append(frames)
+    total_frames = sum(frame_counts)
+    if total_frames <= 0:
+        return None
+    completed = 0.0
+    for task, frames in zip(tasks, frame_counts):
+        stat = task.get("Stat", 1)
+        if stat == 5:
+            completed += frames
+            continue
+        prog_ratio = _parse_progress_ratio(task.get("Prog"))
+        if prog_ratio is None:
+            continue
+        if stat in {3, 4}:
+            completed += frames * prog_ratio
+    if completed > total_frames:
+        completed = float(total_frames)
+    percent = int((completed / total_frames) * 100) if total_frames else 0
+    done_str = (
+        str(int(round(completed)))
+        if abs(completed - round(completed)) < 0.05
+        else f"{completed:.1f}"
+    )
+    return f"{percent}% {done_str}/{total_frames}"
 
 def _build_jobs_overview(
     combined_jobs: list[dict],
@@ -42,6 +125,19 @@ def _build_jobs_overview(
     messages: list[str] = []
     buttons: list[InlineKeyboardButton] = []
 
+    def get_job_icon(stat: int) -> str:
+        if stat == 3:
+            return "✅"
+        if stat == 1:
+            return "▶️"
+        if stat == 6:
+            return "⏳"
+        if stat == 2:
+            return "⏸️"
+        if stat == 4:
+            return "❌"
+        return "❓"
+
     for job in jobs_slice:
         props = job.get("Props", {})
         batch = _resolve_batch_label(props)
@@ -50,7 +146,7 @@ def _build_jobs_overview(
         completed_chunks = job.get("CompletedChunks", 0)
         progress_str = format_progress_old(completed_chunks, total_tasks)
         stat = job.get("Stat", 0)
-        icon = "✅" if stat == 3 else "⏸️" if stat == 2 else "▶️"
+        icon = get_job_icon(stat)
 
         safe_batch = _escape_pre(display_batch)
         safe_progress = _escape_pre(progress_str)
@@ -458,7 +554,11 @@ async def job_info_callback(callback_query: CallbackQuery) -> None:
             props = job.get("Props", {})
             total_tasks = props.get("Tasks", 0)
             completed_chunks = job.get("CompletedChunks", 0)
-            progress_str = format_progress_old(completed_chunks, total_tasks)
+            tasks = job_tasks_map.get(job.get("_id"), [])
+            progress_str = (
+                _compute_progress_from_tasks(tasks or [], total_tasks)
+                or format_progress_old(completed_chunks, total_tasks)
+            )
             full_name = props.get("Name", "Untitled")
             name = full_name.split("/")[-1] if "/" in full_name else full_name
             stat = job.get("Stat", 0)
@@ -466,8 +566,7 @@ async def job_info_callback(callback_query: CallbackQuery) -> None:
 
             eta_str = "N/A"
             if stat in {1, 6}:
-                tasks = job_tasks_map.get(job.get("_id"), [])
-                eta_str = _calculate_eta(tasks, total_tasks, completed_chunks)
+                eta_str = _calculate_eta(tasks or [], total_tasks, completed_chunks)
 
             indent = ""
             info_lines = [
@@ -533,7 +632,11 @@ async def job_update_callback(callback_query: CallbackQuery) -> None:
         batch_name = _resolve_batch_label(props)
         total_tasks = props.get("Tasks", 0)
         completed_chunks = selected_job.get("CompletedChunks", 0)
-        progress_str = format_progress_old(completed_chunks, total_tasks)
+        tasks = await get_job_tasks_by_user_id(callback_query.from_user.id, job_id)
+        progress_str = (
+            _compute_progress_from_tasks(tasks or [], total_tasks)
+            or format_progress_old(completed_chunks, total_tasks)
+        )
         full_name = props.get("Name", "Untitled")
         name = full_name.split("/")[-1] if "/" in full_name else full_name
         stat = selected_job.get("Stat", 0)
@@ -541,7 +644,6 @@ async def job_update_callback(callback_query: CallbackQuery) -> None:
 
         eta_str = "N/A"
         if stat in {1, 6}:
-            tasks = await get_job_tasks_by_user_id(callback_query.from_user.id, job_id)
             eta_str = _calculate_eta(tasks or [], total_tasks, completed_chunks)
 
         info_lines = [
