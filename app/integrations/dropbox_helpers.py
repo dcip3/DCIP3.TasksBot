@@ -2,6 +2,8 @@ import time
 import base64
 import json
 import logging
+import random
+import contextlib
 from typing import Optional, List, Dict, Any
 from pathlib import Path, PurePosixPath
 import asyncio
@@ -100,6 +102,53 @@ metadata_cache = TTLCache(ttl_seconds=180)
 
 PROGRESS_EDIT_MIN_INTERVAL = 1.5
 PROGRESS_MIN_PERCENT_STEP = 1
+RETRY_STATUSES = {401, 408, 429, 500, 502, 503, 504}
+RETRY_ATTEMPTS = 3
+RETRY_BASE_DELAY = 0.5
+RETRY_MAX_DELAY = 8.0
+
+def _parse_retry_after(value: Optional[str]) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+async def _sleep_backoff(attempt: int, retry_after: Optional[str]) -> None:
+    retry_after_seconds = _parse_retry_after(retry_after)
+    if retry_after_seconds is not None and retry_after_seconds > 0:
+        await asyncio.sleep(retry_after_seconds)
+        return
+    base_delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
+    jitter = random.uniform(0.0, RETRY_BASE_DELAY)
+    await asyncio.sleep(base_delay + jitter)
+
+async def _post_json_with_retry(
+    session: aiohttp.ClientSession,
+    url: str,
+    headers: dict,
+    payload: dict,
+    *,
+    operation: str,
+) -> Optional[dict]:
+    for attempt in range(RETRY_ATTEMPTS):
+        try:
+            async with session.post(url, headers=headers, json=payload) as resp:
+                if resp.status in (0, 200):
+                    return await resp.json()
+                text = await resp.text()
+                if resp.status in RETRY_STATUSES and attempt < (RETRY_ATTEMPTS - 1):
+                    await _sleep_backoff(attempt, resp.headers.get("Retry-After"))
+                    continue
+                logger.error("%s failed: %s %s", operation, resp.status, text)
+                return None
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            if attempt < (RETRY_ATTEMPTS - 1):
+                await _sleep_backoff(attempt, None)
+                continue
+            logger.error("%s failed: %s", operation, exc)
+            return None
 
 def _should_update_progress(state: dict, percent: int) -> bool:
     """Throttle progress updates to avoid Telegram edit rate limits."""
@@ -122,6 +171,47 @@ def cache_key_list_folder(path):
 def cache_key_metadata(path):
     return f"metadata:{path}"
 
+async def list_folder_all(session_dbx, path: str, headers_dbx: dict) -> Optional[dict]:
+    """List all entries in a Dropbox folder, handling pagination."""
+    list_url = "https://api.dropboxapi.com/2/files/list_folder"
+    continue_url = "https://api.dropboxapi.com/2/files/list_folder/continue"
+    headers_dbx["Authorization"] = f"Bearer {await get_fresh_access_token()}"
+    result = await _post_json_with_retry(
+        session_dbx,
+        list_url,
+        headers_dbx,
+        {"path": path},
+        operation=f"list_folder {path}",
+    )
+    if result is None:
+        return None
+
+    entries = list(result.get("entries", []))
+    has_more = result.get("has_more")
+    cursor = result.get("cursor")
+
+    while has_more:
+        if not cursor:
+            logger.error("Dropbox list_folder missing cursor for path %s", path)
+            return None
+        headers_dbx["Authorization"] = f"Bearer {await get_fresh_access_token()}"
+        result = await _post_json_with_retry(
+            session_dbx,
+            continue_url,
+            headers_dbx,
+            {"cursor": cursor},
+            operation=f"list_folder_continue {path}",
+        )
+        if result is None:
+            return None
+        entries.extend(result.get("entries", []))
+        has_more = result.get("has_more")
+        cursor = result.get("cursor")
+
+    result["entries"] = entries
+    result["has_more"] = False
+    return result
+
 async def fetch_dropbox_metadata(session_dbx, dropbox_path: str, headers_dbx: dict) -> dict:
     key = cache_key_metadata(dropbox_path)
     cached = metadata_cache.get(key)
@@ -134,44 +224,43 @@ async def fetch_dropbox_metadata(session_dbx, dropbox_path: str, headers_dbx: di
         "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
         "Content-Type": "application/json"
     }
-    async with session_dbx.post(meta_url, headers=headers, json={"path": dropbox_path}) as resp:
-        if resp.status != 200:
-            text = await resp.text()
-            raise RuntimeError(f"Error getting metadata: {text}")
-        result = await resp.json()
-        metadata_cache.set(key, result)
-        return result
+    result = await _post_json_with_retry(
+        session_dbx,
+        meta_url,
+        headers,
+        {"path": dropbox_path},
+        operation=f"get_metadata {dropbox_path}",
+    )
+    if result is None:
+        raise RuntimeError(f"Error getting metadata for {dropbox_path}")
+    metadata_cache.set(key, result)
+    return result
 
 async def list_folder_cached(session_dbx, path, headers_dbx):
     key = cache_key_list_folder(path)
     cached = list_folder_cache.get(key)
     if cached:
         return cached
-    list_url = "https://api.dropboxapi.com/2/files/list_folder"
-    async with session_dbx.post(list_url, headers=headers_dbx, json={"path": path}) as list_resp:
-        if list_resp.status not in (0, 200):
-            return None
-        result = await list_resp.json()
-        list_folder_cache.set(key, result)
-        return result
+    result = await list_folder_all(session_dbx, path, headers_dbx)
+    if result is None:
+        return None
+    list_folder_cache.set(key, result)
+    return result
 
 async def count_exr_files(session_dbx: aiohttp.ClientSession, path: str, headers_dbx: dict) -> int:
     """
     Counts EXR/JPG/PNG files recursively in a Dropbox folder (excluding cryptomatte and conflicted copies).
     """
-    list_url = "https://api.dropboxapi.com/2/files/list_folder"
-    
     # Create a copy of headers and serialize Dropbox-API-Path-Root
     headers_copy = headers_dbx.copy()
     if "Dropbox-API-Path-Root" in headers_copy:
         path_root = headers_copy["Dropbox-API-Path-Root"]
         if not isinstance(path_root, str):
             headers_copy["Dropbox-API-Path-Root"] = json.dumps(path_root)
-    
-    async with session_dbx.post(list_url, headers=headers_copy, json={"path": path}) as list_resp:
-        if list_resp.status not in (0, 200):
-            return 0
-        result = await list_resp.json()
+
+    result = await list_folder_all(session_dbx, path, headers_copy)
+    if not result:
+        return 0
 
     count = 0
     for entry in result.get("entries", []):
@@ -245,32 +334,61 @@ async def download_file_parallel(
     Returns:
         True if successful, False otherwise
     """
-    async with semaphore:
-        try:
-            # Create fresh headers for each download
-            dl_headers = {
-                "Authorization": f"Bearer {await get_fresh_access_token()}",
-                "Dropbox-API-Select-User": settings.dropbox_team_member_id,
-                "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
-                "Dropbox-API-Arg": headers["Dropbox-API-Arg"]
-            }
-            
-            async with session.post(download_url, headers=dl_headers) as resp:
-                if resp.status != 200:
-                    logger.error(f"Failed to download {local_file.name}: {resp.status}")
+    for attempt in range(RETRY_ATTEMPTS):
+        retry_after = None
+        async with semaphore:
+            try:
+                # Create fresh headers for each download
+                dl_headers = {
+                    "Authorization": f"Bearer {await get_fresh_access_token()}",
+                    "Dropbox-API-Select-User": settings.dropbox_team_member_id,
+                    "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
+                    "Dropbox-API-Arg": headers["Dropbox-API-Arg"]
+                }
+                
+                async with session.post(download_url, headers=dl_headers) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        retry_after = resp.headers.get("Retry-After")
+                        if resp.status in RETRY_STATUSES and attempt < (RETRY_ATTEMPTS - 1):
+                            logger.warning(
+                                "Retrying download %s (%s): %s",
+                                local_file.name,
+                                resp.status,
+                                text,
+                            )
+                        else:
+                            logger.error(
+                                "Failed to download %s: %s %s",
+                                local_file.name,
+                                resp.status,
+                                text,
+                            )
+                            return False
+                    else:
+                        # Ensure parent directory exists
+                        local_file.parent.mkdir(parents=True, exist_ok=True)
+                        
+                        # Write file in chunks
+                        async with aiofiles.open(local_file, 'wb') as f:
+                            async for chunk in resp.content.iter_chunked(8192):  # 8KB chunks
+                                await f.write(chunk)
+                        return True
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                if attempt >= (RETRY_ATTEMPTS - 1):
+                    logger.error(f"Error downloading {local_file.name}: {exc}")
                     return False
-                
-                # Ensure parent directory exists
-                local_file.parent.mkdir(parents=True, exist_ok=True)
-                
-                # Write file in chunks
-                async with aiofiles.open(local_file, 'wb') as f:
-                    async for chunk in resp.content.iter_chunked(8192):  # 8KB chunks
-                        await f.write(chunk)
-                return True
-        except Exception as e:
-            logger.error(f"Error downloading {local_file.name}: {e}")
-            return False
+                logger.warning("Retrying download %s after error: %s", local_file.name, exc)
+            except Exception as e:
+                logger.error(f"Error downloading {local_file.name}: {e}")
+                return False
+
+        if local_file.exists():
+            with contextlib.suppress(Exception):
+                local_file.unlink()
+        if attempt < (RETRY_ATTEMPTS - 1):
+            await _sleep_backoff(attempt, retry_after)
+    return False
 
 async def process_file_batch(
     session: aiohttp.ClientSession,
@@ -280,12 +398,12 @@ async def process_file_batch(
     job_id: str,
     download_states: dict,
     stop_downloads: dict,
-    headers_dbx: dict
+    headers_dbx: dict,
+    batch: List[Dict[str, Any]],
 ):
     """Process a batch of files - download and convert them."""
     from app.integrations.video_helpers import convert_single_exr_file_streaming
-    
-    batch = await file_queue.get_batch()
+
     if not batch:
         return
 
@@ -318,6 +436,12 @@ async def process_file_batch(
 
     # Wait for all downloads to complete
     download_results = await asyncio.gather(*(task for task, _ in download_tasks), return_exceptions=True)
+
+    if stop_downloads.get(job_id) and stop_downloads[job_id].is_set():
+        for _, local_file in download_tasks:
+            if str(local_file) in file_queue.processing:
+                file_queue.mark_failed(str(local_file))
+        return
     
     # Process downloaded files
     for i, (download_success, (_, local_file)) in enumerate(zip(download_results, download_tasks)):
@@ -415,10 +539,12 @@ async def download_exr_folder_parallel(
 
     # Process remaining files in the queue
     while not file_queue.is_empty:
+        if stop_downloads.get(job_id) and stop_downloads[job_id].is_set():
+            break
         batch = await file_queue.get_batch()
         if not batch:
             break
-            
+
         # Process batch
         await process_file_batch(
             session_dbx,
@@ -428,7 +554,8 @@ async def download_exr_folder_parallel(
             job_id,
             download_states,
             stop_downloads,
-            headers_dbx
+            headers_dbx,
+            batch,
         )
 
 async def download_exr_folder(
@@ -591,17 +718,46 @@ async def upload_video_to_dropbox(video_path: Path, metadata: dict, job_id: Opti
     dropbox_upload_path = f"{exr_parent}/{filename}"
 
     upload_url = "https://content.dropboxapi.com/2/files/upload"
-    headers_upload = {
-        "Authorization": f"Bearer {await get_fresh_access_token()}",
-        "Dropbox-API-Select-User": settings.dropbox_team_member_id,
-        "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
-        "Dropbox-API-Arg": json.dumps({"path": dropbox_upload_path, "mode": "overwrite"}),
-        "Content-Type": "application/octet-stream"
-    }
-    data = video_path.read_bytes()
+
+    async def _iter_file_chunks(path: Path, chunk_size: int = 1024 * 1024):
+        async with aiofiles.open(path, "rb") as f:
+            while True:
+                chunk = await f.read(chunk_size)
+                if not chunk:
+                    break
+                yield chunk
+
     async with aiohttp.ClientSession() as session_upload:
-        async with session_upload.post(upload_url, headers=headers_upload, data=data) as resp_up:
-            if resp_up.status != 200:
-                text = await resp_up.text()
-                raise RuntimeError(f"Error uploading video to Dropbox: {text}")
+        for attempt in range(RETRY_ATTEMPTS):
+            headers_upload = {
+                "Authorization": f"Bearer {await get_fresh_access_token()}",
+                "Dropbox-API-Select-User": settings.dropbox_team_member_id,
+                "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
+                "Dropbox-API-Arg": json.dumps({"path": dropbox_upload_path, "mode": "overwrite"}),
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(video_path.stat().st_size),
+            }
+            try:
+                async with session_upload.post(
+                    upload_url, headers=headers_upload, data=_iter_file_chunks(video_path)
+                ) as resp_up:
+                    if resp_up.status == 200:
+                        return dropbox_upload_path
+                    text = await resp_up.text()
+                    if resp_up.status in RETRY_STATUSES and attempt < (RETRY_ATTEMPTS - 1):
+                        logger.warning(
+                            "Retrying upload %s (%s): %s",
+                            video_path.name,
+                            resp_up.status,
+                            text,
+                        )
+                        await _sleep_backoff(attempt, resp_up.headers.get("Retry-After"))
+                        continue
+                    raise RuntimeError(f"Error uploading video to Dropbox: {text}")
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                if attempt < (RETRY_ATTEMPTS - 1):
+                    logger.warning("Retrying upload %s after error: %s", video_path.name, exc)
+                    await _sleep_backoff(attempt, None)
+                    continue
+                raise RuntimeError(f"Error uploading video to Dropbox: {exc}") from exc
     return dropbox_upload_path

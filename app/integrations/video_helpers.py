@@ -53,7 +53,8 @@ async def download_exr_file(session: aiohttp.ClientSession, url: str, headers: d
                 return False
             local_path.parent.mkdir(parents=True, exist_ok=True)
             async with aiofiles.open(local_path, 'wb') as f:
-                await f.write(await response.read())
+                async for chunk in response.content.iter_chunked(1024 * 1024):
+                    await f.write(chunk)
             return True
     except Exception as e:
         logger.error(f"Error downloading {local_path.name}: {e}")
@@ -227,6 +228,7 @@ def compress_video_if_needed(video_path: Path, max_size_mb: float = 45.0) -> Pat
     if duration and duration > 0:
         target_size_bytes = max_size_mb * 1024 * 1024 * 0.92
         target_bitrate = int((target_size_bytes * 8) / duration / 1000)
+    ffmpeg_bin = settings.ffmpeg_path or "ffmpeg"
 
     def _run_two_pass(
         output_path: Path,
@@ -234,7 +236,7 @@ def compress_video_if_needed(video_path: Path, max_size_mb: float = 45.0) -> Pat
         passlogfile: Path,
     ) -> Optional[Path]:
         base_cmd = [
-            "ffmpeg", "-y",
+            ffmpeg_bin, "-y",
             "-i", str(video_path),
             "-c:v", "libx264",
             "-b:v", f"{bitrate_k}k",
@@ -257,7 +259,7 @@ def compress_video_if_needed(video_path: Path, max_size_mb: float = 45.0) -> Pat
         preset: str = "slow",
     ) -> Optional[Path]:
         cmd = [
-            "ffmpeg", "-y",
+            ffmpeg_bin, "-y",
             "-i", str(video_path),
             "-c:v", "libx264",
             "-crf", str(crf),
@@ -621,8 +623,9 @@ def assemble_video_from_jpg(conv_root: Path, exr_folder_name: str) -> Path:
     else:
         pattern = str(conv_root / "*.png")
     
+    ffmpeg_bin = settings.ffmpeg_path or "ffmpeg"
     cmd = [
-        "ffmpeg",
+        ffmpeg_bin,
         "-y",
         "-pattern_type", "glob",
         "-i", pattern,

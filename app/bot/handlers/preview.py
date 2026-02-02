@@ -19,6 +19,7 @@ from app.integrations.dropbox_helpers import (
     count_exr_files,
     fetch_dropbox_metadata,
     get_fresh_access_token,
+    list_folder_all,
     upload_video_to_dropbox,
 )
 from app.integrations.video_helpers import (
@@ -974,15 +975,11 @@ async def render_preview_via_server(callback_query: CallbackQuery, job_id: str) 
         }
         session_dbx = await get_dropbox_session()
 
-        list_url = "https://api.dropboxapi.com/2/files/list_folder"
-        async with session_dbx.post(
-            list_url, headers=headers_dbx, json={"path": dropbox_path}
-        ) as list_resp:
-            if list_resp.status != 200:
-                await progress_msg.edit_text(f"❌ Failed to list folder: {list_resp.status}")
-                await callback_query.answer("Could not list files in Dropbox.", show_alert=True)
-                return
-            list_result = await list_resp.json()
+        list_result = await list_folder_all(session_dbx, dropbox_path, headers_dbx)
+        if not list_result:
+            await progress_msg.edit_text("❌ Failed to list folder.")
+            await callback_query.answer("Could not list files in Dropbox.", show_alert=True)
+            return
 
         preview_exts = (".exr", ".jpg", ".jpeg", ".png")
         total_files = sum(

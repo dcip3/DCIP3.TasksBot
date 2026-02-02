@@ -26,7 +26,8 @@ from app.integrations.dropbox_helpers import (
     get_fresh_access_token,
     fetch_dropbox_metadata,
     download_exr_folder,
-    upload_video_to_dropbox
+    upload_video_to_dropbox,
+    list_folder_all,
 )
 from app.core.bot_core import get_aiosession
 
@@ -803,13 +804,11 @@ async def download_job_folder(login: str, password: str, job_id: str) -> Optiona
         local_root = temp_dir / f"{exr_folder_name}_{job_id}"
         local_root.mkdir(exist_ok=True)
             
-        # List files in folder
-        list_url = "https://api.dropboxapi.com/2/files/list_folder"
-        async with session_dbx.post(list_url, headers=headers_dbx, json={"path": metadata["path_display"]}) as list_resp:
-            if list_resp.status != 200:
-                logger.error(f"Failed to list folder: {list_resp.status}")
-                return None
-            result = await list_resp.json()
+        # List files in folder (handle pagination)
+        result = await list_folder_all(session_dbx, metadata["path_display"], headers_dbx)
+        if not result:
+            logger.error("Failed to list folder contents for %s", metadata["path_display"])
+            return None
         
         # Prepare file list for download
         download_url = "https://content.dropboxapi.com/2/files/download"
@@ -1444,7 +1443,11 @@ async def download_video_from_dropbox(
     """
     try:
         import aiohttp
+        import aiofiles
         import json
+        import asyncio
+        import random
+        import contextlib
         from pathlib import Path
         from app.integrations.dropbox_helpers import get_fresh_access_token
         from app.core.config import settings
@@ -1474,24 +1477,66 @@ async def download_video_from_dropbox(
         }
         
         session_dbx = await get_dropbox_session()
-        async with session_dbx.post(download_url, headers=dl_headers) as resp:
-            if resp.status != 200:
-                text = await resp.text()
-                logger.error(f"Error downloading video: {text}")
-                return None
-            
-            # Use the original filename for local storage
-            filename = video_info["filename"]
-            temp_path = temp_dir / filename
-            temp_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            with open(temp_path, "wb") as f:
-                data = await resp.read()
-                f.write(data)
-                
-            logger.info(f"Video downloaded to {temp_path}")
-            return (str(temp_path), video_info["dropbox_path"])
-                
+        retry_statuses = {401, 408, 429, 500, 502, 503, 504}
+        retry_attempts = 3
+        base_delay = 0.5
+        max_delay = 8.0
+
+        def _compute_delay(attempt: int, retry_after: Optional[str]) -> float:
+            if retry_after:
+                try:
+                    return max(float(retry_after), 0.0)
+                except ValueError:
+                    pass
+            delay = min(base_delay * (2 ** attempt), max_delay)
+            return delay + random.uniform(0.0, base_delay)
+
+        # Use the original filename for local storage
+        filename = video_info["filename"]
+        temp_path = temp_dir / filename
+        temp_path.parent.mkdir(parents=True, exist_ok=True)
+
+        for attempt in range(retry_attempts):
+            dl_headers = {
+                "Authorization": f"Bearer {await get_fresh_access_token()}",
+                "Dropbox-API-Select-User": settings.dropbox_team_member_id,
+                "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
+                "Dropbox-API-Arg": json.dumps({"path": video_info["dropbox_path"]})
+            }
+            try:
+                async with session_dbx.post(download_url, headers=dl_headers) as resp:
+                    if resp.status == 200:
+                        async with aiofiles.open(temp_path, "wb") as f:
+                            async for chunk in resp.content.iter_chunked(1024 * 1024):
+                                await f.write(chunk)
+                        logger.info(f"Video downloaded to {temp_path}")
+                        return (str(temp_path), video_info["dropbox_path"])
+
+                    text = await resp.text()
+                    if resp.status in retry_statuses and attempt < (retry_attempts - 1):
+                        delay = _compute_delay(attempt, resp.headers.get("Retry-After"))
+                        logger.warning(
+                            "Retrying Dropbox download %s (%s): %s",
+                            filename,
+                            resp.status,
+                            text,
+                        )
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.error(f"Error downloading video: {text}")
+                        return None
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                if attempt < (retry_attempts - 1):
+                    delay = _compute_delay(attempt, None)
+                    logger.warning("Retrying Dropbox download %s after error: %s", filename, exc)
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(f"Error downloading video for job {job_id}: {exc}")
+                    return None
+            if temp_path.exists():
+                with contextlib.suppress(Exception):
+                    temp_path.unlink()
+
     except Exception as e:
         logger.error(f"Error downloading video for job {job_id}: {e}")
         return None 

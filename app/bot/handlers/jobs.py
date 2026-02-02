@@ -30,6 +30,75 @@ logger = logging.getLogger(__name__)
 
 router = Router()
 
+def _escape_pre(value: object) -> str:
+    return html.escape(str(value))
+
+def _build_jobs_overview(
+    combined_jobs: list[dict],
+    page: int,
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    jobs_slice = combined_jobs[page * JOBS_PAGE_SIZE : page * JOBS_PAGE_SIZE + JOBS_PAGE_SIZE]
+
+    messages: list[str] = []
+    buttons: list[InlineKeyboardButton] = []
+
+    for job in jobs_slice:
+        props = job.get("Props", {})
+        batch = _resolve_batch_label(props)
+        display_batch = truncate_cell(batch)
+        total_tasks = props.get("Tasks", 0)
+        completed_chunks = job.get("CompletedChunks", 0)
+        progress_str = format_progress_old(completed_chunks, total_tasks)
+        stat = job.get("Stat", 0)
+        icon = "✅" if stat == 3 else "⏸️" if stat == 2 else "▶️"
+
+        safe_batch = _escape_pre(display_batch)
+        safe_progress = _escape_pre(progress_str)
+        messages.append(
+            f"{icon} {safe_batch:<{BATCH_COLUMN_WIDTH}} {safe_progress:^16}\n{'-'*40}"
+        )
+
+        job_id = job.get("_id")
+        if job_id:
+            buttons.append(
+                InlineKeyboardButton(text=batch, callback_data=f"job_info:{job_id}")
+            )
+
+    header = f"{'Batch':<{BATCH_COLUMN_WIDTH + 2}} {'Progress':^16}"
+    header += f"\n{'-'*40}"
+    batch_text = "\n".join(messages) if messages else "No data"
+
+    if buttons:
+        inline_keyboard = []
+        row = []
+        for idx, button in enumerate(buttons, 1):
+            row.append(button)
+            if idx % 2 == 0:
+                inline_keyboard.append(row)
+                row = []
+        if row:
+            inline_keyboard.append(row)
+
+        total_items = len(combined_jobs)
+        total_pages = (total_items + JOBS_PAGE_SIZE - 1) // JOBS_PAGE_SIZE
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append(
+                InlineKeyboardButton(text="⬅️ Back", callback_data=f"jobs_page:{page-1}")
+            )
+        if (page + 1) < total_pages:
+            nav_buttons.append(
+                InlineKeyboardButton(text="Next ➡️", callback_data=f"jobs_page:{page+1}")
+            )
+        if nav_buttons:
+            inline_keyboard.append(nav_buttons)
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
+        page_info = f"Page {page+1} of {total_pages}"
+        text = f"<pre>{header}\n{batch_text}\n{page_info}</pre>\n\nSelect a job for details:"
+        return text, keyboard
+
+    return f"<pre>{header}\n{batch_text}</pre>", None
 
 def _resolve_batch_label(props: dict) -> str:
     batch = (props.get("Batch") or "").strip()
@@ -238,77 +307,8 @@ async def handle_jobs(message: Message, page: int = 0) -> None:
             return
 
         combined_jobs = await group_and_sort_jobs(jobs)
-        jobs_slice = combined_jobs[page * JOBS_PAGE_SIZE : page * JOBS_PAGE_SIZE + JOBS_PAGE_SIZE]
-
-        messages = []
-        buttons = []
-
-        def resolve_batch_label(props: dict) -> str:
-            batch = (props.get("Batch") or "").strip()
-            if batch:
-                return batch
-            name = (props.get("Name") or "Untitled").strip()
-            return name or "Untitled"
-
-        for job in jobs_slice:
-            props = job.get("Props", {})
-            batch = resolve_batch_label(props)
-            display_batch = truncate_cell(batch)
-            total_tasks = props.get("Tasks", 0)
-            completed_chunks = job.get("CompletedChunks", 0)
-            progress_str = format_progress_old(completed_chunks, total_tasks)
-            stat = job.get("Stat", 0)
-            icon = "✅" if stat == 3 else "⏸️" if stat == 2 else "▶️"
-
-            messages.append(
-                f"{icon} {display_batch:<{BATCH_COLUMN_WIDTH}} {progress_str:^16}\n{'-'*40}"
-            )
-
-            job_id = job.get("_id")
-            if job_id:
-                buttons.append(
-                    InlineKeyboardButton(text=batch, callback_data=f"job_info:{job_id}")
-                )
-
-        header = f"{'Batch':<{BATCH_COLUMN_WIDTH + 2}} {'Progress':^16}"
-        header += f"\n{'-'*40}"
-        batch_text = "\n".join(messages) if messages else "No data"
-
-        if buttons:
-            inline_keyboard = []
-            row = []
-            for idx, button in enumerate(buttons, 1):
-                row.append(button)
-                if idx % 2 == 0:
-                    inline_keyboard.append(row)
-                    row = []
-            if row:
-                inline_keyboard.append(row)
-
-            total_items = len(combined_jobs)
-            total_pages = (total_items + JOBS_PAGE_SIZE - 1) // JOBS_PAGE_SIZE
-            nav_buttons = []
-            if page > 0:
-                nav_buttons.append(
-                    InlineKeyboardButton(text="⬅️ Back", callback_data=f"jobs_page:{page-1}")
-                )
-            if (page + 1) < total_pages:
-                nav_buttons.append(
-                    InlineKeyboardButton(text="Next ➡️", callback_data=f"jobs_page:{page+1}")
-                )
-            if nav_buttons:
-                inline_keyboard.append(nav_buttons)
-
-            keyboard = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
-            page_info = f"Page {page+1} of {total_pages}"
-
-            await message.answer(
-                f"<pre>{header}\n{batch_text}\n{page_info}</pre>\n\nSelect a job for details:",
-                parse_mode="HTML",
-                reply_markup=keyboard,
-            )
-        else:
-            await message.answer(f"<pre>{header}\n{batch_text}</pre>", parse_mode="HTML")
+        text, keyboard = _build_jobs_overview(combined_jobs, page)
+        await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
 
     except Exception as exc:
         logger.exception("Error handling jobs for user %s", message.from_user.id)
@@ -346,79 +346,15 @@ async def jobs_page_callback(callback_query: CallbackQuery) -> None:
             return
 
         combined_jobs = await group_and_sort_jobs(jobs)
-        jobs_slice = combined_jobs[page * JOBS_PAGE_SIZE : page * JOBS_PAGE_SIZE + JOBS_PAGE_SIZE]
-
-        messages = []
-        buttons = []
-
-        def resolve_batch_label(props: dict) -> str:
-            batch = (props.get("Batch") or "").strip()
-            if batch:
-                return batch
-            name = (props.get("Name") or "Untitled").strip()
-            return name or "Untitled"
-
-        for job in jobs_slice:
-            props = job.get("Props", {})
-            batch = resolve_batch_label(props)
-            display_batch = truncate_cell(batch)
-            total_tasks = props.get("Tasks", 0)
-            completed_chunks = job.get("CompletedChunks", 0)
-            progress_str = format_progress_old(completed_chunks, total_tasks)
-            stat = job.get("Stat", 0)
-            icon = "✅" if stat == 3 else "⏸️" if stat == 2 else "▶️"
-
-            messages.append(
-                f"{icon} {display_batch:<{BATCH_COLUMN_WIDTH}} {progress_str:^16}\n{'-'*40}"
-            )
-
-            job_id = job.get("_id")
-            if job_id:
-                buttons.append(
-                    InlineKeyboardButton(text=batch, callback_data=f"job_info:{job_id}")
-                )
-
-        header = f"{'Batch':<{BATCH_COLUMN_WIDTH + 2}} {'Progress':^16}"
-        header += f"\n{'-'*40}"
-        batch_text = "\n".join(messages) if messages else "No data"
-
-        if buttons:
-            inline_keyboard = []
-            row = []
-            for idx, button in enumerate(buttons, 1):
-                row.append(button)
-                if idx % 2 == 0:
-                    inline_keyboard.append(row)
-                    row = []
-            if row:
-                inline_keyboard.append(row)
-
-            total_items = len(combined_jobs)
-            total_pages = (total_items + JOBS_PAGE_SIZE - 1) // JOBS_PAGE_SIZE
-            nav_buttons = []
-            if page > 0:
-                nav_buttons.append(
-                    InlineKeyboardButton(text="⬅️ Back", callback_data=f"jobs_page:{page-1}")
-                )
-            if (page + 1) < total_pages:
-                nav_buttons.append(
-                    InlineKeyboardButton(text="Next ➡️", callback_data=f"jobs_page:{page+1}")
-                )
-            if nav_buttons:
-                inline_keyboard.append(nav_buttons)
-
-            keyboard = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
-            page_info = f"Page {page+1} of {total_pages}"
-
+        text, keyboard = _build_jobs_overview(combined_jobs, page)
+        if keyboard:
             await callback_query.message.edit_text(
-                f"<pre>{header}\n{batch_text}\n{page_info}</pre>\n\nSelect a job for details:",
+                text,
                 parse_mode="HTML",
                 reply_markup=keyboard,
             )
         else:
-            await callback_query.message.edit_text(
-                f"<pre>{header}\n{batch_text}</pre>", parse_mode="HTML"
-            )
+            await callback_query.message.edit_text(text, parse_mode="HTML")
 
     except Exception as exc:
         logger.exception(
@@ -442,75 +378,15 @@ async def jobs_back_callback(callback_query: CallbackQuery) -> None:
             return
 
         combined_jobs = await group_and_sort_jobs(jobs)
-        jobs_slice = combined_jobs[:JOBS_PAGE_SIZE]
-
-        messages = []
-        buttons = []
-
-        def resolve_batch_label(props: dict) -> str:
-            batch = (props.get("Batch") or "").strip()
-            if batch:
-                return batch
-            name = (props.get("Name") or "Untitled").strip()
-            return name or "Untitled"
-
-        for job in jobs_slice:
-            props = job.get("Props", {})
-            batch = resolve_batch_label(props)
-            display_batch = truncate_cell(batch)
-            total_tasks = props.get("Tasks", 0)
-            completed_chunks = job.get("CompletedChunks", 0)
-            progress_str = format_progress_old(completed_chunks, total_tasks)
-            stat = job.get("Stat", 0)
-            icon = "✅" if stat == 3 else "⏸️" if stat == 2 else "▶️"
-
-            messages.append(
-                f"{icon} {display_batch:<{BATCH_COLUMN_WIDTH}} {progress_str:^16}\n{'-'*40}"
-            )
-
-            job_id = job.get("_id")
-            if job_id:
-                buttons.append(
-                    InlineKeyboardButton(text=batch, callback_data=f"job_info:{job_id}")
-                )
-
-        header = f"{'Batch':<{BATCH_COLUMN_WIDTH + 2}} {'Progress':^16}"
-        header += f"\n{'-'*40}"
-        batch_text = "\n".join(messages) if messages else "No data"
-
-        if buttons:
-            inline_keyboard = []
-            row = []
-            for idx, button in enumerate(buttons, 1):
-                row.append(button)
-                if idx % 2 == 0:
-                    inline_keyboard.append(row)
-                    row = []
-            if row:
-                inline_keyboard.append(row)
-
-            total_items = len(combined_jobs)
-            total_pages = (total_items + JOBS_PAGE_SIZE - 1) // JOBS_PAGE_SIZE
-            nav_buttons = []
-            if (0 + 1) < total_pages:
-                nav_buttons.append(
-                    InlineKeyboardButton(text="➡️ Next", callback_data="jobs_page:1")
-                )
-            if nav_buttons:
-                inline_keyboard.append(nav_buttons)
-
-            keyboard = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
-            page_info = f"Page 1 of {total_pages}"
-
+        text, keyboard = _build_jobs_overview(combined_jobs, 0)
+        if keyboard:
             await callback_query.message.edit_text(
-                f"<pre>{header}\n{batch_text}\n{page_info}</pre>\n\nSelect a job for details:",
+                text,
                 parse_mode="HTML",
                 reply_markup=keyboard,
             )
         else:
-            await callback_query.message.edit_text(
-                f"<pre>{header}\n{batch_text}</pre>", parse_mode="HTML"
-            )
+            await callback_query.message.edit_text(text, parse_mode="HTML")
 
     except Exception as exc:
         logger.exception(
@@ -866,8 +742,8 @@ async def tasks_job_callback(callback_query: CallbackQuery) -> None:
             return "❓"
 
         for task in tasks:
-            frames = task.get("Frames", "")
-            prog = task.get("Prog", "")
+            frames = _escape_pre(task.get("Frames", ""))
+            prog = _escape_pre(task.get("Prog", ""))
             stat = task.get("Stat", 1)
             icon = get_task_icon(stat)
             rendertime_str = ""
@@ -889,7 +765,8 @@ async def tasks_job_callback(callback_query: CallbackQuery) -> None:
                         rendertime_str = str(duration).split(".")[0]
                 except Exception:  # pragma: no cover - defensive
                     pass
-            line = f"{icon} {frames:<16} {prog:^10} {rendertime_str:^12}"
+            safe_rendertime = _escape_pre(rendertime_str)
+            line = f"{icon} {frames:<16} {prog:^10} {safe_rendertime:^12}"
             lines.append(line)
 
         message_text = "<pre>" + "\n".join(lines) + "</pre>"
