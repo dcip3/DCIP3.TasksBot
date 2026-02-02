@@ -39,3 +39,22 @@ def normalize_display_path(path: Optional[str]) -> Optional[str]:
     else:
         normalized = cls(*stack)
     return str(normalized)
+
+
+def normalize_dropbox_path(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    normalized = str(path).replace("\\", "/").strip()
+    if not normalized:
+        return None
+    return f"/{normalized.lstrip('/')}"
+
+
+def extract_dropbox_path(fullpath: Optional[str], root_marker: str) -> Optional[str]:
+    if not fullpath or not root_marker:
+        return None
+    idx = str(fullpath).find(root_marker)
+    if idx == -1:
+        return None
+    trimmed = str(fullpath)[idx:]
+    return normalize_dropbox_path(trimmed)

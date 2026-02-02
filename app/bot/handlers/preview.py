@@ -13,7 +13,13 @@ from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, Inli
 from app.auth import get_deadline_credentials, get_preview_default_method, get_preview_default_worker
 from app.core.bot_core import bot, download_states, stop_downloads
 from app.core.config import settings
-from app.core.utils import cleanup_temp_and_conv, register_preview_message, pop_preview_message
+from app.core.path_utils import extract_dropbox_path
+from app.core.utils import (
+    cleanup_old_files,
+    cleanup_temp_and_conv,
+    register_preview_message,
+    pop_preview_message,
+)
 from app.integrations.dropbox_helpers import (
     download_exr_folder,
     count_exr_files,
@@ -25,7 +31,6 @@ from app.integrations.dropbox_helpers import (
 from app.integrations.video_helpers import (
     assemble_video_from_jpg,
     cleanup_job_files,
-    cleanup_old_files,
     get_file_size_mb,
     prepare_video_for_delivery,
 )
@@ -173,17 +178,6 @@ async def _show_worker_menu(
             logger.error("Error showing worker selection: %s", fallback_exc)
             await callback_query.answer("Failed to load workers.", show_alert=True)
 
-def _resolve_dropbox_path(job_info: dict) -> Optional[str]:
-    outdirs = job_info.get("OutDir", [])
-    if not outdirs:
-        return None
-    fullpath = outdirs[0]
-    idx = fullpath.find(settings.dropbox_root_marker)
-    if idx == -1:
-        return None
-    trimmed = fullpath[idx:]
-    return "/" + trimmed.replace("\\", "/").lstrip("/")
-
 def _extract_preview_source(job_info: dict) -> tuple[bool, Optional[str]]:
     props = job_info.get("Props", {})
     comment = str(props.get("Cmmt") or "")
@@ -233,7 +227,11 @@ async def _maybe_send_single_frame_preview(
     if not job_info:
         return False
 
-    dropbox_path = _resolve_dropbox_path(job_info)
+    outdirs = job_info.get("OutDir", [])
+    dropbox_path = extract_dropbox_path(
+        outdirs[0] if outdirs else None,
+        settings.dropbox_root_marker,
+    )
     if not dropbox_path:
         return False
 
@@ -956,8 +954,11 @@ async def render_preview_via_server(callback_query: CallbackQuery, job_id: str) 
             await callback_query.answer("Could not determine Dropbox path.", show_alert=True)
             return
 
-        trimmed = fullpath[idx:]
-        dropbox_path = "/" + trimmed.replace("\\", "/").lstrip("/")
+        dropbox_path = extract_dropbox_path(fullpath, settings.dropbox_root_marker)
+        if not dropbox_path:
+            await progress_msg.edit_text("❌ Could not normalize Dropbox path.")
+            await callback_query.answer("Could not determine Dropbox path.", show_alert=True)
+            return
 
         temp_dir = Path(settings.temp_dir)
         temp_dir.mkdir(exist_ok=True)

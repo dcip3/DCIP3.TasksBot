@@ -22,6 +22,7 @@ from typing import Optional, List, Dict, Any, Tuple, Union
 
 import aiohttp
 from app.core.config import settings
+from app.core.path_utils import extract_dropbox_path, normalize_dropbox_path
 from app.integrations.dropbox_helpers import (
     get_fresh_access_token,
     fetch_dropbox_metadata,
@@ -57,29 +58,6 @@ class WorkerStatusError(RuntimeError):
 # ============================================================================
 # === UTILITY FUNCTIONS ===
 # ============================================================================
-
-async def create_optimized_session() -> aiohttp.ClientSession:
-    """
-    Create an optimized aiohttp session for better performance.
-    
-    Returns:
-        Optimized aiohttp ClientSession
-    """
-    timeout = aiohttp.ClientTimeout(total=300, connect=30)  # 5 minutes total, 30 seconds connect
-    connector = aiohttp.TCPConnector(
-        limit=100,  # Total connection pool size
-        limit_per_host=30,  # Connections per host
-        ttl_dns_cache=300,  # DNS cache TTL
-        use_dns_cache=True,
-        keepalive_timeout=30,
-        enable_cleanup_closed=True
-    )
-    
-    return aiohttp.ClientSession(
-        timeout=timeout,
-        connector=connector,
-        headers={"User-Agent": "TasksBot/1.0"}
-    )
 
 # ============================================================================
 # === DEADLINE API FUNCTIONS ===
@@ -764,16 +742,9 @@ async def download_job_folder(login: str, password: str, job_id: str) -> Optiona
             return None
             
         fullpath = outdirs[0]
-        # Find root folder marker
-        idx = fullpath.find(settings.dropbox_root_marker)
-        if idx == -1:
-            logger.error(f"Dropbox root marker not found in path: {fullpath}")
-            return None
-            
-        trimmed = fullpath[idx:]
-        dropbox_path = _normalize_dropbox_path(trimmed)
+        dropbox_path = extract_dropbox_path(fullpath, settings.dropbox_root_marker)
         if not dropbox_path:
-            logger.error(f"Failed to normalize Dropbox path for job {job_id}: {trimmed}")
+            logger.error(f"Failed to normalize Dropbox path for job {job_id}: {fullpath}")
             return None
         
         # Create temp directory
@@ -844,16 +815,6 @@ async def download_job_folder(login: str, password: str, job_id: str) -> Optiona
 def _sanitize_windows_filename(name: str) -> str:
     """Replace characters that are invalid in Windows file names."""
     return re.sub(r'[\\/:*?"<>|]', "_", name)
-
-
-def _normalize_dropbox_path(path: Optional[str]) -> Optional[str]:
-    """Normalize Dropbox-style paths to start with a single leading slash."""
-    if not path:
-        return None
-    normalized = path.replace("\\", "/").strip()
-    if not normalized:
-        return None
-    return f"/{normalized.lstrip('/')}"
 
 
 
@@ -953,7 +914,7 @@ async def create_video_from_job(
 
     expected_local_path = video_output_path
 
-    dropbox_folder_normalized = _normalize_dropbox_path(dropbox_folder)
+    dropbox_folder_normalized = normalize_dropbox_path(dropbox_folder)
     if dropbox_folder_normalized:
         dropbox_parent = PurePosixPath(dropbox_folder_normalized).parent
         if str(dropbox_parent) in {"", "."}:
@@ -1348,7 +1309,7 @@ async def check_video_exists_in_dropbox(
             "Content-Type": "application/json"
         }
 
-        normalized_hint = _normalize_dropbox_path(dropbox_path_hint)
+        normalized_hint = normalize_dropbox_path(dropbox_path_hint)
         if normalized_hint:
             try:
                 video_metadata = await fetch_dropbox_metadata(session_dbx, normalized_hint, headers_dbx)
@@ -1380,15 +1341,9 @@ async def check_video_exists_in_dropbox(
             return None
 
         fullpath = outdirs[0]
-        idx = fullpath.find(settings.dropbox_root_marker)
-        if idx == -1:
-            logger.error(f"Dropbox root marker not found in path: {fullpath}")
-            return None
-
-        trimmed = fullpath[idx:]
-        dropbox_path = _normalize_dropbox_path(trimmed)
+        dropbox_path = extract_dropbox_path(fullpath, settings.dropbox_root_marker)
         if not dropbox_path:
-            logger.error(f"Failed to normalize Dropbox path for job {job_id}: {trimmed}")
+            logger.error(f"Failed to normalize Dropbox path for job {job_id}: {fullpath}")
             return None
 
         # Get metadata for the folder
