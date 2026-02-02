@@ -60,6 +60,38 @@ def group_and_combine_jobs(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             batch = (props.get("Name") or "Untitled").strip() or "Untitled"
         grouped_jobs[batch].append(job)
 
+    def _has_running_tasks(job: Dict[str, Any]) -> bool:
+        for key in (
+            "RunningTasks",
+            "RunningChunks",
+            "TasksRunning",
+            "TasksInProgress",
+            "ActiveTasks",
+            "RenderingTasks",
+        ):
+            try:
+                if int(job.get(key, 0) or 0) > 0:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        task_counts = job.get("TaskCounts")
+        if isinstance(task_counts, dict):
+            for key in ("Rendering", "Active", "Running", "InProgress"):
+                try:
+                    if int(task_counts.get(key, 0) or 0) > 0:
+                        return True
+                except (TypeError, ValueError):
+                    continue
+        try:
+            total_tasks = int(job.get("Props", {}).get("Tasks", 0) or 0)
+            completed_chunks = int(job.get("CompletedChunks", 0) or 0)
+        except (TypeError, ValueError):
+            total_tasks = 0
+            completed_chunks = 0
+        if job.get("Stat") == 1 and total_tasks and 0 < completed_chunks < total_tasks:
+            return True
+        return False
+
     # Combine jobs by batch
     combined_jobs = []
     for batch, batch_jobs in grouped_jobs.items():
@@ -68,9 +100,11 @@ def group_and_combine_jobs(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
         # Determine batch-level status with priority: Active > Pending > Suspended > Failed > Completed > Unknown
         status_list = [j.get("Stat", 0) for j in batch_jobs]
-        if 1 in status_list:
+        has_running = any(_has_running_tasks(job) for job in batch_jobs)
+        has_pending = any(stat in {1, 6} for stat in status_list)
+        if has_running:
             batch_stat = 1      # Active
-        elif 6 in status_list:
+        elif has_pending:
             batch_stat = 6      # Pending
         elif 2 in status_list:
             batch_stat = 2      # Suspended
