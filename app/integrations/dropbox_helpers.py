@@ -7,8 +7,6 @@ from pathlib import Path, PurePosixPath
 import asyncio
 import aiofiles
 import aiohttp
-import requests
-from aiohttp import ClientTimeout
 import gc
 import functools
 import threading
@@ -25,8 +23,9 @@ def _is_preview_frame(name: str) -> bool:
 # Cached Dropbox access token details
 _dropbox_access_token = None
 _dropbox_access_token_expires_at = 0
+_dropbox_token_lock = asyncio.Lock()
 
-def get_fresh_access_token():
+async def get_fresh_access_token() -> str:
     """
     Return a valid Dropbox access token, refreshing it via the refresh token when expired.
     """
@@ -34,29 +33,44 @@ def get_fresh_access_token():
     now = int(time.time())
     if _dropbox_access_token and now < _dropbox_access_token_expires_at - 30:
         return _dropbox_access_token
+    async with _dropbox_token_lock:
+        now = int(time.time())
+        if _dropbox_access_token and now < _dropbox_access_token_expires_at - 30:
+            return _dropbox_access_token
 
-    url = "https://api.dropboxapi.com/oauth2/token"
-    creds = f"{settings.dropbox_app_key}:{settings.dropbox_app_secret}".encode("ascii")
-    b64_creds = base64.b64encode(creds).decode("ascii")
-    headers = {
-        "Authorization": f"Basic {b64_creds}",
-        "Content-Type": "application/x-www-form-urlencoded"
-    }
-    data = {
-        "grant_type": "refresh_token",
-        "refresh_token": settings.dropbox_refresh_token
-    }
-    resp = requests.post(url, headers=headers, data=data)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Failed to update access_token: {resp.status_code} – {resp.text}")
-    token_info = resp.json()
-    access_token = token_info.get("access_token")
-    expires_in = token_info.get("expires_in", 0)
-    if not access_token:
-        raise RuntimeError("No access_token field in response")
-    _dropbox_access_token = access_token
-    _dropbox_access_token_expires_at = now + expires_in
-    return _dropbox_access_token
+        url = "https://api.dropboxapi.com/oauth2/token"
+        creds = f"{settings.dropbox_app_key}:{settings.dropbox_app_secret}".encode("ascii")
+        b64_creds = base64.b64encode(creds).decode("ascii")
+        headers = {
+            "Authorization": f"Basic {b64_creds}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        data = {
+            "grant_type": "refresh_token",
+            "refresh_token": settings.dropbox_refresh_token,
+        }
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, headers=headers, data=data) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    raise RuntimeError(
+                        f"Failed to update access_token: {resp.status} – {text}"
+                    )
+                try:
+                    token_info = await resp.json()
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Failed to parse Dropbox token response: {text}"
+                    ) from exc
+
+        access_token = token_info.get("access_token")
+        expires_in = token_info.get("expires_in", 0)
+        if not access_token:
+            raise RuntimeError("No access_token field in response")
+        _dropbox_access_token = access_token
+        _dropbox_access_token_expires_at = now + int(expires_in)
+        return _dropbox_access_token
 
 # Simple in-memory cache with TTL support
 class TTLCache:
@@ -115,7 +129,7 @@ async def fetch_dropbox_metadata(session_dbx, dropbox_path: str, headers_dbx: di
         return cached
     meta_url = "https://api.dropboxapi.com/2/files/get_metadata"
     headers = {
-        "Authorization": f"Bearer {get_fresh_access_token()}",
+        "Authorization": f"Bearer {await get_fresh_access_token()}",
         "Dropbox-API-Select-User": settings.dropbox_team_member_id,
         "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
         "Content-Type": "application/json"
@@ -235,7 +249,7 @@ async def download_file_parallel(
         try:
             # Create fresh headers for each download
             dl_headers = {
-                "Authorization": f"Bearer {get_fresh_access_token()}",
+                "Authorization": f"Bearer {await get_fresh_access_token()}",
                 "Dropbox-API-Select-User": settings.dropbox_team_member_id,
                 "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
                 "Dropbox-API-Arg": headers["Dropbox-API-Arg"]
@@ -294,7 +308,7 @@ async def process_file_batch(
         file_queue.mark_processing(str(local_file))
         
         dl_headers = {
-            "Authorization": f"Bearer {get_fresh_access_token()}",
+            "Authorization": f"Bearer {await get_fresh_access_token()}",
             "Dropbox-API-Select-User": settings.dropbox_team_member_id,
             "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
             "Dropbox-API-Arg": json.dumps({"path": file_info["path_display"]})
@@ -486,7 +500,7 @@ async def download_exr_folder(
             file_queue.mark_processing(str(local_file))
             
             dl_headers = {
-                "Authorization": f"Bearer {get_fresh_access_token()}",
+                "Authorization": f"Bearer {await get_fresh_access_token()}",
                 "Dropbox-API-Select-User": settings.dropbox_team_member_id,
                 "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
                 "Dropbox-API-Arg": json.dumps({"path": file_info["path_display"]})
@@ -578,7 +592,7 @@ async def upload_video_to_dropbox(video_path: Path, metadata: dict, job_id: Opti
 
     upload_url = "https://content.dropboxapi.com/2/files/upload"
     headers_upload = {
-        "Authorization": f"Bearer {get_fresh_access_token()}",
+        "Authorization": f"Bearer {await get_fresh_access_token()}",
         "Dropbox-API-Select-User": settings.dropbox_team_member_id,
         "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
         "Dropbox-API-Arg": json.dumps({"path": dropbox_upload_path, "mode": "overwrite"}),

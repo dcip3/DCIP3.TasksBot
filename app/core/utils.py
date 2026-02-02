@@ -1446,7 +1446,11 @@ async def job_progress_watcher(bot):
                 try:
                     session = await get_aiosession()
                     headers = aiohttp.BasicAuth(login, decrypted_password)
-                    async with session.get(f"{settings.deadline_api_url}/jobs", auth=headers, ssl=False) as resp:
+                    async with session.get(
+                        f"{settings.deadline_api_url}/jobs",
+                        auth=headers,
+                        ssl=settings.deadline_tls_verify,
+                    ) as resp:
                         if resp.status == 200:
                             jobs = await resp.json()
                             for job in jobs:

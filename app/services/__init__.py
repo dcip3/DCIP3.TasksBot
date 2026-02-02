@@ -106,7 +106,7 @@ async def get_jobs_list(telegram_user_id: int) -> List[Dict[str, Any]]:
 
         session = await get_aiosession()
         headers = aiohttp.BasicAuth(login, password)
-        async with session.get(f"{settings.deadline_api_url}/jobs", auth=headers, ssl=False) as resp:
+        async with session.get(f"{settings.deadline_api_url}/jobs", auth=headers, ssl=settings.deadline_tls_verify) as resp:
             logger.info(f"Jobs API response status: {resp.status}")
             if resp.status == 200:
                 data = await resp.json()
@@ -126,7 +126,7 @@ async def _fetch_workers(login: str, password: str) -> List[Dict[str, Any]]:
     try:
         session = await get_aiosession()
         headers = aiohttp.BasicAuth(login, password)
-        async with session.get(f"{settings.deadline_api_url}/slaves?Data=infosettings", auth=headers, ssl=False) as resp:
+        async with session.get(f"{settings.deadline_api_url}/slaves?Data=infosettings", auth=headers, ssl=settings.deadline_tls_verify) as resp:
             logger.info(f"Slaves API response status: {resp.status}")
             if resp.status == 200:
                 data = await resp.json()
@@ -200,7 +200,7 @@ async def get_worker_report_contents(
     url = f"{settings.deadline_api_url}/slaves"
     session = await get_aiosession()
     auth = aiohttp.BasicAuth(login, password)
-    async with session.get(url, params=params, auth=auth, ssl=False) as resp:
+    async with session.get(url, params=params, auth=auth, ssl=settings.deadline_tls_verify) as resp:
         text = await resp.text()
         if resp.status != 200:
             logger.error(
@@ -276,7 +276,7 @@ async def get_job_info(login: str, password: str, job_id: str) -> Optional[Dict[
         session = await get_aiosession()
         headers = aiohttp.BasicAuth(login, password)
         # Get all jobs and find the specific one
-        async with session.get(f"{settings.deadline_api_url}/jobs", auth=headers, ssl=False) as resp:
+        async with session.get(f"{settings.deadline_api_url}/jobs", auth=headers, ssl=settings.deadline_tls_verify) as resp:
             if resp.status == 200:
                 jobs = await resp.json()
                 # Find the job by _id
@@ -334,7 +334,7 @@ async def get_job_tasks(login: str, password: str, job_id: str) -> List[Dict[str
     try:
         session = await get_aiosession()
         headers = aiohttp.BasicAuth(login, password)
-        async with session.get(f"{settings.deadline_api_url}/tasks?JobID={job_id}", auth=headers, ssl=False) as resp:
+        async with session.get(f"{settings.deadline_api_url}/tasks?JobID={job_id}", auth=headers, ssl=settings.deadline_tls_verify) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 # API may return {"Tasks": [...]} or a plain list
@@ -444,7 +444,7 @@ async def submit_deadline_job(
 
     async with aiohttp.ClientSession() as session:
         auth = aiohttp.BasicAuth(login, password)
-        async with session.post(submit_url, auth=auth, ssl=False, json=payload) as resp:
+        async with session.post(submit_url, auth=auth, ssl=settings.deadline_tls_verify, json=payload) as resp:
             text = await resp.text()
             if resp.status not in (200, 201, 202, 204):
                 logger.error("Deadline submission failed (%s): %s", resp.status, text)
@@ -474,7 +474,7 @@ async def submit_deadline_job(
                 async with session.put(
                     upload_url,
                     auth=auth,
-                    ssl=False,
+                    ssl=settings.deadline_tls_verify,
                     data=local_path.read_bytes(),
                     headers={"Content-Type": "application/octet-stream"}
                 ) as upload_resp:
@@ -492,7 +492,7 @@ async def submit_deadline_job(
 
             if complete_submission:
                 complete_url = f"{settings.deadline_api_url}/jobs/{job_id}/complete-submission"
-                async with session.post(complete_url, auth=auth, ssl=False) as comp_resp:
+                async with session.post(complete_url, auth=auth, ssl=settings.deadline_tls_verify) as comp_resp:
                     if comp_resp.status not in (200, 201, 204):
                         text = await comp_resp.text()
                         logger.error(
@@ -524,7 +524,7 @@ async def requeue_job(login: str, password: str, job_id: str) -> bool:
         session = await get_aiosession()
         headers = aiohttp.BasicAuth(login, password)
         json_body = {"Command": "requeue", "JobID": job_id}
-        async with session.put(f"{settings.deadline_api_url}/jobs", json=json_body, auth=headers, ssl=False) as resp:
+        async with session.put(f"{settings.deadline_api_url}/jobs", json=json_body, auth=headers, ssl=settings.deadline_tls_verify) as resp:
             success = resp.status == 200
             if not success:
                 logger.error(f"Failed to requeue job: {resp.status}")
@@ -575,7 +575,7 @@ async def resume_job(login: str, password: str, job_id: str) -> bool:
         session = await get_aiosession()
         headers = aiohttp.BasicAuth(login, password)
         json_body = {"Command": "resume", "JobID": job_id}
-        async with session.put(f"{settings.deadline_api_url}/jobs", json=json_body, auth=headers, ssl=False) as resp:
+        async with session.put(f"{settings.deadline_api_url}/jobs", json=json_body, auth=headers, ssl=settings.deadline_tls_verify) as resp:
             success = resp.status == 200
             if not success:
                 logger.error(f"Failed to resume job: {resp.status}")
@@ -626,7 +626,7 @@ async def suspend_job(login: str, password: str, job_id: str) -> bool:
         session = await get_aiosession()
         headers = aiohttp.BasicAuth(login, password)
         json_body = {"Command": "suspend", "JobID": job_id}
-        async with session.put(f"{settings.deadline_api_url}/jobs", json=json_body, auth=headers, ssl=False) as resp:
+        async with session.put(f"{settings.deadline_api_url}/jobs", json=json_body, auth=headers, ssl=settings.deadline_tls_verify) as resp:
             success = resp.status == 200
             if not success:
                 logger.error(f"Failed to suspend job: {resp.status}")
@@ -676,7 +676,7 @@ async def delete_job(login: str, password: str, job_id: str) -> bool:
     try:
         session = await get_aiosession()
         headers = aiohttp.BasicAuth(login, password)
-        async with session.delete(f"{settings.deadline_api_url}/jobs?JobID={job_id}", auth=headers, ssl=False) as resp:
+        async with session.delete(f"{settings.deadline_api_url}/jobs?JobID={job_id}", auth=headers, ssl=settings.deadline_tls_verify) as resp:
             success = resp.status == 200
             if not success:
                 logger.error(f"Failed to delete job: {resp.status}")
@@ -781,7 +781,7 @@ async def download_job_folder(login: str, password: str, job_id: str) -> Optiona
         
         # Prepare Dropbox headers
         headers_dbx = {
-            "Authorization": f"Bearer {get_fresh_access_token()}",
+            "Authorization": f"Bearer {await get_fresh_access_token()}",
             "Dropbox-API-Select-User": settings.dropbox_team_member_id,
             "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
             "Content-Type": "application/json"
@@ -823,7 +823,7 @@ async def download_job_folder(login: str, password: str, job_id: str) -> Optiona
             if entry[".tag"] == "file" and name.endswith(preview_exts):
                 api_args = {"path": entry["path_display"]}
                 headers = {
-                    "Authorization": f"Bearer {get_fresh_access_token()}",
+                    "Authorization": f"Bearer {await get_fresh_access_token()}",
                     "Dropbox-API-Select-User": settings.dropbox_team_member_id,
                     "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
                     "Dropbox-API-Arg": json.dumps(api_args)
@@ -1343,7 +1343,7 @@ async def check_video_exists_in_dropbox(
         
         session_dbx = await get_dropbox_session()
         headers_dbx = {
-            "Authorization": f"Bearer {get_fresh_access_token()}",
+            "Authorization": f"Bearer {await get_fresh_access_token()}",
             "Dropbox-API-Select-User": settings.dropbox_team_member_id,
             "Dropbox-API-Path-Root": {".tag": "root", "root": settings.dropbox_root_namespace_id},
             "Content-Type": "application/json"
@@ -1467,7 +1467,7 @@ async def download_video_from_dropbox(
         # Download video
         download_url = "https://content.dropboxapi.com/2/files/download"
         dl_headers = {
-            "Authorization": f"Bearer {get_fresh_access_token()}",
+            "Authorization": f"Bearer {await get_fresh_access_token()}",
             "Dropbox-API-Select-User": settings.dropbox_team_member_id,
             "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
             "Dropbox-API-Arg": json.dumps({"path": video_info["dropbox_path"]})

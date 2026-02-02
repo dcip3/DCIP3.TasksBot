@@ -28,6 +28,10 @@ class Settings(BaseSettings):
         ...,
         description="Base URL for the Deadline API",
     )
+    deadline_tls_verify: bool = Field(
+        True,
+        description="Verify TLS certificates for Deadline API requests",
+    )
     
     # Dropbox API Configuration
     dropbox_app_key: str

@@ -237,7 +237,7 @@ async def _maybe_send_single_frame_preview(
         return False
 
     headers_dbx = {
-        "Authorization": f"Bearer {get_fresh_access_token()}",
+        "Authorization": f"Bearer {await get_fresh_access_token()}",
         "Dropbox-API-Select-User": settings.dropbox_team_member_id,
         "Dropbox-API-Path-Root": json.dumps(
             {".tag": "root", "root": settings.dropbox_root_namespace_id}
@@ -965,7 +965,7 @@ async def render_preview_via_server(callback_query: CallbackQuery, job_id: str) 
         local_root.mkdir(parents=True, exist_ok=True)
 
         headers_dbx = {
-            "Authorization": f"Bearer {get_fresh_access_token()}",
+            "Authorization": f"Bearer {await get_fresh_access_token()}",
             "Dropbox-API-Select-User": settings.dropbox_team_member_id,
             "Dropbox-API-Path-Root": json.dumps(
                 {".tag": "root", "root": settings.dropbox_root_namespace_id}

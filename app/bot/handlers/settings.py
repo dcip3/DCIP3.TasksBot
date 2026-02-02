@@ -27,6 +27,28 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 
+async def _edit_or_send(
+    message: Message,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    parse_mode: str | None = None,
+) -> None:
+    try:
+        await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except TelegramBadRequest as exc:
+        error_text = str(exc).lower()
+        if "message is not modified" in error_text:
+            return
+        if (
+            "message can't be edited" in error_text
+            or "message to edit not found" in error_text
+            or "message is too old" in error_text
+        ):
+            await message.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)
+            return
+        raise
+
+
 def _render_settings_root_text() -> str:
     return "Settings\nSelect a section to configure."
 
@@ -109,6 +131,12 @@ def _build_notification_keyboard(enabled: bool, scope: str) -> InlineKeyboardMar
                     callback_data="settings:back:root",
                 ),
                 InlineKeyboardButton(
+                    text="🔄 Update",
+                    callback_data="settings:update:notifications",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
                     text="✖️ Close",
                     callback_data="settings:close",
                 ),
@@ -155,25 +183,19 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
     action = parts[1] if len(parts) > 1 else ""
 
     async def show_root() -> None:
-        try:
-            await callback_query.message.edit_text(
-                _render_settings_root_text(),
-                reply_markup=_build_settings_root_keyboard(),
-            )
-        except TelegramBadRequest as exc:
-            if "message is not modified" not in str(exc).lower():
-                raise
+        await _edit_or_send(
+            callback_query.message,
+            _render_settings_root_text(),
+            reply_markup=_build_settings_root_keyboard(),
+        )
 
     async def show_notifications() -> None:
         enabled, scope = await get_notification_settings(user_id)
-        try:
-            await callback_query.message.edit_text(
-                _render_notification_settings_text(enabled, scope),
-                reply_markup=_build_notification_keyboard(enabled, scope),
-            )
-        except TelegramBadRequest as exc:
-            if "message is not modified" not in str(exc).lower():
-                raise
+        await _edit_or_send(
+            callback_query.message,
+            _render_notification_settings_text(enabled, scope),
+            reply_markup=_build_notification_keyboard(enabled, scope),
+        )
 
     async def show_preview_worker() -> None:
         default_worker = await get_preview_default_worker(user_id)
@@ -230,18 +252,19 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
                 InlineKeyboardButton(
                     text="⬅️ Back",
                     callback_data="settings:preview",
-                )
+                ),
+                InlineKeyboardButton(
+                    text="🔄 Update",
+                    callback_data="settings:update:preview:worker",
+                ),
             ]
         )
 
-        try:
-            await callback_query.message.edit_text(
-                "\n".join(text_lines),
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
-            )
-        except TelegramBadRequest as exc:
-            if "message is not modified" not in str(exc).lower():
-                raise
+        await _edit_or_send(
+            callback_query.message,
+            "\n".join(text_lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+        )
 
     async def show_preview_method() -> None:
         default_method = await get_preview_default_method(user_id)
@@ -283,18 +306,19 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
                 InlineKeyboardButton(
                     text="⬅️ Back",
                     callback_data="settings:preview",
-                )
+                ),
+                InlineKeyboardButton(
+                    text="🔄 Update",
+                    callback_data="settings:update:preview:method",
+                ),
             ],
         ]
 
-        try:
-            await callback_query.message.edit_text(
-                "\n".join(text_lines),
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
-            )
-        except TelegramBadRequest as exc:
-            if "message is not modified" not in str(exc).lower():
-                raise
+        await _edit_or_send(
+            callback_query.message,
+            "\n".join(text_lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+        )
 
     async def show_preview_menu() -> None:
         auto_enabled = await get_preview_auto_enabled(user_id)
@@ -328,20 +352,48 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
                 InlineKeyboardButton(
                     text="⬅️ Back",
                     callback_data="settings:back:root",
-                )
+                ),
+                InlineKeyboardButton(
+                    text="🔄 Update",
+                    callback_data="settings:update:preview",
+                ),
             ],
         ]
-        try:
-            await callback_query.message.edit_text(
-                "\n".join(text_lines),
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
-            )
-        except TelegramBadRequest as exc:
-            if "message is not modified" not in str(exc).lower():
-                raise
+        await _edit_or_send(
+            callback_query.message,
+            "\n".join(text_lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+        )
 
     if action == "close":
-        await callback_query.message.edit_text("Settings closed.")
+        await _edit_or_send(callback_query.message, "Settings closed.")
+        await callback_query.answer()
+        return
+
+    if action == "update":
+        target = parts[2] if len(parts) > 2 else "root"
+        if target == "notifications":
+            await show_notifications()
+            await callback_query.answer("Updated")
+            return
+        if target == "preview":
+            if len(parts) > 3:
+                sub_target = parts[3]
+                if sub_target == "worker":
+                    await show_preview_worker()
+                    await callback_query.answer("Updated")
+                    return
+                if sub_target == "method":
+                    await show_preview_method()
+                    await callback_query.answer("Updated")
+                    return
+            await show_preview_menu()
+            await callback_query.answer("Updated")
+            return
+        if target == "root":
+            await show_root()
+            await callback_query.answer("Updated")
+            return
         await callback_query.answer()
         return
 
