@@ -10,9 +10,9 @@ from aiogram import Router
 from aiogram.exceptions import TelegramRetryAfter
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from app.auth import (
+from app.auth import get_deadline_credentials
+from app.user_settings import (
     PREVIEW_DEFAULT_WORKER_AUTO,
-    get_deadline_credentials,
     get_preview_default_method,
     get_preview_default_worker,
 )

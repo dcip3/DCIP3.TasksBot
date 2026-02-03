@@ -673,7 +673,7 @@ async def _submit_auto_preview_deadline(
 ) -> None:
     """Submit a Deadline preview job and register progress tracking."""
     from app.services import create_video_from_job, WorkerStatusError
-    from app.auth import PREVIEW_DEFAULT_WORKER_AUTO
+    from app.user_settings import PREVIEW_DEFAULT_WORKER_AUTO
 
     result = None
     fallback_used = False
@@ -1340,8 +1340,8 @@ async def job_progress_watcher(bot):
     """
     import aiohttp
     from datetime import datetime, timezone, timedelta
-    from app.auth import (
-        _decrypt_password,
+    from app.auth import _decrypt_password
+    from app.user_settings import (
         _normalize_scope,
         VALID_PREVIEW_RENDER_METHODS,
         disable_notifications_for_user,

@@ -6,7 +6,8 @@ from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from app.auth import (
+from app.auth import is_authorized
+from app.user_settings import (
     NotificationScope,
     PREVIEW_DEFAULT_WORKER_AUTO,
     get_notification_settings,
@@ -14,7 +15,6 @@ from app.auth import (
     get_preview_default_worker,
     get_preview_auto_enabled,
     get_preview_auto_scope,
-    is_authorized,
     set_notification_enabled,
     set_notification_scope,
     set_preview_auto_enabled,
