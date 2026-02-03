@@ -501,6 +501,47 @@ async def set_preview_default_method(telegram_user_id: int, method: Optional[str
     if conn is None:
         return False
 
+    normalized: Optional[str]
+    if method is None:
+        normalized = None
+    else:
+        candidate = method.strip().lower()
+        if candidate in {"none", "ask", ""}:
+            normalized = None
+        elif candidate in VALID_PREVIEW_RENDER_METHODS:
+            normalized = candidate
+        else:
+            logger.error(
+                "Unsupported preview default method '%s' for user %s",
+                method,
+                telegram_user_id,
+            )
+            return False
+
+    try:
+        await conn.execute(
+            """
+            UPDATE user_sessions
+            SET preview_default_method = ?
+            WHERE telegram_user_id = ?
+            """,
+            (normalized, telegram_user_id),
+        )
+        await conn.commit()
+        logger.info(
+            "User %s preview default method set to %s",
+            telegram_user_id,
+            normalized or "ask",
+        )
+        return True
+    except Exception as e:
+        logger.error(
+            "Failed to set preview default method for user %s: %s",
+            telegram_user_id,
+            e,
+        )
+        return False
+
 
 async def get_preview_auto_enabled(telegram_user_id: int) -> bool:
     """
@@ -546,47 +587,6 @@ async def set_preview_auto_enabled(telegram_user_id: int, enabled: bool) -> bool
         return True
     except Exception as e:
         logger.error("Failed to set preview auto flag for user %s: %s", telegram_user_id, e)
-        return False
-
-    normalized: Optional[str]
-    if method is None:
-        normalized = None
-    else:
-        candidate = method.strip().lower()
-        if candidate in {"none", "ask", ""}:
-            normalized = None
-        elif candidate in VALID_PREVIEW_RENDER_METHODS:
-            normalized = candidate
-        else:
-            logger.error(
-                "Unsupported preview default method '%s' for user %s",
-                method,
-                telegram_user_id,
-            )
-            return False
-
-    try:
-        await conn.execute(
-            """
-            UPDATE user_sessions
-            SET preview_default_method = ?
-            WHERE telegram_user_id = ?
-            """,
-            (normalized, telegram_user_id),
-        )
-        await conn.commit()
-        logger.info(
-            "User %s preview default method set to %s",
-            telegram_user_id,
-            normalized or "ask",
-        )
-        return True
-    except Exception as e:
-        logger.error(
-            "Failed to set preview default method for user %s: %s",
-            telegram_user_id,
-            e,
-        )
         return False
 
 

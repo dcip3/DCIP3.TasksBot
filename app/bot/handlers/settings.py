@@ -130,10 +130,6 @@ def _build_notification_keyboard(enabled: bool, scope: str) -> InlineKeyboardMar
                     text="⬅️ Back",
                     callback_data="settings:back:root",
                 ),
-                InlineKeyboardButton(
-                    text="🔄 Update",
-                    callback_data="settings:update:notifications",
-                ),
             ],
             [
                 InlineKeyboardButton(
@@ -253,10 +249,6 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
                     text="⬅️ Back",
                     callback_data="settings:preview",
                 ),
-                InlineKeyboardButton(
-                    text="🔄 Update",
-                    callback_data="settings:update:preview:worker",
-                ),
             ]
         )
 
@@ -307,10 +299,6 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
                     text="⬅️ Back",
                     callback_data="settings:preview",
                 ),
-                InlineKeyboardButton(
-                    text="🔄 Update",
-                    callback_data="settings:update:preview:method",
-                ),
             ],
         ]
 
@@ -352,10 +340,6 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
                 InlineKeyboardButton(
                     text="⬅️ Back",
                     callback_data="settings:back:root",
-                ),
-                InlineKeyboardButton(
-                    text="🔄 Update",
-                    callback_data="settings:update:preview",
                 ),
             ],
         ]
