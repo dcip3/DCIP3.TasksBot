@@ -253,9 +253,9 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
         keyboard_rows.append(
             [
                 InlineKeyboardButton(
-                    text="✅ Always ask"
+                    text="✅ ❓ Always ask"
                     if default_worker is None
-                    else "Always ask",
+                    else "❓ Always ask",
                     callback_data="settings:preview:worker:set:none",
                 )
             ]
@@ -309,7 +309,7 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
             ],
             [
                 _button(
-                    "Always ask",
+                    "❓ Always ask",
                     "none",
                     default_method is None,
                 )
