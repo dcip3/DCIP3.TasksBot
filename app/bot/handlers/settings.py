@@ -199,21 +199,26 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
         workers = await get_workers_list(user_id)
 
         text_lines = ["Preview Worker Settings", ""]
+        text_lines = [
+            "🖥️ Preview Worker",
+            "",
+        ]
         if default_worker == PREVIEW_DEFAULT_WORKER_AUTO:
-            text_lines.append("Default worker: Auto (render worker)")
+            default_label = "Auto"
         elif default_worker:
-            text_lines.append(f"Default worker: {default_worker}")
+            default_label = default_worker
         else:
-            text_lines.append("Default worker: Not set (will show menu)")
+            default_label = "Always ask"
         text_lines.extend(
             [
+                f"• Default: {default_label}",
+                "• Applies to: Deadline previews only",
+                "• Server method ignores this setting",
                 "",
-                "This setting applies only to Deadline previews.",
-                "If preview method is set to Server, this worker is ignored.",
-                "",
-                "Pick a worker that should render previews on the Deadline farm.",
-                "Auto will prefer the job creator or workers that rendered the job.",
-                "Select 'None' to always show the worker selection menu.",
+                "Pick where previews should be rendered:",
+                "• ✅ Auto — prefer the job creator or workers that rendered the job",
+                "• 🖥️ Specific worker — always use that machine",
+                "• ❓ Always ask — always show the worker picker",
             ]
         )
 
@@ -251,9 +256,9 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
         keyboard_rows.append(
             [
                 InlineKeyboardButton(
-                    text="✅ None (Always ask)"
+                    text="✅ Always ask"
                     if default_worker is None
-                    else "None (Always ask)",
+                    else "Always ask",
                     callback_data="settings:preview:worker:set:none",
                 )
             ]
@@ -276,18 +281,21 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
     async def show_preview_method() -> None:
         default_method = await get_preview_default_method(user_id)
         method_display = {
-            "server": "Server (bot host)",
-            "deadline": "Deadline farm",
+            "server": "Server",
+            "deadline": "Deadline",
             None: "Always ask",
         }
 
         text_lines = [
-            "Preview Method Settings",
+            "🎛 Preview Method",
             "",
-            f"Default method: {method_display.get(default_method, 'Always ask')}",
+            f"• Default: {method_display.get(default_method, 'Always ask')}",
+            "• Applies to: how previews are rendered",
             "",
-            "Choose how previews should be rendered by default.",
-            "Select 'Always ask' to see the method menu every time.",
+            "Choose the default render method:",
+            "• 🖥️ Server — build preview on the bot host",
+            "• ☁️ Deadline — build preview on the farm",
+            "• ❓ Always ask — show the menu every time",
         ]
 
         def _button(label: str, method_value: str, selected: bool) -> InlineKeyboardButton:
@@ -304,7 +312,7 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
             ],
             [
                 _button(
-                    "None (Always ask)",
+                    "Always ask",
                     "none",
                     default_method is None,
                 )
