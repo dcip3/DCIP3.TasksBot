@@ -86,19 +86,20 @@ def _build_settings_root_keyboard() -> InlineKeyboardMarkup:
 
 
 def _render_notification_settings_text(enabled: bool, scope: str) -> str:
-    status_text = "enabled" if enabled else "disabled"
+    status_text = "On" if enabled else "Off"
     scope_lower = scope.lower()
     scope_text = "My jobs only" if scope_lower == "own" else "All jobs"
 
     details = [
-        "Notification Settings",
-        f"Status: {status_text}",
-        f"Scope: {scope_text}",
+        "🔔 Notifications",
         "",
-        "Choose how you would like to receive job alerts.",
+        f"• Status: {status_text}",
+        f"• Scope: {scope_text}",
+        "",
+        "Choose when you want to receive job alerts.",
     ]
     if not enabled:
-        details.append("Notifications are currently disabled.")
+        details.append("• Alerts are currently turned off")
     return "\n".join(details)
 
 
