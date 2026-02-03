@@ -1,22 +1,22 @@
 # Core dependencies
-aiogram>=3.2.0
-aiohttp>=3.8.0
-pydantic-settings>=2.0.0
-pydantic>=2.0.0
-requests>=2.31.0
+aiogram>=3.24.0
+aiohttp>=3.13.3
+pydantic-settings>=2.12.0
+pydantic>=2.12.5
+requests>=2.32.5
 
 # Image and video processing
-numpy>=1.21.0
-OpenEXR>=1.3.2
-OpenColorIO>=2.3.0
-Pillow>=10.0.0
+numpy>=2.4.2
+OpenEXR>=3.4.4
+OpenColorIO>=2.5.1
+Pillow>=12.1.0
 
 # Scheduling
-APScheduler>=3.10.0
+APScheduler>=3.11.2
 
 # Async support
-aiosqlite>=0.19.0
-aiofiles>=23.0.0
+aiosqlite>=0.22.1
+aiofiles>=25.1.0
 
 # Security
-cryptography>=41.0.0
+cryptography>=46.0.4
