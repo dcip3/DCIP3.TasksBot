@@ -69,6 +69,7 @@ async def init_db():
             preview_default_worker TEXT,
             preview_default_method TEXT,
             preview_auto_enabled INTEGER DEFAULT 0,
+            preview_auto_scope TEXT,
             last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (telegram_user_id) REFERENCES users(telegram_user_id)
         )
@@ -162,6 +163,36 @@ async def init_db():
         else:
             logger.error("Failed to ensure preview_auto_enabled column: %s", column_error)
             raise
+
+    # Ensure preview_auto_scope column exists for legacy databases
+    try:
+        await tasks_db_conn.execute(
+            "ALTER TABLE user_sessions ADD COLUMN preview_auto_scope TEXT"
+        )
+        await tasks_db_conn.commit()
+        logger.info("Added preview_auto_scope column to user_sessions table")
+    except aiosqlite.OperationalError as column_error:
+        message = str(column_error).lower()
+        if "duplicate column name" in message:
+            logger.debug("preview_auto_scope column already exists on user_sessions table")
+        else:
+            logger.error("Failed to ensure preview_auto_scope column: %s", column_error)
+            raise
+
+    try:
+        await tasks_db_conn.execute(
+            """
+            UPDATE user_sessions
+            SET preview_auto_scope = notification_scope
+            WHERE preview_auto_scope IS NULL OR preview_auto_scope = ''
+            """
+        )
+        await tasks_db_conn.commit()
+    except Exception as update_error:
+        logger.warning(
+            "Failed to backfill preview_auto_scope: %s",
+            update_error,
+        )
 
     await tasks_db_conn.commit()
     logger.info("Database initialized successfully")

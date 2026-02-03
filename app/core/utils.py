@@ -1373,7 +1373,8 @@ async def job_progress_watcher(bot):
                                notification_scope,
                                preview_default_method,
                                preview_default_worker,
-                               preview_auto_enabled
+                               preview_auto_enabled,
+                               preview_auto_scope
                         FROM user_sessions
                         """
                     ) as cursor:
@@ -1392,6 +1393,7 @@ async def job_progress_watcher(bot):
                     preview_method_raw,
                     preview_worker,
                     preview_auto_enabled,
+                    preview_auto_scope_raw,
                 ) = row
                 try:
                     decrypted_password = _decrypt_password(password)
@@ -1399,6 +1401,7 @@ async def job_progress_watcher(bot):
                     decrypted_password = password
 
                 scope = _normalize_scope(scope_raw)
+                auto_scope = _normalize_scope(preview_auto_scope_raw) if preview_auto_scope_raw else scope
                 preview_method = (preview_method_raw or "").strip().lower()
                 if preview_method not in VALID_PREVIEW_RENDER_METHODS:
                     preview_method = None
@@ -1410,6 +1413,7 @@ async def job_progress_watcher(bot):
                         decrypted_password,
                         bool(notifications_enabled),
                         scope,
+                        auto_scope,
                         preview_method,
                         preview_worker,
                         bool(preview_auto_enabled),
@@ -1417,7 +1421,7 @@ async def job_progress_watcher(bot):
                 )
 
             notify_count = sum(1 for item in users if item[3])
-            auto_preview_count = sum(1 for item in users if item[7])
+            auto_preview_count = sum(1 for item in users if item[8])
             logger.info(
                 "Job progress watcher: Monitoring %d users (%d notifications, %d auto previews)",
                 len(users),
@@ -1441,6 +1445,7 @@ async def job_progress_watcher(bot):
                 decrypted_password,
                 has_notifications,
                 scope,
+                auto_scope,
                 preview_method,
                 preview_worker,
                 auto_preview_enabled,
@@ -1560,10 +1565,8 @@ async def job_progress_watcher(bot):
                                     notified_jobs.add((job_id, resolved_user_id))
                                     continue
 
-                                if not job_matches_scope(scope, login, props, job):
-                                    continue
-
-                                if auto_preview_enabled and preview_method in {"server", "deadline"}:
+                                auto_matches = job_matches_scope(auto_scope, login, props, job)
+                                if auto_preview_enabled and preview_method in {"server", "deadline"} and auto_matches:
                                     auto_key = (job_id, telegram_user_id)
                                     if auto_key not in auto_preview_jobs:
                                         auto_preview_jobs.add(auto_key)
@@ -1578,6 +1581,9 @@ async def job_progress_watcher(bot):
                                                 preview_worker,
                                             )
                                         )
+
+                                if not job_matches_scope(scope, login, props, job):
+                                    continue
 
                                 if not has_notifications:
                                     continue

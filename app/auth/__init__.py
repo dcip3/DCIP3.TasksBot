@@ -587,6 +587,31 @@ async def get_preview_auto_enabled(telegram_user_id: int) -> bool:
         return False
 
 
+async def get_preview_auto_scope(telegram_user_id: int) -> NotificationScope:
+    """
+    Get the auto-preview scope for a user.
+
+    Falls back to notification scope when not explicitly set.
+    """
+    conn = get_db_connection()
+    if conn is None:
+        return DEFAULT_NOTIFICATION_SCOPE
+
+    try:
+        async with conn.execute(
+            "SELECT preview_auto_scope FROM user_sessions WHERE telegram_user_id = ?",
+            (telegram_user_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row and row[0]:
+                return _normalize_scope(row[0])
+    except Exception as e:
+        logger.error("Failed to fetch preview auto scope for user %s: %s", telegram_user_id, e)
+
+    _, scope = await get_notification_settings(telegram_user_id)
+    return scope
+
+
 async def set_preview_auto_enabled(telegram_user_id: int, enabled: bool) -> bool:
     """
     Enable or disable auto-preview for a user.
@@ -610,6 +635,39 @@ async def set_preview_auto_enabled(telegram_user_id: int, enabled: bool) -> bool
     except Exception as e:
         logger.error("Failed to set preview auto flag for user %s: %s", telegram_user_id, e)
         return False
+
+
+async def set_preview_auto_scope(
+    telegram_user_id: int,
+    scope: NotificationScope,
+) -> NotificationScope:
+    """
+    Set the auto-preview scope for a user.
+    """
+    conn = get_db_connection()
+    if conn is None:
+        return DEFAULT_NOTIFICATION_SCOPE
+
+    normalized_scope = _normalize_scope(scope)
+    try:
+        await conn.execute(
+            """
+            UPDATE user_sessions
+            SET preview_auto_scope = ?
+            WHERE telegram_user_id = ?
+            """,
+            (normalized_scope, telegram_user_id),
+        )
+        await conn.commit()
+        logger.info(
+            "User %s preview auto scope set to %s",
+            telegram_user_id,
+            normalized_scope,
+        )
+        return normalized_scope
+    except Exception as e:
+        logger.error("Failed to set preview auto scope for user %s: %s", telegram_user_id, e)
+        return DEFAULT_NOTIFICATION_SCOPE
 
 
 async def get_notification_status(telegram_user_id: int) -> bool:

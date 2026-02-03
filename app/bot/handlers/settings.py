@@ -13,10 +13,12 @@ from app.auth import (
     get_preview_default_method,
     get_preview_default_worker,
     get_preview_auto_enabled,
+    get_preview_auto_scope,
     is_authorized,
     set_notification_enabled,
     set_notification_scope,
     set_preview_auto_enabled,
+    set_preview_auto_scope,
     set_preview_default_method,
     set_preview_default_worker,
 )
@@ -131,12 +133,6 @@ def _build_notification_keyboard(enabled: bool, scope: str) -> InlineKeyboardMar
                 InlineKeyboardButton(
                     text="⬅️ Back",
                     callback_data="settings:back:root",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="✖️ Close",
-                    callback_data="settings:close",
                 ),
             ],
         ]
@@ -334,18 +330,23 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
 
     async def show_preview_menu() -> None:
         auto_enabled = await get_preview_auto_enabled(user_id)
+        auto_scope = await get_preview_auto_scope(user_id)
+        scope_label = "My jobs only" if auto_scope == "own" else "All jobs"
+        auto_label = "On" if auto_enabled else "Off"
         text_lines = [
-            "Preview Settings",
-            f"Auto preview: {'enabled' if auto_enabled else 'disabled'}",
+            "🎬 Preview Settings",
+            "",
+            f"• Auto preview: {auto_label}",
+            f"• Auto preview scope: {scope_label}",
+            "• Uses: your default method",
+            "",
             "Choose what to configure for previews.",
-            "Auto preview uses your notification scope and default method.",
         ]
-        auto_toggle_label = "✅ Auto preview on completion" if auto_enabled else "☐ Auto preview on completion"
         keyboard_rows = [
             [
                 InlineKeyboardButton(
-                    text=auto_toggle_label,
-                    callback_data="settings:preview:auto:toggle",
+                    text="⚡ Auto Preview",
+                    callback_data="settings:preview:auto",
                 ),
             ],
             [
@@ -367,6 +368,56 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
                 ),
             ],
         ]
+        await _edit_or_send(
+            callback_query.message,
+            "\n".join(text_lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+        )
+
+    async def show_preview_auto() -> None:
+        auto_enabled = await get_preview_auto_enabled(user_id)
+        auto_scope = await get_preview_auto_scope(user_id)
+        scope_label = "My jobs only" if auto_scope == "own" else "All jobs"
+        status_label = "On" if auto_enabled else "Off"
+
+        text_lines = [
+            "⚡ Auto Preview",
+            "",
+            f"• Status: {status_label}",
+            f"• Scope: {scope_label}",
+            "",
+            "Auto preview creates previews automatically when jobs finish.",
+        ]
+
+        toggle_label = "✅ Auto preview enabled" if auto_enabled else "☐ Auto preview enabled"
+        all_jobs_label = ("✅ " if auto_scope == "all" else "◻ ") + "All jobs"
+        own_jobs_label = ("✅ " if auto_scope == "own" else "◻ ") + "My jobs only"
+
+        keyboard_rows = [
+            [
+                InlineKeyboardButton(
+                    text=toggle_label,
+                    callback_data="settings:preview:auto:toggle",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=all_jobs_label,
+                    callback_data="settings:preview:auto:scope:all",
+                ),
+                InlineKeyboardButton(
+                    text=own_jobs_label,
+                    callback_data="settings:preview:auto:scope:own",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Back",
+                    callback_data="settings:preview",
+                ),
+            ],
+        ]
+
         await _edit_or_send(
             callback_query.message,
             "\n".join(text_lines),
@@ -459,14 +510,30 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
                         return
                     await show_preview_method()
                     return
-            if sub_action == "auto" and len(parts) > 3 and parts[3] == "toggle":
-                current_enabled = await get_preview_auto_enabled(user_id)
-                await set_preview_auto_enabled(user_id, not current_enabled)
-                await show_preview_menu()
-                await callback_query.answer(
-                    "Auto preview enabled" if not current_enabled else "Auto preview disabled"
-                )
-                return
+            if sub_action == "auto":
+                if len(parts) == 3:
+                    await show_preview_auto()
+                    await callback_query.answer()
+                    return
+                if len(parts) > 3 and parts[3] == "toggle":
+                    current_enabled = await get_preview_auto_enabled(user_id)
+                    await set_preview_auto_enabled(user_id, not current_enabled)
+                    await show_preview_auto()
+                    await callback_query.answer(
+                        "Auto preview enabled" if not current_enabled else "Auto preview disabled"
+                    )
+                    return
+                if len(parts) > 4 and parts[3] == "scope":
+                    scope_value = parts[4]
+                    if scope_value not in {"all", "own"}:
+                        await callback_query.answer("Unsupported option.", show_alert=True)
+                        return
+                    await set_preview_auto_scope(user_id, cast(NotificationScope, scope_value))
+                    await show_preview_auto()
+                    await callback_query.answer(
+                        "Scope set to all jobs" if scope_value == "all" else "Scope set to my jobs only"
+                    )
+                    return
 
     if action == "setup_script":
         script_path = Path(__file__).resolve().parents[3] / "scripts" / "worker_setup.ps1"
