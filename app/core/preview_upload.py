@@ -2,8 +2,6 @@
 Preview upload endpoint and token helpers for worker-to-bot delivery.
 """
 
-from __future__ import annotations
-
 import html
 import json
 import logging
@@ -394,11 +392,10 @@ async def _deliver_preview(payload: PreviewUploadPayload, temp_path: Path) -> No
         dropbox_path=display_path,
     )
 
+    from app.core.preview_text import build_preview_caption
+
     display_name = payload.expected_filename or preparation.video_path.name
-    caption_parts = [f"📁 {display_name}"]
-    if display_path:
-        caption_parts.append(f"<code>{display_path}</code>")
-    caption = "\n".join(caption_parts)
+    caption = build_preview_caption(display_name, display_path)
 
     if preparation.fallback_message:
         fallback_message = preparation.fallback_message

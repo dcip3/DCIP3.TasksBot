@@ -5,7 +5,6 @@ Preview creation and delivery service functions.
 from typing import Optional, List, Dict, Any, Tuple, Union
 from pathlib import Path, PurePosixPath
 from collections import Counter
-from datetime import datetime
 import base64
 import json
 import logging
@@ -20,13 +19,9 @@ import aiohttp
 
 from app.core.config import settings
 from app.core.path_utils import extract_dropbox_path, normalize_dropbox_path
-from app.core.bot_core import get_aiosession
 from app.integrations.dropbox_helpers import (
     get_fresh_access_token,
     fetch_dropbox_metadata,
-    download_exr_folder,
-    upload_video_to_dropbox,
-    list_folder_all,
 )
 from app.services.dropbox_service import get_dropbox_session
 from app.services.deadline_service import (
@@ -41,6 +36,13 @@ from app.services.deadline_service import (
 
 logger = logging.getLogger(__name__)
 
+
+class PreviewSubmissionError(RuntimeError):
+    """Raised when a preview submission fails with a user-facing reason."""
+
+    def __init__(self, user_message: str, log_message: Optional[str] = None):
+        super().__init__(log_message or user_message)
+        self.user_message = user_message
 def _sanitize_windows_filename(name: str) -> str:
     """Replace characters that are invalid in Windows file names."""
     return re.sub(r'[\\/:*?"<>|]', "_", name)
@@ -75,13 +77,17 @@ async def create_video_from_job(
     credentials = await get_deadline_credentials(telegram_user_id)
     if not credentials:
         logger.error("No Deadline credentials found for user %s", telegram_user_id)
-        return None
+        raise PreviewSubmissionError(
+            "Deadline credentials are missing. Please /login again."
+        )
 
     login, password = credentials
     job_info = await get_job_info(login, password, job_id)
     if not job_info:
         logger.error("Could not get job info for %s", job_id)
-        return None
+        raise PreviewSubmissionError(
+            "Failed to fetch job details from Deadline. Please try again."
+        )
 
     props = job_info.get("Props", {})
     status_value = job_info.get("Stat")
@@ -96,7 +102,9 @@ async def create_video_from_job(
     outdirs = job_info.get("OutDir", [])
     if not outdirs:
         logger.error("No OutDir found for job %s", job_id)
-        return None
+        raise PreviewSubmissionError(
+            "Render output path was not found for this job."
+        )
 
     output_path = outdirs[0]
     idx = output_path.find(settings.dropbox_root_marker)
@@ -188,7 +196,9 @@ async def create_video_from_job(
     helper_script = Path(__file__).resolve().parents[2] / "scripts" / "deadline_preview_worker.py"
     if not helper_script.exists():
         logger.error("Preview helper script not found: %s", helper_script)
-        return None
+        raise PreviewSubmissionError(
+            "Preview helper script is missing on the bot host."
+        )
 
     script_bytes = helper_script.read_bytes()
     compressed_script = zlib.compress(script_bytes)
@@ -205,7 +215,9 @@ async def create_video_from_job(
         local_config_path = Path(settings.ocio_config_path)
         if not local_config_path.exists():
             logger.error("Configured OCIO config not found for attachment: %s", local_config_path)
-            return None
+            raise PreviewSubmissionError(
+                "OCIO config file was not found. Please check OCIO_CONFIG_PATH."
+            )
         aux_files.append((local_config_path, local_config_path.name))
         remote_config_path = (
             f"%DEADLINE_AUX_ROOT%\\{local_config_path.name}" if is_windows_path else f"$DEADLINE_AUX_ROOT/{local_config_path.name}"
@@ -477,7 +489,10 @@ async def create_video_from_job(
         )
     except DeadlineSubmissionError as exc:
         logger.error("Failed to submit preview job for %s: %s", job_id, exc)
-        return None
+        raise PreviewSubmissionError(
+            "Failed to submit the preview job to Deadline. Please try again.",
+            str(exc),
+        ) from exc
 
     preview_job_id = submission_response.get("job_id") or submission_response.get("_id")
     logger.info(

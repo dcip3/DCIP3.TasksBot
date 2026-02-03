@@ -19,6 +19,7 @@ from app.user_settings import (
 from app.core.bot_core import bot, download_states, stop_downloads
 from app.core.config import settings
 from app.core.path_utils import extract_dropbox_path
+from app.core.preview_text import build_preview_caption
 from app.core.utils import (
     cleanup_old_files,
     cleanup_temp_and_conv,
@@ -41,6 +42,7 @@ from app.integrations.video_helpers import (
 )
 from app.services import (
     ALLOWED_WORKER_STATUSES,
+    PreviewSubmissionError,
     check_video_exists_in_dropbox,
     create_video_from_job,
     delete_job_by_user_id,
@@ -604,6 +606,18 @@ async def create_new_video_process(
             if rate_limited:
                 return
         await callback_query.answer("Preferred workers are unavailable.", show_alert=False)
+    except PreviewSubmissionError as exc:
+        user_message = exc.user_message
+        if progress_msg:
+            await _set_progress_message(
+                callback_query,
+                progress_msg,
+                f"❌ {user_message}",
+            )
+        try:
+            await callback_query.answer(user_message, show_alert=True)
+        except Exception:
+            pass
     except Exception as exc:
         logger.error(
             "Error submitting preview job for user %s: %s",
@@ -1160,7 +1174,7 @@ async def render_preview_via_server(callback_query: CallbackQuery, job_id: str) 
         except Exception:  # pragma: no cover - defensive
             pass
 
-        caption = f"📁 {project_name}\n<code>{dropbox_video_path or ''}</code>"
+        caption = build_preview_caption(project_name, dropbox_video_path or None)
         if fallback_message:
             if callback_query.message:
                 await callback_query.message.answer(
@@ -1197,21 +1211,24 @@ async def render_preview_via_server(callback_query: CallbackQuery, job_id: str) 
             logger.warning("Could not answer callback query: %s", answer_error)
 
     except Exception as exc:
+        from app.core.error_text import describe_error
+
         logger.error(
             "Error in server-side preview generation for user %s job %s: %s",
             callback_query.from_user.id if callback_query.from_user else "unknown",
             job_id,
             exc,
         )
+        user_message = describe_error(exc) or "Error occurred while creating the preview."
         if progress_msg:
             with contextlib.suppress(Exception):
-                await progress_msg.edit_text(f"❌ Error during preview generation: {exc}")
+                await progress_msg.edit_text(f"❌ {user_message}")
         try:
-            await callback_query.answer("Error occurred while creating video.", show_alert=True)
+            await callback_query.answer(user_message, show_alert=True)
         except Exception as answer_error:
             logger.warning("Could not answer callback query after failure: %s", answer_error)
             if callback_query.message:
-                await callback_query.message.answer("❌ Error occurred while creating video.")
+                await callback_query.message.answer(f"❌ {user_message}")
         try:
             cleanup_job_files(job_id)
         except Exception as cleanup_error:
@@ -1313,9 +1330,12 @@ async def send_dbx_video_callback(callback_query: CallbackQuery) -> None:
         try:
             download_result = await download_video_from_dropbox(login, password, job_id)
         except Exception as exc:
+            from app.core.error_text import describe_error
+
             logger.error("Error downloading video from Dropbox: %s", exc)
-            await progress_msg.edit_text(f"❌ Error downloading video: {exc}")
-            await callback_query.answer("Error occurred while downloading video.", show_alert=True)
+            user_message = describe_error(exc) or "Failed to download the video from Dropbox."
+            await progress_msg.edit_text(f"❌ {user_message}")
+            await callback_query.answer(user_message, show_alert=True)
             return
 
         if not download_result:
@@ -1332,12 +1352,10 @@ async def send_dbx_video_callback(callback_query: CallbackQuery) -> None:
         try:
             video_file = FSInputFile(video_path)
             project_name = Path(video_path).stem
-            caption_lines = [f"📁 {project_name}"]
-            if dropbox_path:
-                caption_lines.append(f"<code>{dropbox_path}</code>")
-            else:
-                caption_lines.append(f"<code>{video_path}</code>")
-            caption = "\n".join(caption_lines)
+            caption = build_preview_caption(
+                project_name,
+                dropbox_path or video_path,
+            )
             await callback_query.message.answer_video(
                 video=video_file,
                 caption=caption,
@@ -1358,9 +1376,12 @@ async def send_dbx_video_callback(callback_query: CallbackQuery) -> None:
             except Exception as answer_error:
                 logger.warning("Could not answer callback query: %s", answer_error)
         except Exception as exc:
+            from app.core.error_text import describe_error
+
             logger.error("Error sending Dropbox video: %s", exc)
-            await progress_msg.edit_text(f"❌ Error sending video: {exc}")
-            await callback_query.answer("Error occurred while sending video.", show_alert=True)
+            user_message = describe_error(exc) or "Failed to send the video."
+            await progress_msg.edit_text(f"❌ {user_message}")
+            await callback_query.answer(user_message, show_alert=True)
 
     except Exception as exc:
         logger.error("Error handling send_dbx_video for user %s: %s", callback_query.from_user.id, exc)

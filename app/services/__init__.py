@@ -24,6 +24,7 @@ from app.services.deadline_service import (
 )
 from app.services.dropbox_service import get_dropbox_session, download_job_folder
 from app.services.preview_service import (
+    PreviewSubmissionError,
     create_video_from_job,
     check_video_exists_in_dropbox,
     download_video_from_dropbox,
@@ -53,6 +54,7 @@ __all__ = [
     "get_dropbox_session",
     "download_job_folder",
     "create_video_from_job",
+    "PreviewSubmissionError",
     "check_video_exists_in_dropbox",
     "download_video_from_dropbox",
 ]

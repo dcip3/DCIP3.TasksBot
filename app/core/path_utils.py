@@ -2,8 +2,6 @@
 Path formatting helpers for user-facing messages.
 """
 
-from __future__ import annotations
-
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Optional
 

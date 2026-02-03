@@ -18,7 +18,7 @@ import os
 import shutil
 from functools import wraps
 from pathlib import Path
-from typing import cast, Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, List, Dict, Any
 
 from aiogram.types import (
     BotCommand,
@@ -34,7 +34,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from app.core.config import settings
-from app.core.bot_core import bot, dp, init_aiosession, close_aiosession, auto_preview_jobs
+from app.core.bot_core import bot, init_aiosession, close_aiosession, auto_preview_jobs
 from app.core.database import init_db, close_db
 from app.integrations.video_helpers import prepare_video_for_delivery, get_file_size_mb
 
@@ -352,10 +352,8 @@ async def _notify_preview_job_completion(
             f"Please download it manually:\n{location_hint}"
         )
 
-    caption_parts = [f"📁 {final_path.name}"]
-    if display_path:
-        caption_parts.append(f"<code>{display_path}</code>")
-    caption = "\n".join(caption_parts)
+    from app.core.preview_text import build_preview_caption
+    caption = build_preview_caption(final_path.name, display_path)
 
     ready_text = f"🎬 Preview for {job_name} is ready."
     target_chat_id = target_user_id
@@ -611,9 +609,12 @@ async def _send_dropbox_video_to_user(
             dropbox_path_hint=dropbox_path_hint,
         )
     except Exception as exc:
+        from app.core.error_text import describe_error
+
         logger.error("Auto preview Dropbox download failed for job %s: %s", job_id, exc)
+        user_message = describe_error(exc) or "Auto preview: failed to download from Dropbox."
         with contextlib.suppress(Exception):
-            await progress_msg.edit_text("❌ Auto preview: failed to download from Dropbox.")
+            await progress_msg.edit_text(f"❌ {user_message}")
         return False
 
     if not download_result:
@@ -628,12 +629,11 @@ async def _send_dropbox_video_to_user(
             video_path_obj,
             dropbox_path,
         )
-        caption_lines = [f"📁 {video_path_obj.stem}"]
-        if dropbox_path:
-            caption_lines.append(f"<code>{dropbox_path}</code>")
-        else:
-            caption_lines.append(f"<code>{video_path}</code>")
-        caption = "\n".join(caption_lines)
+        from app.core.preview_text import build_preview_caption
+        caption = build_preview_caption(
+            video_path_obj.name,
+            dropbox_path or video_path,
+        )
 
         if preparation.fallback_message:
             await bot.send_message(
@@ -652,9 +652,12 @@ async def _send_dropbox_video_to_user(
             await progress_msg.delete()
         return True
     except Exception as exc:
+        from app.core.error_text import describe_error
+
         logger.error("Auto preview send failed for job %s: %s", job_id, exc)
+        user_message = describe_error(exc) or "Auto preview: failed to send the video."
         with contextlib.suppress(Exception):
-            await progress_msg.edit_text("❌ Auto preview: failed to send video.")
+            await progress_msg.edit_text(f"❌ {user_message}")
         return False
     finally:
         with contextlib.suppress(Exception):
@@ -672,7 +675,7 @@ async def _submit_auto_preview_deadline(
     default_worker: Optional[str],
 ) -> None:
     """Submit a Deadline preview job and register progress tracking."""
-    from app.services import create_video_from_job, WorkerStatusError
+    from app.services import create_video_from_job, PreviewSubmissionError, WorkerStatusError
     from app.user_settings import PREVIEW_DEFAULT_WORKER_AUTO
 
     result = None
@@ -685,6 +688,12 @@ async def _submit_auto_preview_deadline(
             job_id,
             specific_worker=default_worker,
         )
+    except PreviewSubmissionError as exc:
+        await bot.send_message(
+            telegram_user_id,
+            f"❌ Auto preview: {exc.user_message}",
+        )
+        return
     except WorkerStatusError as worker_error:
         logger.warning(
             "Auto preview default worker unavailable for job %s: %s",

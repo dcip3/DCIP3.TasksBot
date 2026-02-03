@@ -13,6 +13,29 @@ VALID_NOTIFICATION_SCOPES = {"all", "own"}
 VALID_PREVIEW_RENDER_METHODS = {"server", "deadline"}
 PREVIEW_DEFAULT_WORKER_AUTO = "__auto__"
 
+__all__ = [
+    "NotificationScope",
+    "DEFAULT_NOTIFICATION_SCOPE",
+    "VALID_NOTIFICATION_SCOPES",
+    "VALID_PREVIEW_RENDER_METHODS",
+    "PREVIEW_DEFAULT_WORKER_AUTO",
+    "_normalize_scope",
+    "get_notification_settings",
+    "set_notification_enabled",
+    "set_notification_scope",
+    "get_preview_default_worker",
+    "set_preview_default_worker",
+    "get_preview_default_method",
+    "set_preview_default_method",
+    "get_preview_auto_enabled",
+    "get_preview_auto_scope",
+    "set_preview_auto_enabled",
+    "set_preview_auto_scope",
+    "get_notification_status",
+    "get_all_users_with_notifications",
+    "disable_notifications_for_user",
+]
+
 
 def _normalize_scope(scope: Optional[str]) -> NotificationScope:
     """Normalize notification scope to a known value."""
