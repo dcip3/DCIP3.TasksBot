@@ -673,10 +673,13 @@ async def _submit_auto_preview_deadline(
 ) -> None:
     """Submit a Deadline preview job and register progress tracking."""
     from app.services import create_video_from_job, WorkerStatusError
+    from app.auth import PREVIEW_DEFAULT_WORKER_AUTO
 
     result = None
     fallback_used = False
     try:
+        if default_worker == PREVIEW_DEFAULT_WORKER_AUTO:
+            default_worker = None
         result = await create_video_from_job(
             telegram_user_id,
             job_id,

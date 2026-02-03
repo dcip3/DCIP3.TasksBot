@@ -23,6 +23,7 @@ NotificationScope = Literal["all", "own"]
 DEFAULT_NOTIFICATION_SCOPE: NotificationScope = "all"
 VALID_NOTIFICATION_SCOPES = {"all", "own"}
 VALID_PREVIEW_RENDER_METHODS = {"server", "deadline"}
+PREVIEW_DEFAULT_WORKER_AUTO = "__auto__"
 
 def _get_cipher() -> Fernet:
     """Get or create Fernet cipher for password encryption."""
@@ -419,7 +420,12 @@ async def get_preview_default_worker(telegram_user_id: int) -> Optional[str]:
             row = await cursor.fetchone()
             if not row or not row[0]:
                 return None
-            return row[0]
+            raw = str(row[0]).strip()
+            if not raw:
+                return None
+            if raw.lower() in {"auto", PREVIEW_DEFAULT_WORKER_AUTO.lower()}:
+                return PREVIEW_DEFAULT_WORKER_AUTO
+            return raw
     except Exception as e:
         logger.error(f"Failed to fetch preview default worker for user {telegram_user_id}: {e}")
         return None
@@ -440,6 +446,18 @@ async def set_preview_default_worker(telegram_user_id: int, worker_name: Optiona
     if conn is None:
         return False
 
+    normalized: Optional[str]
+    if worker_name is None:
+        normalized = None
+    else:
+        candidate = str(worker_name).strip()
+        if not candidate or candidate.lower() in {"none", "ask"}:
+            normalized = None
+        elif candidate.lower() in {"auto", PREVIEW_DEFAULT_WORKER_AUTO.lower()}:
+            normalized = PREVIEW_DEFAULT_WORKER_AUTO
+        else:
+            normalized = candidate
+
     try:
         await conn.execute(
             """
@@ -447,10 +465,14 @@ async def set_preview_default_worker(telegram_user_id: int, worker_name: Optiona
             SET preview_default_worker = ?
             WHERE telegram_user_id = ?
             """,
-            (worker_name, telegram_user_id),
+            (normalized, telegram_user_id),
         )
         await conn.commit()
-        logger.info("User %s preview default worker set to %s", telegram_user_id, worker_name or "None")
+        logger.info(
+            "User %s preview default worker set to %s",
+            telegram_user_id,
+            normalized or "None",
+        )
         return True
     except Exception as e:
         logger.error("Failed to set preview default worker for user %s: %s", telegram_user_id, e)

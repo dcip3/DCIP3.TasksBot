@@ -8,6 +8,7 @@ from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, Inli
 
 from app.auth import (
     NotificationScope,
+    PREVIEW_DEFAULT_WORKER_AUTO,
     get_notification_settings,
     get_preview_default_method,
     get_preview_default_worker,
@@ -198,7 +199,9 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
         workers = await get_workers_list(user_id)
 
         text_lines = ["Preview Worker Settings", ""]
-        if default_worker:
+        if default_worker == PREVIEW_DEFAULT_WORKER_AUTO:
+            text_lines.append("Default worker: Auto (render worker)")
+        elif default_worker:
             text_lines.append(f"Default worker: {default_worker}")
         else:
             text_lines.append("Default worker: Not set (will show menu)")
@@ -209,11 +212,23 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
                 "If preview method is set to Server, this worker is ignored.",
                 "",
                 "Pick a worker that should render previews on the Deadline farm.",
+                "Auto will prefer the job creator or workers that rendered the job.",
                 "Select 'None' to always show the worker selection menu.",
             ]
         )
 
         keyboard_rows = []
+
+        keyboard_rows.append(
+            [
+                InlineKeyboardButton(
+                    text="✅ Auto"
+                    if default_worker == PREVIEW_DEFAULT_WORKER_AUTO
+                    else "Auto",
+                    callback_data="settings:preview:worker:set:auto",
+                )
+            ]
+        )
 
         if workers:
             for i in range(0, len(workers), 2):
@@ -237,7 +252,7 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
             [
                 InlineKeyboardButton(
                     text="✅ None (Always ask)"
-                    if not default_worker
+                    if default_worker is None
                     else "None (Always ask)",
                     callback_data="settings:preview:worker:set:none",
                 )
@@ -405,6 +420,9 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
                         await callback_query.answer(
                             "Default worker cleared. Menu will be shown for each preview."
                         )
+                    elif worker_name == "auto":
+                        await set_preview_default_worker(user_id, PREVIEW_DEFAULT_WORKER_AUTO)
+                        await callback_query.answer("Default worker set to: Auto (render worker)")
                     else:
                         await set_preview_default_worker(user_id, worker_name)
                         await callback_query.answer(f"Default worker set to: {worker_name}")

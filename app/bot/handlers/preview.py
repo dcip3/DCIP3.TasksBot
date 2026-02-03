@@ -10,7 +10,12 @@ from aiogram import Router
 from aiogram.exceptions import TelegramRetryAfter
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from app.auth import get_deadline_credentials, get_preview_default_method, get_preview_default_worker
+from app.auth import (
+    PREVIEW_DEFAULT_WORKER_AUTO,
+    get_deadline_credentials,
+    get_preview_default_method,
+    get_preview_default_worker,
+)
 from app.core.bot_core import bot, download_states, stop_downloads
 from app.core.config import settings
 from app.core.path_utils import extract_dropbox_path
@@ -319,6 +324,30 @@ async def _start_deadline_preview(callback_query: CallbackQuery, job_id: str) ->
     default_worker = await get_preview_default_worker(callback_query.from_user.id)
     # Use a fresh progress message to avoid editing the job card message.
     progress_msg: Optional[Message] = None
+
+    if default_worker == PREVIEW_DEFAULT_WORKER_AUTO:
+        try:
+            await create_new_video_process(
+                callback_query,
+                job_id,
+                use_any_machine=False,
+                skip_worker_validation=True,
+                progress_message=progress_msg,
+                specific_worker=None,
+            )
+            return
+        except Exception as exc:
+            logger.error(
+                "Error auto-submitting preview with render worker preference: %s",
+                exc,
+            )
+            try:
+                await show_worker_selection_for_preview(callback_query, job_id)
+                return
+            except Exception as fallback_exc:
+                logger.error("Error showing worker selection fallback: %s", fallback_exc)
+                await callback_query.answer("Failed to submit with auto worker.", show_alert=True)
+                return
 
     if default_worker:
         try:
@@ -1212,7 +1241,9 @@ async def show_worker_selection_for_preview(callback_query: CallbackQuery, job_i
     workers = await get_workers_list(user_id)
 
     text_lines = ["🎬 Select worker for preview rendering:"]
-    if default_worker:
+    if default_worker == PREVIEW_DEFAULT_WORKER_AUTO:
+        text_lines.append("\nDefault: Auto (render worker)")
+    elif default_worker:
         text_lines.append(f"\nDefault: {default_worker}")
 
     text = "\n".join(text_lines)
