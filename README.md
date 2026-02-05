@@ -56,7 +56,6 @@ All configuration lives in `.env`. Use the tables below as a checklist.
 |----------|-------------|---------|
 | `DEADLINE_API_URL` | Deadline REST endpoint (should include scheme + port) | `https://renderfarm.local:4434/api` |
 | `DEADLINE_TLS_VERIFY` | Verify TLS certificates for Deadline API requests | `false` |
-| `PASSWORD_SALT` | Salt for hashing stored credentials | `change-me` |
 | `ENCRYPTION_KEY` | Fernet key for secrets in storage | `generated-with-fernet` |
 
 Set `DEADLINE_TLS_VERIFY=false` only if your Deadline API uses a self-signed certificate.

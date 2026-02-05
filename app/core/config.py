@@ -121,7 +121,6 @@ class Settings(BaseSettings):
     )
 
     # Security Settings
-    password_salt: str = Field(..., description="Salt for password hashing")
     encryption_key: str = Field(..., description="Fernet encryption key for password storage (generate with Fernet.generate_key())")
 
     # Application Limits

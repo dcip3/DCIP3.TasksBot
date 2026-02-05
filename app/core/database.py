@@ -22,8 +22,7 @@ async def init_db():
     Initialize the SQLite database and create all necessary tables.
     
     Creates the following tables:
-    - users: Stores user authentication and preferences
-    - user_sessions: Stores user session data and credentials
+    - user_sessions: Stores Deadline credentials and user settings
     """
     global tasks_db_conn
     db_path = Path(settings.sqlite_db_path)
@@ -44,19 +43,6 @@ async def init_db():
 
     tasks_db_conn = await aiosqlite.connect(settings.sqlite_db_path)
     
-    # Create users table for authentication and user management
-    await tasks_db_conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE,
-            password_hash TEXT,
-            telegram_user_id INTEGER UNIQUE,
-            is_active INTEGER DEFAULT 1,
-            notifications_enabled INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
     # Create user_sessions table for storing session data
     await tasks_db_conn.execute("""
         CREATE TABLE IF NOT EXISTS user_sessions (
@@ -70,8 +56,7 @@ async def init_db():
             preview_default_method TEXT,
             preview_auto_enabled INTEGER DEFAULT 0,
             preview_auto_scope TEXT,
-            last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (telegram_user_id) REFERENCES users(telegram_user_id)
+            last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
@@ -90,16 +75,6 @@ async def init_db():
     """)
     
     # Create indexes for better performance
-    await tasks_db_conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_users_telegram_id 
-        ON users(telegram_user_id)
-    """)
-    
-    await tasks_db_conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_users_username 
-        ON users(username)
-    """)
-    
     await tasks_db_conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_user_sessions_telegram_id 
         ON user_sessions(telegram_user_id)

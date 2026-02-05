@@ -1,12 +1,8 @@
 # app/auth/__init__.py
 """
-User authentication and management system.
-
-This module provides user authentication, password hashing, and user management
-functions including login, logout, and session management for TasksBot.
+Deadline credential authentication and session management for TasksBot.
 """
 
-import hashlib
 import logging
 from typing import Optional, Tuple
 from cryptography.fernet import Fernet
@@ -56,66 +52,6 @@ def _decrypt_password(encrypted_password: str) -> str:
     cipher = _get_cipher()
     decrypted = cipher.decrypt(encrypted_password.encode('utf-8'))
     return decrypted.decode('utf-8')
-
-
-def _hash_password(password: str) -> str:
-    """
-    Hash password using PBKDF2-HMAC-SHA256 with salt from settings.
-    
-    Args:
-        password: Plain text password to hash
-        
-    Returns:
-        Hexadecimal representation of the hashed password
-    """
-    salt = settings.password_salt.encode('utf-8')
-    dk = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100_000)
-    return dk.hex()
-
-
-def _verify_password(password: str, stored_hash: str) -> bool:
-    """
-    Verify a password against a stored hash.
-    
-    Args:
-        password: Plain text password to verify
-        stored_hash: Stored password hash to compare against
-        
-    Returns:
-        True if password matches the hash, False otherwise
-    """
-    salt = settings.password_salt.encode('utf-8')
-    dk = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100_000)
-    return dk.hex() == stored_hash
-
-
-async def create_user(username: str, password: str) -> bool:
-    """
-    Create a new user with plaintext password. Hashes and stores the password.
-    
-    Args:
-        username: Unique username for the new user
-        password: Plain text password to hash and store
-        
-    Returns:
-        True if user was created successfully, False if username is already taken
-    """
-    conn = get_db_connection()
-    if conn is None:
-        raise RuntimeError("Database not initialized")
-    
-    phash = _hash_password(password)
-    try:
-        await conn.execute(
-            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
-            (username, phash)
-        )
-        await conn.commit()
-        logger.info(f"Created user: {username}")
-        return True
-    except Exception as e:
-        logger.warning(f"Failed to create user {username}: {e}")
-        return False
 
 
 async def authenticate_user(username: str, password: str, telegram_user_id: int) -> bool:
@@ -299,4 +235,3 @@ async def get_deadline_credentials(telegram_user_id: int) -> Optional[Tuple[str,
     except Exception as e:
         logger.error(f"Failed to get Deadline credentials for user {telegram_user_id}: {e}")
         return None
-

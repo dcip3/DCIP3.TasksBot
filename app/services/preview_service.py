@@ -181,7 +181,7 @@ async def create_video_from_job(
                 expected_local_path=expected_local_path,
                 source_job_id=job_id,
             )
-            upload_token = issue_preview_upload_token(payload)
+            upload_token = await issue_preview_upload_token(payload)
 
     frames_str = props.get("Frames", "")
     start_match = re.search(r"-?\d+", frames_str)
@@ -507,9 +507,9 @@ async def create_video_from_job(
         from app.core.preview_upload import drop_preview_upload_token, update_preview_upload_token
 
         if preview_job_id:
-            update_preview_upload_token(upload_token, str(preview_job_id))
+            await update_preview_upload_token(upload_token, str(preview_job_id))
         else:
-            drop_preview_upload_token(upload_token)
+            await drop_preview_upload_token(upload_token)
 
     return {
         "preview_job_id": preview_job_id,

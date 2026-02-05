@@ -6,13 +6,15 @@ import html
 import json
 import logging
 import secrets
-import sqlite3
 import time
 import urllib.parse
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import aiofiles
+import aiosqlite
 from aiohttp import web
 from aiogram.types import FSInputFile
 
@@ -41,26 +43,38 @@ class PreviewUploadTokenStore:
     def __init__(self, ttl_seconds: int, max_size: int = 10000) -> None:
         self._ttl_seconds = int(ttl_seconds)
         self._max_size = max_size
+        self._schema_ready = False
+        self._schema_lock = asyncio.Lock()
 
-    def _open_db(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(settings.sqlite_db_path)
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS preview_upload_tokens (
-                token TEXT PRIMARY KEY,
-                expires_at INTEGER NOT NULL,
-                created_at INTEGER NOT NULL,
-                payload_json TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_preview_upload_tokens_expires
-            ON preview_upload_tokens(expires_at)
-            """
-        )
+    async def _open_db(self) -> aiosqlite.Connection:
+        conn = await aiosqlite.connect(settings.sqlite_db_path)
+        await conn.execute("PRAGMA journal_mode=WAL")
         return conn
+
+    async def _ensure_schema(self, conn: aiosqlite.Connection) -> None:
+        if self._schema_ready:
+            return
+        async with self._schema_lock:
+            if self._schema_ready:
+                return
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS preview_upload_tokens (
+                    token TEXT PRIMARY KEY,
+                    expires_at INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL
+                )
+                """
+            )
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_preview_upload_tokens_expires
+                ON preview_upload_tokens(expires_at)
+                """
+            )
+            await conn.commit()
+            self._schema_ready = True
 
     def _serialize_payload(self, payload: PreviewUploadPayload) -> str:
         data = {
@@ -94,17 +108,17 @@ class PreviewUploadTokenStore:
         except Exception:
             return None
 
-    def _cleanup(self, conn: sqlite3.Connection) -> None:
+    async def _cleanup(self, conn: aiosqlite.Connection) -> None:
         now = int(time.time())
-        conn.execute("DELETE FROM preview_upload_tokens WHERE expires_at <= ?", (now,))
+        await conn.execute("DELETE FROM preview_upload_tokens WHERE expires_at <= ?", (now,))
         if self._max_size <= 0:
             return
-        cur = conn.execute("SELECT COUNT(*) FROM preview_upload_tokens")
-        row = cur.fetchone()
+        async with conn.execute("SELECT COUNT(*) FROM preview_upload_tokens") as cur:
+            row = await cur.fetchone()
         total = row[0] if row else 0
         overflow = total - self._max_size
         if overflow > 0:
-            conn.execute(
+            await conn.execute(
                 """
                 DELETE FROM preview_upload_tokens
                 WHERE token IN (
@@ -116,12 +130,13 @@ class PreviewUploadTokenStore:
                 (overflow,),
             )
 
-    def issue(self, payload: PreviewUploadPayload) -> str:
+    async def issue(self, payload: PreviewUploadPayload) -> str:
         token = secrets.token_urlsafe(32)
         now = int(time.time())
         expires_at = now + self._ttl_seconds
-        with self._open_db() as conn:
-            conn.execute(
+        async with await self._open_db() as conn:
+            await self._ensure_schema(conn)
+            await conn.execute(
                 """
                 INSERT OR REPLACE INTO preview_upload_tokens
                 (token, expires_at, created_at, payload_json)
@@ -129,65 +144,78 @@ class PreviewUploadTokenStore:
                 """,
                 (token, expires_at, now, self._serialize_payload(payload)),
             )
-            self._cleanup(conn)
+            await self._cleanup(conn)
+            await conn.commit()
         return token
 
-    def update(self, token: str, **updates: object) -> bool:
-        with self._open_db() as conn:
-            cur = conn.execute(
+    async def update(self, token: str, **updates: object) -> bool:
+        async with await self._open_db() as conn:
+            await self._ensure_schema(conn)
+            async with conn.execute(
                 "SELECT expires_at, payload_json FROM preview_upload_tokens WHERE token = ?",
                 (token,),
-            )
-            row = cur.fetchone()
+            ) as cur:
+                row = await cur.fetchone()
             if not row:
                 return False
             expires_at, payload_json = row
             if int(expires_at) <= int(time.time()):
-                conn.execute("DELETE FROM preview_upload_tokens WHERE token = ?", (token,))
+                await conn.execute("DELETE FROM preview_upload_tokens WHERE token = ?", (token,))
+                await conn.commit()
                 return False
             payload = self._deserialize_payload(payload_json)
             if payload is None:
-                conn.execute("DELETE FROM preview_upload_tokens WHERE token = ?", (token,))
+                await conn.execute("DELETE FROM preview_upload_tokens WHERE token = ?", (token,))
+                await conn.commit()
                 return False
             for key, value in updates.items():
                 if hasattr(payload, key):
                     setattr(payload, key, value)
-            conn.execute(
+            await conn.execute(
                 "UPDATE preview_upload_tokens SET payload_json = ? WHERE token = ?",
                 (self._serialize_payload(payload), token),
             )
+            await conn.commit()
             return True
 
-    def get(self, token: str) -> Optional[PreviewUploadPayload]:
-        with self._open_db() as conn:
-            cur = conn.execute(
+    async def get(self, token: str) -> Optional[PreviewUploadPayload]:
+        async with await self._open_db() as conn:
+            await self._ensure_schema(conn)
+            async with conn.execute(
                 "SELECT expires_at, payload_json FROM preview_upload_tokens WHERE token = ?",
                 (token,),
-            )
-            row = cur.fetchone()
+            ) as cur:
+                row = await cur.fetchone()
             if not row:
                 return None
             expires_at, payload_json = row
             if int(expires_at) <= int(time.time()):
-                conn.execute("DELETE FROM preview_upload_tokens WHERE token = ?", (token,))
+                await conn.execute("DELETE FROM preview_upload_tokens WHERE token = ?", (token,))
+                await conn.commit()
                 return None
             return self._deserialize_payload(payload_json)
 
-    def consume(self, token: str) -> Optional[PreviewUploadPayload]:
-        payload = self.get(token)
+    async def consume(self, token: str) -> Optional[PreviewUploadPayload]:
+        payload = await self.get(token)
         if payload is None:
             return None
-        with self._open_db() as conn:
-            conn.execute("DELETE FROM preview_upload_tokens WHERE token = ?", (token,))
+        async with await self._open_db() as conn:
+            await self._ensure_schema(conn)
+            await conn.execute("DELETE FROM preview_upload_tokens WHERE token = ?", (token,))
+            await conn.commit()
         return payload
 
-    def drop(self, token: str) -> None:
-        with self._open_db() as conn:
-            conn.execute("DELETE FROM preview_upload_tokens WHERE token = ?", (token,))
+    async def drop(self, token: str) -> None:
+        async with await self._open_db() as conn:
+            await self._ensure_schema(conn)
+            await conn.execute("DELETE FROM preview_upload_tokens WHERE token = ?", (token,))
+            await conn.commit()
 
-    def cleanup(self) -> None:
-        with self._open_db() as conn:
-            self._cleanup(conn)
+    async def cleanup(self) -> None:
+        async with await self._open_db() as conn:
+            await self._ensure_schema(conn)
+            await self._cleanup(conn)
+            await conn.commit()
 
 
 _token_store = PreviewUploadTokenStore(
@@ -209,25 +237,25 @@ def get_preview_upload_url() -> Optional[str]:
     return raw
 
 
-def issue_preview_upload_token(payload: PreviewUploadPayload) -> Optional[str]:
+async def issue_preview_upload_token(payload: PreviewUploadPayload) -> Optional[str]:
     if not settings.preview_upload_enabled:
         return None
     if not get_preview_upload_url():
         logger.warning("Preview upload enabled, but PREVIEW_UPLOAD_URL is not set")
         return None
-    return _token_store.issue(payload)
+    return await _token_store.issue(payload)
 
 
-def update_preview_upload_token(token: str, preview_job_id: str) -> None:
-    _token_store.update(token, preview_job_id=preview_job_id)
+async def update_preview_upload_token(token: str, preview_job_id: str) -> None:
+    await _token_store.update(token, preview_job_id=preview_job_id)
 
 
-def drop_preview_upload_token(token: str) -> None:
-    _token_store.drop(token)
+async def drop_preview_upload_token(token: str) -> None:
+    await _token_store.drop(token)
 
 
-def cleanup_preview_upload_tokens() -> None:
-    _token_store.cleanup()
+async def cleanup_preview_upload_tokens() -> None:
+    await _token_store.cleanup()
 
 
 async def start_preview_upload_server() -> None:
@@ -304,14 +332,14 @@ async def _handle_preview_upload(request: web.Request) -> web.Response:
     if not token:
         return web.Response(status=401, text="Missing token")
 
-    payload = _token_store.get(token)
+    payload = await _token_store.get(token)
     if payload is None:
         return web.Response(status=403, text="Invalid or expired token")
 
     if payload.preview_job_id:
         notified_key = (payload.preview_job_id, payload.telegram_user_id)
         if notified_key in notified_jobs:
-            _token_store.consume(token)
+            await _token_store.consume(token)
             return web.Response(status=200, text="Preview already delivered")
 
     max_size_bytes = settings.preview_upload_max_mb * 1024 * 1024
@@ -330,16 +358,15 @@ async def _handle_preview_upload(request: web.Request) -> web.Response:
     temp_path = upload_dir / filename
     bytes_written = 0
     try:
-        with open(temp_path, "wb") as handle:
+        async with aiofiles.open(temp_path, "wb") as handle:
             async for chunk in request.content.iter_chunked(1024 * 1024):
                 if not chunk:
                     continue
                 bytes_written += len(chunk)
                 if bytes_written > max_size_bytes:
-                    handle.close()
                     temp_path.unlink(missing_ok=True)
                     return web.Response(status=413, text="Payload too large")
-                handle.write(chunk)
+                await handle.write(chunk)
     except Exception as exc:
         logger.error("Failed to write preview upload: %s", exc)
         temp_path.unlink(missing_ok=True)
@@ -352,7 +379,7 @@ async def _handle_preview_upload(request: web.Request) -> web.Response:
         temp_path.unlink(missing_ok=True)
         return web.Response(status=500, text="Delivery failed")
 
-    _token_store.consume(token)
+    await _token_store.consume(token)
     return web.Response(status=200, text="OK")
 
 

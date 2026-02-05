@@ -16,6 +16,7 @@ import html
 import logging
 import os
 import shutil
+import subprocess
 from functools import wraps
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
@@ -34,7 +35,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from app.core.config import settings
-from app.core.bot_core import bot, init_aiosession, close_aiosession, auto_preview_jobs
+from app.core.bot_core import bot, init_aiosession, close_aiosession
 from app.core.database import init_db, close_db
 from app.integrations.video_helpers import prepare_video_for_delivery, get_file_size_mb
 
@@ -1275,9 +1276,10 @@ async def on_startup(bot):
     )
 
     # Clean up expired preview upload tokens every hour
-    def cleanup_preview_tokens():
+    def cleanup_preview_tokens() -> None:
         from app.core.preview_upload import cleanup_preview_upload_tokens
-        cleanup_preview_upload_tokens()
+
+        asyncio.create_task(cleanup_preview_upload_tokens())
 
     scheduler.add_job(
         cleanup_preview_tokens,
@@ -1291,6 +1293,8 @@ async def on_startup(bot):
     # Start job progress watcher
     global job_watcher_task
     if job_watcher_task is None or job_watcher_task.done():
+        from app.services.job_watcher_service import job_progress_watcher
+
         job_watcher_task = asyncio.create_task(job_progress_watcher(bot))
         logger.info("Job progress watcher started")
 
@@ -1336,313 +1340,7 @@ async def on_shutdown(bot):
 
 
 async def job_progress_watcher(bot):
-    """
-    Monitor job completion and notify users about finished jobs.
-    Also monitors preview jobs for ALL users (regardless of notification settings).
+    """Backward-compatible wrapper around the dedicated watcher service."""
+    from app.services.job_watcher_service import job_progress_watcher as _service_job_progress_watcher
 
-    Uses adaptive polling interval:
-    - 15 seconds when there are active preview jobs
-    - 60 seconds for regular monitoring
-
-    Args:
-        bot: Bot instance for sending notifications
-    """
-    import aiohttp
-    from datetime import datetime, timezone, timedelta
-    from app.auth import _decrypt_password
-    from app.user_settings import (
-        _normalize_scope,
-        VALID_PREVIEW_RENDER_METHODS,
-        disable_notifications_for_user,
-    )
-    from app.core.bot_core import notified_jobs, get_aiosession, auto_preview_jobs
-    from app.core.database import get_db_connection
-
-    try:
-        while True:
-            # Adaptive polling interval based on active preview jobs
-            has_active_previews = len(preview_message_registry) > 0
-            sleep_interval = settings.job_watcher_interval_preview if has_active_previews else settings.job_watcher_interval_normal
-
-            if has_active_previews:
-                logger.debug(f"Active preview jobs: {len(preview_message_registry)}, using fast polling ({sleep_interval}s)")
-
-            await asyncio.sleep(sleep_interval)
-
-            conn = get_db_connection()
-            user_rows = []
-            if conn:
-                try:
-                    async with conn.execute(
-                        """
-                        SELECT telegram_user_id,
-                               deadline_login,
-                               deadline_password,
-                               notifications_enabled,
-                               notification_scope,
-                               preview_default_method,
-                               preview_default_worker,
-                               preview_auto_enabled,
-                               preview_auto_scope
-                        FROM user_sessions
-                        """
-                    ) as cursor:
-                        user_rows = await cursor.fetchall()
-                except Exception as e:
-                    logger.error("Error fetching users for monitoring: %s", e)
-
-            users = []
-            for row in user_rows:
-                (
-                    user_id,
-                    login,
-                    password,
-                    notifications_enabled,
-                    scope_raw,
-                    preview_method_raw,
-                    preview_worker,
-                    preview_auto_enabled,
-                    preview_auto_scope_raw,
-                ) = row
-                try:
-                    decrypted_password = _decrypt_password(password)
-                except Exception:
-                    decrypted_password = password
-
-                scope = _normalize_scope(scope_raw)
-                auto_scope = _normalize_scope(preview_auto_scope_raw) if preview_auto_scope_raw else scope
-                preview_method = (preview_method_raw or "").strip().lower()
-                if preview_method not in VALID_PREVIEW_RENDER_METHODS:
-                    preview_method = None
-
-                users.append(
-                    (
-                        user_id,
-                        login,
-                        decrypted_password,
-                        bool(notifications_enabled),
-                        scope,
-                        auto_scope,
-                        preview_method,
-                        preview_worker,
-                        bool(preview_auto_enabled),
-                    )
-                )
-
-            notify_count = sum(1 for item in users if item[3])
-            auto_preview_count = sum(1 for item in users if item[8])
-            logger.info(
-                "Job progress watcher: Monitoring %d users (%d notifications, %d auto previews)",
-                len(users),
-                notify_count,
-                auto_preview_count,
-            )
-
-            def job_matches_scope(scope_value: str, login_value: str, props: dict, job_entry: dict) -> bool:
-                if scope_value != "own":
-                    return True
-                job_owner = props.get("User") or job_entry.get("UserName") or ""
-                if not job_owner:
-                    return False
-                normalized_login = str(login_value).split("\\")[-1].split("/")[-1].lower()
-                normalized_owner = str(job_owner).split("\\")[-1].split("/")[-1].lower()
-                return normalized_owner == normalized_login
-
-            for (
-                telegram_user_id,
-                login,
-                decrypted_password,
-                has_notifications,
-                scope,
-                auto_scope,
-                preview_method,
-                preview_worker,
-                auto_preview_enabled,
-            ) in users:
-
-                try:
-                    session = await get_aiosession()
-                    headers = aiohttp.BasicAuth(login, decrypted_password)
-                    async with session.get(
-                        f"{settings.deadline_api_url}/jobs",
-                        auth=headers,
-                        ssl=settings.deadline_tls_verify,
-                    ) as resp:
-                        if resp.status == 200:
-                            jobs = await resp.json()
-                            for job in jobs:
-                                job_id = job.get("_id", "")
-                                if not job_id:
-                                    continue
-
-                                # Verify job status
-                                stat = job.get("Stat", 0)
-
-                                props = job.get("Props", {})
-                                name = props.get("Name", "").split("/")[-1]
-                                comment = props.get("Cmmt", "")
-                                extra_dict = props.get("ExDic") or {}
-                                if not isinstance(extra_dict, dict):
-                                    extra_dict = {}
-
-                                preview_owner_str = extra_dict.get("PreviewTelegram")
-                                for key in (
-                                    "ExtraInfoKeyValue0",
-                                    "ExtraInfoKeyValue1",
-                                    "ExtraInfoKeyValue2",
-                                    "ExtraInfoKeyValue3",
-                                    "ExtraInfoKeyValue4",
-                                ):
-                                    value = props.get(key)
-                                    if not value or "=" not in value:
-                                        continue
-                                    prefix, payload = value.split("=", 1)
-                                    if prefix == "PreviewTelegram":
-                                        preview_owner_str = payload
-
-                                preview_owner_id: Optional[int] = None
-                                if preview_owner_str:
-                                    try:
-                                        preview_owner_id = int(str(preview_owner_str).strip())
-                                    except (TypeError, ValueError):
-                                        logger.warning(
-                                            "Invalid PreviewTelegram value '%s' for job %s",
-                                            preview_owner_str,
-                                            job_id,
-                                        )
-
-                                is_preview_job = (
-                                    "Preview job generated by TasksBot" in comment
-                                    or name.endswith(" - Preview")
-                                    or extra_dict.get("PreviewJob") == "1"
-                                )
-
-                                if is_preview_job and preview_owner_id is not None and preview_owner_id != telegram_user_id:
-                                    continue
-
-                                target_user_for_cache = (
-                                    preview_owner_id if preview_owner_id is not None else telegram_user_id
-                                )
-                                notified_key = (job_id, target_user_for_cache)
-
-                                if stat == 4 and is_preview_job:
-                                    if notified_key in notified_jobs:
-                                        continue
-
-                                    notified_user_id = await _notify_preview_job_failure(
-                                        telegram_user_id,
-                                        job,
-                                        name,
-                                        login,
-                                        decrypted_password,
-                                    )
-                                    resolved_user_id = (
-                                        notified_user_id or preview_owner_id or telegram_user_id
-                                    )
-                                    notified_jobs.add((job_id, resolved_user_id))
-                                    continue
-
-                                if stat != 3:
-                                    continue
-
-                                date_comp_str = job.get("DateComp") or props.get("DateComp")
-                                if not date_comp_str or date_comp_str == "0001-01-01T00:00:00Z":
-                                    continue
-
-                                try:
-                                    date_comp = datetime.fromisoformat(date_comp_str.replace("Z", "+00:00"))
-                                    now = datetime.now(timezone.utc)
-                                    diff = now - date_comp
-                                    if diff > timedelta(minutes=10):
-                                        continue
-                                except Exception:
-                                    continue
-
-                                if is_preview_job:
-                                    if notified_key in notified_jobs:
-                                        continue
-                                    notified_user_id = await _notify_preview_job_completion(
-                                        telegram_user_id,
-                                        job,
-                                        name,
-                                        login,
-                                        decrypted_password,
-                                    )
-                                    resolved_user_id = (
-                                        notified_user_id or preview_owner_id or telegram_user_id
-                                    )
-                                    notified_jobs.add((job_id, resolved_user_id))
-                                    continue
-
-                                auto_matches = job_matches_scope(auto_scope, login, props, job)
-                                if auto_preview_enabled and preview_method in {"server", "deadline"} and auto_matches:
-                                    auto_key = (job_id, telegram_user_id)
-                                    if auto_key not in auto_preview_jobs:
-                                        auto_preview_jobs.add(auto_key)
-                                        asyncio.create_task(
-                                            _run_auto_preview_for_job(
-                                                telegram_user_id,
-                                                job_id,
-                                                name,
-                                                login,
-                                                decrypted_password,
-                                                preview_method,
-                                                preview_worker,
-                                            )
-                                        )
-
-                                if not job_matches_scope(scope, login, props, job):
-                                    continue
-
-                                if not has_notifications:
-                                    continue
-
-                                if notified_key in notified_jobs:
-                                    continue
-
-                                batch = props.get("Batch") or "No Batch"
-                                message_text = (
-                                    "✅ Job completed:\n"
-                                    f"• Batch: {batch}\n"
-                                    f"• Name: {name}"
-                                )
-
-                                preview_markup = InlineKeyboardMarkup(
-                                    inline_keyboard=[
-                                        [
-                                            InlineKeyboardButton(
-                                                text="🔍 Preview",
-                                                callback_data=f"preview_job:{job_id}"
-                                            )
-                                        ]
-                                    ]
-                                )
-
-                                await bot.send_message(
-                                    telegram_user_id,
-                                    message_text,
-                                    reply_markup=preview_markup
-                                )
-                                logger.info(
-                                    "Completion notification sent to user %s for job %s (%s)",
-                                    telegram_user_id,
-                                    job_id,
-                                    name,
-                                )
-                                notified_jobs.add((job_id, telegram_user_id))
-                        elif resp.status == 401:
-                            logger.warning(
-                                "Watcher: Unauthorized for user %s. Disabling notifications and requesting re-login.",
-                                telegram_user_id
-                            )
-                            await disable_notifications_for_user(telegram_user_id)
-                            await bot.send_message(
-                                telegram_user_id,
-                                "⚠️ Authorization expired. Please run /login again to keep receiving notifications."
-                            )
-                        else:
-                            logger.error(f"Watcher: Error requesting jobs for user {telegram_user_id}: {resp.status}")
-                except Exception as e:
-                    logger.error(f"Watcher: Error monitoring jobs for user {telegram_user_id}: {e}", exc_info=True)
-    except asyncio.CancelledError:
-        logger.info("Job progress watcher cancelled")
+    await _service_job_progress_watcher(bot)

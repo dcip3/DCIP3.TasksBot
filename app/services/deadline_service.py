@@ -2,7 +2,7 @@
 Deadline API service functions.
 """
 
-from typing import Optional, List, Dict, Any, Tuple, Union
+from typing import Optional, List, Dict, Any, Tuple, Union, Callable, Awaitable, TypeVar
 from pathlib import Path
 import json
 import logging
@@ -15,6 +15,7 @@ from app.core.bot_core import get_aiosession
 logger = logging.getLogger(__name__)
 
 ALLOWED_WORKER_STATUSES = {0, 1, 2}
+T = TypeVar("T")
 
 
 class DeadlineSubmissionError(RuntimeError):
@@ -29,6 +30,34 @@ class WorkerStatusError(RuntimeError):
         super().__init__(message)
         self.invalid_workers = invalid_workers
         self.preferred_workers = preferred_workers
+
+
+async def _with_user_credentials(
+    telegram_user_id: int,
+    *,
+    default: T,
+    operation_name: str,
+    call: Callable[[str, str], Awaitable[T]],
+) -> T:
+    """Resolve Deadline credentials for a Telegram user and run an operation."""
+    from app.auth import get_deadline_credentials
+
+    credentials = await get_deadline_credentials(telegram_user_id)
+    if not credentials:
+        logger.error("No Deadline credentials found for user %s", telegram_user_id)
+        return default
+
+    login, password = credentials
+    try:
+        return await call(login, password)
+    except Exception as exc:
+        logger.error(
+            "Error during %s for user %s: %s",
+            operation_name,
+            telegram_user_id,
+            exc,
+        )
+        return default
 
 
 # ==========================================================================
@@ -46,31 +75,34 @@ async def get_jobs_list(telegram_user_id: int) -> List[Dict[str, Any]]:
     Returns:
         List of job dictionaries
     """
-    try:
-        from app.auth import get_deadline_credentials
-        credentials = await get_deadline_credentials(telegram_user_id)
-        if not credentials:
-            logger.error(f"No Deadline credentials found for user {telegram_user_id}")
-            return []
-
-        login, password = credentials
-        logger.info(f"Requesting jobs for user {telegram_user_id} with login {login}")
+    async def _op(login: str, password: str) -> List[Dict[str, Any]]:
+        logger.info("Requesting jobs for user %s with login %s", telegram_user_id, login)
 
         session = await get_aiosession()
         headers = aiohttp.BasicAuth(login, password)
-        async with session.get(f"{settings.deadline_api_url}/jobs", auth=headers, ssl=settings.deadline_tls_verify) as resp:
-            logger.info(f"Jobs API response status: {resp.status}")
+        async with session.get(
+            f"{settings.deadline_api_url}/jobs",
+            auth=headers,
+            ssl=settings.deadline_tls_verify,
+        ) as resp:
+            logger.info("Jobs API response status: %s", resp.status)
             if resp.status == 200:
                 data = await resp.json()
-                logger.info(f"Jobs API returned {len(data) if isinstance(data, list) else 'non-list'} items")
-                return data
-            else:
-                response_text = await resp.text()
-                logger.error(f"Failed to get jobs: {resp.status}, response: {response_text}")
-                return []
-    except Exception as e:
-        logger.error(f"Error getting jobs: {e}")
-        return []
+                logger.info(
+                    "Jobs API returned %s items",
+                    len(data) if isinstance(data, list) else "non-list",
+                )
+                return data if isinstance(data, list) else []
+            response_text = await resp.text()
+            logger.error("Failed to get jobs: %s, response: %s", resp.status, response_text)
+            return []
+
+    return await _with_user_credentials(
+        telegram_user_id,
+        default=[],
+        operation_name="get jobs",
+        call=_op,
+    )
 
 
 async def _fetch_workers(login: str, password: str) -> List[Dict[str, Any]]:
@@ -102,19 +134,16 @@ async def get_workers_list(telegram_user_id: int) -> List[Dict[str, Any]]:
     Returns:
         List of worker dictionaries
     """
-    try:
-        from app.auth import get_deadline_credentials
-        credentials = await get_deadline_credentials(telegram_user_id)
-        if not credentials:
-            logger.error(f"No Deadline credentials found for user {telegram_user_id}")
-            return []
-        
-        login, password = credentials
-        logger.info(f"Requesting slaves for user {telegram_user_id} with login {login}")
+    async def _op(login: str, password: str) -> List[Dict[str, Any]]:
+        logger.info("Requesting slaves for user %s with login %s", telegram_user_id, login)
         return await _fetch_workers(login, password)
-    except Exception as e:
-        logger.error(f"Error getting slaves: {e}")
-        return []
+
+    return await _with_user_credentials(
+        telegram_user_id,
+        default=[],
+        operation_name="get workers",
+        call=_op,
+    )
 
 
 async def get_workers_by_credentials(login: str, password: str) -> List[Dict[str, Any]]:
@@ -257,18 +286,12 @@ async def get_job_info_by_user_id(telegram_user_id: int, job_id: str) -> Optiona
     Returns:
         Job information dictionary or None if error
     """
-    try:
-        from app.auth import get_deadline_credentials
-        credentials = await get_deadline_credentials(telegram_user_id)
-        if not credentials:
-            logger.error(f"No Deadline credentials found for user {telegram_user_id}")
-            return None
-        
-        login, password = credentials
-        return await get_job_info(login, password, job_id)
-    except Exception as e:
-        logger.error(f"Error getting job info for user {telegram_user_id}: {e}")
-        return None
+    return await _with_user_credentials(
+        telegram_user_id,
+        default=None,
+        operation_name=f"get job info ({job_id})",
+        call=lambda login, password: get_job_info(login, password, job_id),
+    )
 
 
 async def get_job_tasks(login: str, password: str, job_id: str) -> List[Dict[str, Any]]:
@@ -312,18 +335,12 @@ async def get_job_tasks_by_user_id(telegram_user_id: int, job_id: str) -> List[D
     Returns:
         List of task dictionaries
     """
-    try:
-        from app.auth import get_deadline_credentials
-        credentials = await get_deadline_credentials(telegram_user_id)
-        if not credentials:
-            logger.error(f"No Deadline credentials found for user {telegram_user_id}")
-            return []
-        
-        login, password = credentials
-        return await get_job_tasks(login, password, job_id)
-    except Exception as e:
-        logger.error(f"Error getting job tasks for user {telegram_user_id}: {e}")
-        return []
+    return await _with_user_credentials(
+        telegram_user_id,
+        default=[],
+        operation_name=f"get job tasks ({job_id})",
+        call=lambda login, password: get_job_tasks(login, password, job_id),
+    )
 
 
 async def submit_deadline_job(
@@ -497,18 +514,12 @@ async def requeue_job_by_user_id(telegram_user_id: int, job_id: str) -> bool:
     Returns:
         True if successful, False otherwise
     """
-    try:
-        from app.auth import get_deadline_credentials
-        credentials = await get_deadline_credentials(telegram_user_id)
-        if not credentials:
-            logger.error(f"No Deadline credentials found for user {telegram_user_id}")
-            return False
-        
-        login, password = credentials
-        return await requeue_job(login, password, job_id)
-    except Exception as e:
-        logger.error(f"Error requeuing job for user {telegram_user_id}: {e}")
-        return False
+    return await _with_user_credentials(
+        telegram_user_id,
+        default=False,
+        operation_name=f"requeue job ({job_id})",
+        call=lambda login, password: requeue_job(login, password, job_id),
+    )
 
 
 async def resume_job(login: str, password: str, job_id: str) -> bool:
@@ -548,18 +559,12 @@ async def resume_job_by_user_id(telegram_user_id: int, job_id: str) -> bool:
     Returns:
         True if successful, False otherwise
     """
-    try:
-        from app.auth import get_deadline_credentials
-        credentials = await get_deadline_credentials(telegram_user_id)
-        if not credentials:
-            logger.error(f"No Deadline credentials found for user {telegram_user_id}")
-            return False
-        
-        login, password = credentials
-        return await resume_job(login, password, job_id)
-    except Exception as e:
-        logger.error(f"Error resuming job for user {telegram_user_id}: {e}")
-        return False
+    return await _with_user_credentials(
+        telegram_user_id,
+        default=False,
+        operation_name=f"resume job ({job_id})",
+        call=lambda login, password: resume_job(login, password, job_id),
+    )
 
 
 async def suspend_job(login: str, password: str, job_id: str) -> bool:
@@ -599,18 +604,12 @@ async def suspend_job_by_user_id(telegram_user_id: int, job_id: str) -> bool:
     Returns:
         True if successful, False otherwise
     """
-    try:
-        from app.auth import get_deadline_credentials
-        credentials = await get_deadline_credentials(telegram_user_id)
-        if not credentials:
-            logger.error(f"No Deadline credentials found for user {telegram_user_id}")
-            return False
-        
-        login, password = credentials
-        return await suspend_job(login, password, job_id)
-    except Exception as e:
-        logger.error(f"Error suspending job for user {telegram_user_id}: {e}")
-        return False
+    return await _with_user_credentials(
+        telegram_user_id,
+        default=False,
+        operation_name=f"suspend job ({job_id})",
+        call=lambda login, password: suspend_job(login, password, job_id),
+    )
 
 
 async def delete_job(login: str, password: str, job_id: str) -> bool:
@@ -649,17 +648,11 @@ async def delete_job_by_user_id(telegram_user_id: int, job_id: str) -> bool:
     Returns:
         True if successful, False otherwise
     """
-    try:
-        from app.auth import get_deadline_credentials
-        credentials = await get_deadline_credentials(telegram_user_id)
-        if not credentials:
-            logger.error(f"No Deadline credentials found for user {telegram_user_id}")
-            return False
-        
-        login, password = credentials
-        return await delete_job(login, password, job_id)
-    except Exception as e:
-        logger.error(f"Error deleting job for user {telegram_user_id}: {e}")
-        return False
+    return await _with_user_credentials(
+        telegram_user_id,
+        default=False,
+        operation_name=f"delete job ({job_id})",
+        call=lambda login, password: delete_job(login, password, job_id),
+    )
 
 # ============================================================================
