@@ -8,7 +8,7 @@ import logging
 import sys
 
 from app.core.bot_core import dp, bot
-from app.core.utils import on_startup, on_shutdown
+from app.core.lifecycle import on_startup, on_shutdown
 from app.bot.handlers import register_handlers
 
 logging.basicConfig(level=logging.INFO)

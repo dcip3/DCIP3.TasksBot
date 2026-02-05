@@ -22,7 +22,7 @@ from app.user_settings import (
     set_preview_default_method,
     set_preview_default_worker,
 )
-from app.core.utils import authorized_only
+from app.core.ui_helpers import authorized_only
 from app.services import get_workers_list
 
 logger = logging.getLogger(__name__)

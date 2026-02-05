@@ -389,7 +389,7 @@ async def _deliver_preview(payload: PreviewUploadPayload, temp_path: Path) -> No
     stored_message = None
     if payload.preview_job_id:
         try:
-            from app.core.utils import pop_preview_message
+            from app.services.preview_runtime_service import pop_preview_message
 
             stored_message = pop_preview_message(payload.preview_job_id)
         except Exception as exc:

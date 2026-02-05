@@ -16,7 +16,7 @@ from app.bot.job_helpers import (
     truncate_cell,
 )
 from app.core.config import settings
-from app.core.utils import authorized_only
+from app.core.ui_helpers import authorized_only
 from app.services import (
     delete_job_by_user_id,
     get_job_tasks_by_user_id,

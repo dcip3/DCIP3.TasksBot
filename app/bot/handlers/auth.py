@@ -11,7 +11,7 @@ from app.auth import (
     logout_user,
     save_deadline_credentials,
 )
-from app.core.utils import get_main_keyboard
+from app.core.ui_helpers import get_main_keyboard
 
 logger = logging.getLogger(__name__)
 

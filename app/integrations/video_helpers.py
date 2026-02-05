@@ -167,7 +167,7 @@ def compress_video_if_needed(video_path: Path, max_size_mb: float = 45.0) -> Pat
         
     # Calculate target bitrate (in kbps) based on desired file size
     # Formula: bitrate = target_size_bytes * 8 / duration_seconds / 1000
-    from app.core.utils import get_video_duration
+    from app.core.maintenance import get_video_duration
     duration = get_video_duration(video_path)
 
     target_bitrate = None

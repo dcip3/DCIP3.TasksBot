@@ -13,7 +13,7 @@ import gc
 import threading
 
 from app.core.config import settings
-from app.core.utils import make_progress_bar
+from app.core.maintenance import make_progress_bar
 
 logger = logging.getLogger(__name__)
 PREVIEW_FRAME_EXTS = {".exr", ".jpg", ".jpeg", ".png"}

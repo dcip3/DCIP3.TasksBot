@@ -6,7 +6,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
 from app.bot.handlers.auth import LoginStates, build_login_cancel_keyboard
-from app.core.utils import get_main_keyboard
+from app.core.ui_helpers import get_main_keyboard
 
 logger = logging.getLogger(__name__)
 

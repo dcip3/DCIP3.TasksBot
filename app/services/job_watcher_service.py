@@ -15,7 +15,7 @@ from app.auth import _decrypt_password
 from app.core.bot_core import auto_preview_jobs, get_aiosession, notified_jobs
 from app.core.config import settings
 from app.core.database import get_db_connection
-from app.core.utils import (
+from app.services.preview_runtime_service import (
     _notify_preview_job_completion,
     _notify_preview_job_failure,
     _run_auto_preview_for_job,
