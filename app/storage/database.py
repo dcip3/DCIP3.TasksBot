@@ -1,4 +1,3 @@
-# app/core/database.py
 """
 Database operations and connection management.
 

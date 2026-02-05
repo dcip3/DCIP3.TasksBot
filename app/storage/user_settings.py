@@ -3,7 +3,7 @@
 from typing import Optional, Tuple, Literal
 import logging
 
-from app.core.database import get_db_connection
+from app.storage.database import get_db_connection
 
 logger = logging.getLogger(__name__)
 

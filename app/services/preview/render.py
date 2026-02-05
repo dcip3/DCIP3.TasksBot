@@ -23,8 +23,8 @@ from app.integrations.dropbox_helpers import (
     get_fresh_access_token,
     fetch_dropbox_metadata,
 )
-from app.services.dropbox_service import get_dropbox_session
-from app.services.deadline_service import (
+from app.services.dropbox import get_dropbox_session
+from app.services.deadline import (
     ALLOWED_WORKER_STATUSES,
     DeadlineSubmissionError,
     WorkerStatusError,

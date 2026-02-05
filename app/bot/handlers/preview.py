@@ -9,7 +9,7 @@ from aiogram.exceptions import TelegramRetryAfter
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from app.auth import get_deadline_credentials
-from app.user_settings import (
+from app.storage.user_settings import (
     PREVIEW_DEFAULT_WORKER_AUTO,
     get_preview_default_method,
     get_preview_default_worker,
@@ -24,20 +24,22 @@ from app.integrations.dropbox_helpers import (
     get_fresh_access_token,
 )
 from app.integrations.video_helpers import cleanup_job_files
-from app.services.preview_pipeline_service import render_preview_via_server_pipeline
-from app.services.preview_runtime_service import pop_preview_message, register_preview_message
-from app.services import (
+from app.services.deadline import (
     ALLOWED_WORKER_STATUSES,
-    PreviewSubmissionError,
-    check_video_exists_in_dropbox,
-    create_video_from_job,
     delete_job_by_user_id,
-    download_video_from_dropbox,
-    get_dropbox_session,
     get_job_info_by_user_id,
     get_workers_list,
     WorkerStatusError,
 )
+from app.services.dropbox import get_dropbox_session
+from app.services.preview.pipeline import render_preview_via_server_pipeline
+from app.services.preview.render import (
+    PreviewSubmissionError,
+    check_video_exists_in_dropbox,
+    create_video_from_job,
+    download_video_from_dropbox,
+)
+from app.services.preview.runtime import pop_preview_message, register_preview_message
 
 logger = logging.getLogger(__name__)
 

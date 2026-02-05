@@ -13,7 +13,7 @@ from app.core.config import settings
 from app.core.path_utils import extract_dropbox_path
 from app.core.bot_core import get_aiosession
 from app.integrations.dropbox_helpers import get_fresh_access_token, fetch_dropbox_metadata, list_folder_all
-from app.services.deadline_service import get_job_info
+from app.services.deadline import get_job_info
 
 logger = logging.getLogger(__name__)
 

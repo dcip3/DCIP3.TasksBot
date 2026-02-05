@@ -12,7 +12,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from app.core.bot_core import close_aiosession, init_aiosession
 from app.core.config import settings
-from app.core.database import close_db, init_db
+from app.storage.database import close_db, init_db
 from app.core.maintenance import (
     cleanup_old_files,
     cleanup_temp_and_conv,
@@ -104,7 +104,7 @@ async def on_startup(bot) -> None:
 
     global job_watcher_task
     if job_watcher_task is None or job_watcher_task.done():
-        from app.services.job_watcher_service import job_progress_watcher
+        from app.services.job_watcher import job_progress_watcher
 
         job_watcher_task = asyncio.create_task(job_progress_watcher(bot))
         logger.info("Job progress watcher started")

@@ -14,14 +14,14 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from app.auth import _decrypt_password
 from app.core.bot_core import auto_preview_jobs, get_aiosession, notified_jobs
 from app.core.config import settings
-from app.core.database import get_db_connection
-from app.services.preview_runtime_service import (
+from app.storage.database import get_db_connection
+from app.services.preview.runtime import (
     _notify_preview_job_completion,
     _notify_preview_job_failure,
     _run_auto_preview_for_job,
     preview_message_registry,
 )
-from app.user_settings import (
+from app.storage.user_settings import (
     VALID_PREVIEW_RENDER_METHODS,
     _normalize_scope,
     disable_notifications_for_user,

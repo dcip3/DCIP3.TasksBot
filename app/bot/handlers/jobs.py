@@ -17,7 +17,7 @@ from app.bot.job_helpers import (
 )
 from app.core.config import settings
 from app.core.ui_helpers import authorized_only
-from app.services import (
+from app.services.deadline import (
     delete_job_by_user_id,
     get_job_tasks_by_user_id,
     get_jobs_list,
@@ -505,7 +505,7 @@ async def job_info_callback(callback_query: CallbackQuery) -> None:
     job_id = callback_query.data.split(":", 1)[1]
 
     try:
-        from app.services import get_jobs_list as fetch_jobs_list
+        from app.services.deadline import get_jobs_list as fetch_jobs_list
 
         all_jobs = await fetch_jobs_list(callback_query.from_user.id)
         if not all_jobs:
@@ -616,7 +616,7 @@ async def job_update_callback(callback_query: CallbackQuery) -> None:
 
     job_id = callback_query.data.split(":", 1)[1]
     try:
-        from app.services import get_jobs_list as fetch_jobs_list
+        from app.services.deadline import get_jobs_list as fetch_jobs_list
 
         all_jobs = await fetch_jobs_list(callback_query.from_user.id)
         if not all_jobs:

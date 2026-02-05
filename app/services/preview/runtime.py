@@ -172,7 +172,7 @@ async def _notify_preview_job_completion(
 
     if dropbox_path_hint:
         try:
-            from app.services import download_video_from_dropbox
+            from app.services.preview.render import download_video_from_dropbox
 
             retry_delays = [0, 2, 4, 6, 10, 20, 40, 80, 138]
             for delay in retry_delays:
@@ -264,7 +264,7 @@ async def _notify_preview_job_completion(
                 )
 
             try:
-                from app.services import delete_job
+                from app.services.deadline import delete_job
 
                 deleted = await delete_job(login, password, job_id)
                 if deleted:
@@ -349,7 +349,7 @@ async def _notify_preview_job_completion(
         await asyncio.to_thread(final_path.unlink, missing_ok=True)
 
     try:
-        from app.services import delete_job
+        from app.services.deadline import delete_job
 
         deleted = await delete_job(login, password, job_id)
         if deleted:
@@ -409,7 +409,7 @@ async def _notify_preview_job_failure(
 
     worker_names: List[str] = []
     try:
-        from app.services import get_job_tasks, get_worker_report_contents
+        from app.services.deadline import get_job_tasks, get_worker_report_contents
 
         tasks = await get_job_tasks(login, password, job_id)
         for task in tasks:
@@ -508,7 +508,7 @@ async def _notify_preview_job_failure(
         )
 
     try:
-        from app.services import delete_job
+        from app.services.deadline import delete_job
 
         deleted = await delete_job(login, password, job_id)
         if deleted:
@@ -534,7 +534,7 @@ async def _send_dropbox_video_to_user(
 ) -> bool:
     """Download a preview from Dropbox and deliver it to the user."""
     from app.integrations.video_helpers import cleanup_job_files
-    from app.services import download_video_from_dropbox
+    from app.services.preview.render import download_video_from_dropbox
 
     progress_msg = await bot.send_message(
         telegram_user_id,
@@ -612,8 +612,9 @@ async def _submit_auto_preview_deadline(
     default_worker: Optional[str],
 ) -> None:
     """Submit a Deadline preview job and register progress tracking."""
-    from app.services import PreviewSubmissionError, WorkerStatusError, create_video_from_job
-    from app.user_settings import PREVIEW_DEFAULT_WORKER_AUTO
+    from app.services.deadline import WorkerStatusError
+    from app.services.preview.render import PreviewSubmissionError, create_video_from_job
+    from app.storage.user_settings import PREVIEW_DEFAULT_WORKER_AUTO
 
     result = None
     fallback_used = False

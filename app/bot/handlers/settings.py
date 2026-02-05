@@ -7,7 +7,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from app.auth import is_authorized
-from app.user_settings import (
+from app.storage.user_settings import (
     NotificationScope,
     PREVIEW_DEFAULT_WORKER_AUTO,
     get_notification_settings,
@@ -23,7 +23,7 @@ from app.user_settings import (
     set_preview_default_worker,
 )
 from app.core.ui_helpers import authorized_only
-from app.services import get_workers_list
+from app.services.deadline import get_workers_list
 
 logger = logging.getLogger(__name__)
 

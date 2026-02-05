@@ -20,7 +20,7 @@ from app.core.maintenance import (
     make_progress_bar,
 )
 from app.core.ui_helpers import authorized_only, get_main_keyboard
-from app.services.preview_runtime_service import (
+from app.services.preview.runtime import (
     _notify_preview_job_completion,
     _notify_preview_job_failure,
     _run_auto_preview_for_job,
@@ -87,7 +87,7 @@ def get_worker_icon(stat: int) -> str:
 
 async def job_progress_watcher(bot) -> None:
     """Backward-compatible wrapper around the dedicated watcher service."""
-    from app.services.job_watcher_service import job_progress_watcher as _service_job_progress_watcher
+    from app.services.job_watcher import job_progress_watcher as _service_job_progress_watcher
 
     await _service_job_progress_watcher(bot)
 

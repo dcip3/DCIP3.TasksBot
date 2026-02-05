@@ -389,7 +389,7 @@ async def _deliver_preview(payload: PreviewUploadPayload, temp_path: Path) -> No
     stored_message = None
     if payload.preview_job_id:
         try:
-            from app.services.preview_runtime_service import pop_preview_message
+            from app.services.preview.runtime import pop_preview_message
 
             stored_message = pop_preview_message(payload.preview_job_id)
         except Exception as exc:
@@ -447,7 +447,7 @@ async def _deliver_preview(payload: PreviewUploadPayload, temp_path: Path) -> No
         notified_jobs.add((payload.preview_job_id, payload.telegram_user_id))
 
     try:
-        from app.services import delete_job_by_user_id
+        from app.services.deadline import delete_job_by_user_id
 
         if payload.preview_job_id:
             await delete_job_by_user_id(payload.telegram_user_id, payload.preview_job_id)

@@ -29,8 +29,8 @@ from app.integrations.video_helpers import (
     get_file_size_mb,
     prepare_video_for_delivery,
 )
-from app.services.deadline_service import get_job_info_by_user_id
-from app.services.dropbox_service import get_dropbox_session
+from app.services.deadline import get_job_info_by_user_id
+from app.services.dropbox import get_dropbox_session
 
 logger = logging.getLogger(__name__)
 
