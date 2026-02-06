@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import html
 import logging
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -14,9 +15,12 @@ from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarku
 
 from app.core.bot_core import bot
 from app.integrations.video_helpers import get_file_size_mb, prepare_video_for_delivery
-from app.core.maintenance import cleanup_old_files
 
 logger = logging.getLogger(__name__)
+_PREVIEW_RESOLVE_TIMEOUT_SECONDS = 60.0
+_DROPBOX_RETRY_DELAYS = (0, 1, 2, 4, 8, 12, 16)
+_LOCAL_FILE_RETRY_DELAYS = (0, 1, 2, 4, 8, 12)
+_SINGLE_RETRY_ATTEMPT_TIMEOUT_SECONDS = 20.0
 
 # Track preview submission progress messages (preview_job_id -> (chat_id, message_id))
 preview_message_registry: dict[str, tuple[int, int]] = {}
@@ -174,16 +178,28 @@ async def _notify_preview_job_completion(
         try:
             from app.services.preview.render import download_video_from_dropbox
 
-            retry_delays = [0, 2, 4, 6, 10, 20, 40, 80, 138]
-            for delay in retry_delays:
+            deadline = time.monotonic() + _PREVIEW_RESOLVE_TIMEOUT_SECONDS
+            for delay in _DROPBOX_RETRY_DELAYS:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
                 if delay:
-                    await asyncio.sleep(delay)
-                result = await download_video_from_dropbox(
-                    login,
-                    password,
-                    job_id,
-                    dropbox_path_hint=dropbox_path_hint,
-                )
+                    await asyncio.sleep(min(delay, remaining))
+                attempt_timeout = min(_SINGLE_RETRY_ATTEMPT_TIMEOUT_SECONDS, max(remaining, 1.0))
+                try:
+                    async with asyncio.timeout(attempt_timeout):
+                        result = await download_video_from_dropbox(
+                            login,
+                            password,
+                            job_id,
+                            dropbox_path_hint=dropbox_path_hint,
+                        )
+                except TimeoutError:
+                    logger.warning(
+                        "Timed out downloading preview video from Dropbox for job %s",
+                        job_id,
+                    )
+                    continue
                 if result:
                     final_path = Path(result[0])
                     dropbox_path = result[1]
@@ -207,10 +223,13 @@ async def _notify_preview_job_completion(
             return None
 
         if not local_path.exists():
-            retry_delays = [0, 2, 4, 6, 10, 15, 20]
-            for delay in retry_delays:
+            deadline = time.monotonic() + _PREVIEW_RESOLVE_TIMEOUT_SECONDS
+            for delay in _LOCAL_FILE_RETRY_DELAYS:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
                 if delay:
-                    await asyncio.sleep(delay)
+                    await asyncio.sleep(min(delay, remaining))
                 if local_path.exists():
                     break
 
@@ -601,8 +620,6 @@ async def _send_dropbox_video_to_user(
             video_path_obj.unlink()
         with contextlib.suppress(Exception):
             cleanup_job_files(job_id)
-        with contextlib.suppress(Exception):
-            cleanup_old_files(max_age_hours=6)
 
 
 async def _submit_auto_preview_deadline(

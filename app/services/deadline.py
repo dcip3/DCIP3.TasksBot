@@ -2,10 +2,12 @@
 Deadline API service functions.
 """
 
-from typing import Optional, List, Dict, Any, Tuple, Union, Callable, Awaitable, TypeVar
-from pathlib import Path
+import asyncio
 import json
 import logging
+import time
+from typing import Optional, List, Dict, Any, Tuple, Union, Callable, Awaitable, TypeVar
+from pathlib import Path
 
 import aiohttp
 
@@ -16,6 +18,10 @@ logger = logging.getLogger(__name__)
 
 ALLOWED_WORKER_STATUSES = {0, 1, 2}
 T = TypeVar("T")
+_JOBS_CACHE_TTL_SECONDS = 5.0
+_JOBS_CACHE_MAX_ENTRIES = 256
+_jobs_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+_jobs_cache_lock = asyncio.Lock()
 
 
 class DeadlineSubmissionError(RuntimeError):
@@ -60,6 +66,72 @@ async def _with_user_credentials(
         return default
 
 
+def _jobs_cache_key(login: str) -> str:
+    return str(login or "").strip().lower()
+
+
+def _prune_jobs_cache() -> None:
+    now = time.monotonic()
+    expired_keys = [
+        key
+        for key, (expires_at, _) in _jobs_cache.items()
+        if expires_at <= now
+    ]
+    for key in expired_keys:
+        _jobs_cache.pop(key, None)
+
+    if len(_jobs_cache) <= _JOBS_CACHE_MAX_ENTRIES:
+        return
+
+    # Keep entries with the highest expiration timestamps.
+    survivors = sorted(_jobs_cache.items(), key=lambda item: item[1][0], reverse=True)[
+        :_JOBS_CACHE_MAX_ENTRIES
+    ]
+    _jobs_cache.clear()
+    _jobs_cache.update(survivors)
+
+
+async def _fetch_jobs_by_credentials(
+    login: str,
+    password: str,
+    *,
+    use_cache: bool,
+    force_refresh: bool = False,
+) -> List[Dict[str, Any]]:
+    cache_key = _jobs_cache_key(login)
+    now = time.monotonic()
+
+    if use_cache and not force_refresh:
+        cached = _jobs_cache.get(cache_key)
+        if cached and cached[0] > now:
+            return cached[1]
+
+    session = await get_aiosession()
+    auth = aiohttp.BasicAuth(login, password)
+    async with session.get(
+        f"{settings.deadline_api_url}/jobs",
+        auth=auth,
+        ssl=settings.deadline_tls_verify,
+    ) as resp:
+        if resp.status != 200:
+            response_text = await resp.text()
+            logger.error("Failed to get jobs: %s, response: %s", resp.status, response_text)
+            return []
+        data = await resp.json()
+        if not isinstance(data, list):
+            return []
+
+    if use_cache:
+        async with _jobs_cache_lock:
+            _jobs_cache[cache_key] = (now + _JOBS_CACHE_TTL_SECONDS, data)
+            _prune_jobs_cache()
+    return data
+
+
+def _invalidate_jobs_cache(login: str) -> None:
+    _jobs_cache.pop(_jobs_cache_key(login), None)
+
+
 # ==========================================================================
 # === DEADLINE API FUNCTIONS ===
 # ==========================================================================
@@ -76,26 +148,12 @@ async def get_jobs_list(telegram_user_id: int) -> List[Dict[str, Any]]:
         List of job dictionaries
     """
     async def _op(login: str, password: str) -> List[Dict[str, Any]]:
-        logger.info("Requesting jobs for user %s with login %s", telegram_user_id, login)
-
-        session = await get_aiosession()
-        headers = aiohttp.BasicAuth(login, password)
-        async with session.get(
-            f"{settings.deadline_api_url}/jobs",
-            auth=headers,
-            ssl=settings.deadline_tls_verify,
-        ) as resp:
-            logger.info("Jobs API response status: %s", resp.status)
-            if resp.status == 200:
-                data = await resp.json()
-                logger.info(
-                    "Jobs API returned %s items",
-                    len(data) if isinstance(data, list) else "non-list",
-                )
-                return data if isinstance(data, list) else []
-            response_text = await resp.text()
-            logger.error("Failed to get jobs: %s, response: %s", resp.status, response_text)
-            return []
+        logger.info("Requesting jobs for user %s", telegram_user_id)
+        return await _fetch_jobs_by_credentials(
+            login,
+            password,
+            use_cache=True,
+        )
 
     return await _with_user_credentials(
         telegram_user_id,
@@ -254,22 +312,24 @@ async def get_job_info(login: str, password: str, job_id: str) -> Optional[Dict[
         Job information dictionary or None if error
     """
     try:
-        session = await get_aiosession()
-        headers = aiohttp.BasicAuth(login, password)
-        # Get all jobs and find the specific one
-        async with session.get(f"{settings.deadline_api_url}/jobs", auth=headers, ssl=settings.deadline_tls_verify) as resp:
-            if resp.status == 200:
-                jobs = await resp.json()
-                # Find the job by _id
-                matching_jobs = [j for j in jobs if j.get("_id") == job_id]
-                if matching_jobs:
-                    return matching_jobs[0]
-                else:
-                    logger.error(f"Job {job_id} not found in jobs list")
-                    return None
-            else:
-                logger.error(f"Failed to get jobs list: {resp.status}")
-                return None
+        jobs = await _fetch_jobs_by_credentials(login, password, use_cache=True)
+        match = next((job for job in jobs if job.get("_id") == job_id), None)
+        if match is not None:
+            return match
+
+        # Cache may be stale for a few seconds; refresh once before failing.
+        fresh_jobs = await _fetch_jobs_by_credentials(
+            login,
+            password,
+            use_cache=True,
+            force_refresh=True,
+        )
+        match = next((job for job in fresh_jobs if job.get("_id") == job_id), None)
+        if match is not None:
+            return match
+
+        logger.error("Job %s not found in jobs list", job_id)
+        return None
     except Exception as e:
         logger.error(f"Error getting job info: {e}")
         return None
@@ -411,21 +471,26 @@ async def submit_deadline_job(
     submit_url = f"{settings.deadline_api_url}/jobs"
     logger.info("Submitting Deadline job via %s", submit_url)
 
-    async with aiohttp.ClientSession() as session:
-        auth = aiohttp.BasicAuth(login, password)
-        async with session.post(submit_url, auth=auth, ssl=settings.deadline_tls_verify, json=payload) as resp:
-            text = await resp.text()
-            if resp.status not in (200, 201, 202, 204):
-                logger.error("Deadline submission failed (%s): %s", resp.status, text)
-                raise DeadlineSubmissionError(f"Submission failed with status {resp.status}")
-            if text:
-                try:
-                    submission_response = json.loads(text)
-                except json.JSONDecodeError:
-                    logger.warning("Unexpected non-JSON response from Deadline: %s", text)
-                    submission_response = {}
-            else:
+    session = await get_aiosession()
+    auth = aiohttp.BasicAuth(login, password)
+    async with session.post(
+        submit_url,
+        auth=auth,
+        ssl=settings.deadline_tls_verify,
+        json=payload,
+    ) as resp:
+        text = await resp.text()
+        if resp.status not in (200, 201, 202, 204):
+            logger.error("Deadline submission failed (%s): %s", resp.status, text)
+            raise DeadlineSubmissionError(f"Submission failed with status {resp.status}")
+        if text:
+            try:
+                submission_response = json.loads(text)
+            except json.JSONDecodeError:
+                logger.warning("Unexpected non-JSON response from Deadline: %s", text)
                 submission_response = {}
+        else:
+            submission_response = {}
 
     job_id = submission_response.get("job_id") or submission_response.get("_id")
     if not job_id:
@@ -435,44 +500,49 @@ async def submit_deadline_job(
         logger.info("Deadline job submitted successfully: %s", job_id)
 
     if resolved_aux and job_id:
-        async with aiohttp.ClientSession() as session:
-            auth = aiohttp.BasicAuth(login, password)
-            for local_path, remote_name in resolved_aux:
-                upload_url = f"{settings.deadline_api_url}/jobs/{job_id}/aux-files/{remote_name}"
-                logger.info("Uploading aux file %s -> %s", local_path, upload_url)
-                async with session.put(
-                    upload_url,
-                    auth=auth,
-                    ssl=settings.deadline_tls_verify,
-                    data=local_path.read_bytes(),
-                    headers={"Content-Type": "application/octet-stream"}
-                ) as upload_resp:
-                    if upload_resp.status not in (200, 201, 204):
-                        text = await upload_resp.text()
-                        logger.error(
-                            "Failed to upload aux file %s (%s): %s",
-                            remote_name,
-                            upload_resp.status,
-                            text
-                        )
-                        raise DeadlineSubmissionError(
-                            f"Aux file upload failed for {remote_name} ({upload_resp.status})"
-                        )
+        for local_path, remote_name in resolved_aux:
+            upload_url = f"{settings.deadline_api_url}/jobs/{job_id}/aux-files/{remote_name}"
+            logger.info("Uploading aux file %s -> %s", local_path, upload_url)
+            payload_bytes = await asyncio.to_thread(local_path.read_bytes)
+            async with session.put(
+                upload_url,
+                auth=auth,
+                ssl=settings.deadline_tls_verify,
+                data=payload_bytes,
+                headers={"Content-Type": "application/octet-stream"},
+            ) as upload_resp:
+                if upload_resp.status not in (200, 201, 204):
+                    text = await upload_resp.text()
+                    logger.error(
+                        "Failed to upload aux file %s (%s): %s",
+                        remote_name,
+                        upload_resp.status,
+                        text,
+                    )
+                    raise DeadlineSubmissionError(
+                        f"Aux file upload failed for {remote_name} ({upload_resp.status})"
+                    )
 
-            if complete_submission:
-                complete_url = f"{settings.deadline_api_url}/jobs/{job_id}/complete-submission"
-                async with session.post(complete_url, auth=auth, ssl=settings.deadline_tls_verify) as comp_resp:
-                    if comp_resp.status not in (200, 201, 204):
-                        text = await comp_resp.text()
-                        logger.error(
-                            "Failed to complete submission for job %s (%s): %s",
-                            job_id,
-                            comp_resp.status,
-                            text
-                        )
-                        raise DeadlineSubmissionError(
-                            f"Complete submission failed ({comp_resp.status})"
-                        )
+        if complete_submission:
+            complete_url = f"{settings.deadline_api_url}/jobs/{job_id}/complete-submission"
+            async with session.post(
+                complete_url,
+                auth=auth,
+                ssl=settings.deadline_tls_verify,
+            ) as comp_resp:
+                if comp_resp.status not in (200, 201, 204):
+                    text = await comp_resp.text()
+                    logger.error(
+                        "Failed to complete submission for job %s (%s): %s",
+                        job_id,
+                        comp_resp.status,
+                        text,
+                    )
+                    raise DeadlineSubmissionError(
+                        f"Complete submission failed ({comp_resp.status})"
+                    )
+
+    _invalidate_jobs_cache(login)
 
     return submission_response
 
@@ -497,6 +567,8 @@ async def requeue_job(login: str, password: str, job_id: str) -> bool:
             success = resp.status == 200
             if not success:
                 logger.error(f"Failed to requeue job: {resp.status}")
+            else:
+                _invalidate_jobs_cache(login)
             return success
     except Exception as e:
         logger.error(f"Error requeuing job: {e}")
@@ -542,6 +614,8 @@ async def resume_job(login: str, password: str, job_id: str) -> bool:
             success = resp.status == 200
             if not success:
                 logger.error(f"Failed to resume job: {resp.status}")
+            else:
+                _invalidate_jobs_cache(login)
             return success
     except Exception as e:
         logger.error(f"Error resuming job: {e}")
@@ -587,6 +661,8 @@ async def suspend_job(login: str, password: str, job_id: str) -> bool:
             success = resp.status == 200
             if not success:
                 logger.error(f"Failed to suspend job: {resp.status}")
+            else:
+                _invalidate_jobs_cache(login)
             return success
     except Exception as e:
         logger.error(f"Error suspending job: {e}")
@@ -631,6 +707,8 @@ async def delete_job(login: str, password: str, job_id: str) -> bool:
             success = resp.status == 200
             if not success:
                 logger.error(f"Failed to delete job: {resp.status}")
+            else:
+                _invalidate_jobs_cache(login)
             return success
     except Exception as e:
         logger.error(f"Error deleting job: {e}")

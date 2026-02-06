@@ -13,6 +13,7 @@ import gc
 import threading
 
 from app.core.config import settings
+from app.core.bot_core import get_aiosession
 from app.core.maintenance import make_progress_bar
 
 logger = logging.getLogger(__name__)
@@ -51,19 +52,19 @@ async def get_fresh_access_token() -> str:
             "refresh_token": settings.dropbox_refresh_token,
         }
         timeout = aiohttp.ClientTimeout(total=30)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, headers=headers, data=data) as resp:
-                text = await resp.text()
-                if resp.status != 200:
-                    raise RuntimeError(
-                        f"Failed to update access_token: {resp.status} – {text}"
-                    )
-                try:
-                    token_info = await resp.json()
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"Failed to parse Dropbox token response: {text}"
-                    ) from exc
+        session = await get_aiosession()
+        async with session.post(url, headers=headers, data=data, timeout=timeout) as resp:
+            text = await resp.text()
+            if resp.status != 200:
+                raise RuntimeError(
+                    f"Failed to update access_token: {resp.status} – {text}"
+                )
+            try:
+                token_info = await resp.json()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to parse Dropbox token response: {text}"
+                ) from exc
 
         access_token = token_info.get("access_token")
         expires_in = token_info.get("expires_in", 0)
@@ -558,37 +559,37 @@ async def upload_video_to_dropbox(video_path: Path, metadata: dict, job_id: Opti
                     break
                 yield chunk
 
-    async with aiohttp.ClientSession() as session_upload:
-        for attempt in range(RETRY_ATTEMPTS):
-            headers_upload = {
-                "Authorization": f"Bearer {await get_fresh_access_token()}",
-                "Dropbox-API-Select-User": settings.dropbox_team_member_id,
-                "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
-                "Dropbox-API-Arg": json.dumps({"path": dropbox_upload_path, "mode": "overwrite"}),
-                "Content-Type": "application/octet-stream",
-                "Content-Length": str(video_path.stat().st_size),
-            }
-            try:
-                async with session_upload.post(
-                    upload_url, headers=headers_upload, data=_iter_file_chunks(video_path)
-                ) as resp_up:
-                    if resp_up.status == 200:
-                        return dropbox_upload_path
-                    text = await resp_up.text()
-                    if resp_up.status in RETRY_STATUSES and attempt < (RETRY_ATTEMPTS - 1):
-                        logger.warning(
-                            "Retrying upload %s (%s): %s",
-                            video_path.name,
-                            resp_up.status,
-                            text,
-                        )
-                        await _sleep_backoff(attempt, resp_up.headers.get("Retry-After"))
-                        continue
-                    raise RuntimeError(f"Error uploading video to Dropbox: {text}")
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                if attempt < (RETRY_ATTEMPTS - 1):
-                    logger.warning("Retrying upload %s after error: %s", video_path.name, exc)
-                    await _sleep_backoff(attempt, None)
+    session_upload = await get_aiosession()
+    for attempt in range(RETRY_ATTEMPTS):
+        headers_upload = {
+            "Authorization": f"Bearer {await get_fresh_access_token()}",
+            "Dropbox-API-Select-User": settings.dropbox_team_member_id,
+            "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
+            "Dropbox-API-Arg": json.dumps({"path": dropbox_upload_path, "mode": "overwrite"}),
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(video_path.stat().st_size),
+        }
+        try:
+            async with session_upload.post(
+                upload_url, headers=headers_upload, data=_iter_file_chunks(video_path)
+            ) as resp_up:
+                if resp_up.status == 200:
+                    return dropbox_upload_path
+                text = await resp_up.text()
+                if resp_up.status in RETRY_STATUSES and attempt < (RETRY_ATTEMPTS - 1):
+                    logger.warning(
+                        "Retrying upload %s (%s): %s",
+                        video_path.name,
+                        resp_up.status,
+                        text,
+                    )
+                    await _sleep_backoff(attempt, resp_up.headers.get("Retry-After"))
                     continue
-                raise RuntimeError(f"Error uploading video to Dropbox: {exc}") from exc
+                raise RuntimeError(f"Error uploading video to Dropbox: {text}")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            if attempt < (RETRY_ATTEMPTS - 1):
+                logger.warning("Retrying upload %s after error: %s", video_path.name, exc)
+                await _sleep_backoff(attempt, None)
+                continue
+            raise RuntimeError(f"Error uploading video to Dropbox: {exc}") from exc
     return dropbox_upload_path

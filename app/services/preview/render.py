@@ -35,6 +35,10 @@ from app.services.deadline import (
 )
 
 logger = logging.getLogger(__name__)
+_DOWNLOAD_VIDEO_GLOBAL_TIMEOUT_SECONDS = 90.0
+_DOWNLOAD_VIDEO_RETRY_ATTEMPTS = 4
+_DOWNLOAD_VIDEO_RETRY_BASE_DELAY = 0.25
+_DOWNLOAD_VIDEO_RETRY_MAX_DELAY = 2.0
 
 
 class PreviewSubmissionError(RuntimeError):
@@ -677,9 +681,6 @@ async def download_video_from_dropbox(
         
         session_dbx = await get_dropbox_session()
         retry_statuses = {401, 408, 429, 500, 502, 503, 504}
-        retry_attempts = 3
-        base_delay = 0.5
-        max_delay = 8.0
 
         def _compute_delay(attempt: int, retry_after: Optional[str]) -> float:
             if retry_after:
@@ -687,54 +688,65 @@ async def download_video_from_dropbox(
                     return max(float(retry_after), 0.0)
                 except ValueError:
                     pass
-            delay = min(base_delay * (2 ** attempt), max_delay)
-            return delay + random.uniform(0.0, base_delay)
+            delay = min(
+                _DOWNLOAD_VIDEO_RETRY_BASE_DELAY * (2 ** attempt),
+                _DOWNLOAD_VIDEO_RETRY_MAX_DELAY,
+            )
+            return delay + random.uniform(0.0, _DOWNLOAD_VIDEO_RETRY_BASE_DELAY)
 
         # Use the original filename for local storage
         filename = video_info["filename"]
         temp_path = temp_dir / filename
         temp_path.parent.mkdir(parents=True, exist_ok=True)
 
-        for attempt in range(retry_attempts):
-            dl_headers = {
-                "Authorization": f"Bearer {await get_fresh_access_token()}",
-                "Dropbox-API-Select-User": settings.dropbox_team_member_id,
-                "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
-                "Dropbox-API-Arg": json.dumps({"path": video_info["dropbox_path"]})
-            }
-            try:
-                async with session_dbx.post(download_url, headers=dl_headers) as resp:
-                    if resp.status == 200:
-                        async with aiofiles.open(temp_path, "wb") as f:
-                            async for chunk in resp.content.iter_chunked(1024 * 1024):
-                                await f.write(chunk)
-                        logger.info(f"Video downloaded to {temp_path}")
-                        return (str(temp_path), video_info["dropbox_path"])
+        async with asyncio.timeout(_DOWNLOAD_VIDEO_GLOBAL_TIMEOUT_SECONDS):
+            for attempt in range(_DOWNLOAD_VIDEO_RETRY_ATTEMPTS):
+                dl_headers = {
+                    "Authorization": f"Bearer {await get_fresh_access_token()}",
+                    "Dropbox-API-Select-User": settings.dropbox_team_member_id,
+                    "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
+                    "Dropbox-API-Arg": json.dumps({"path": video_info["dropbox_path"]})
+                }
+                try:
+                    async with session_dbx.post(download_url, headers=dl_headers) as resp:
+                        if resp.status == 200:
+                            async with aiofiles.open(temp_path, "wb") as f:
+                                async for chunk in resp.content.iter_chunked(1024 * 1024):
+                                    await f.write(chunk)
+                            logger.info(f"Video downloaded to {temp_path}")
+                            return (str(temp_path), video_info["dropbox_path"])
 
-                    text = await resp.text()
-                    if resp.status in retry_statuses and attempt < (retry_attempts - 1):
-                        delay = _compute_delay(attempt, resp.headers.get("Retry-After"))
-                        logger.warning(
-                            "Retrying Dropbox download %s (%s): %s",
-                            filename,
-                            resp.status,
-                            text,
-                        )
+                        text = await resp.text()
+                        if resp.status in retry_statuses and attempt < (_DOWNLOAD_VIDEO_RETRY_ATTEMPTS - 1):
+                            delay = _compute_delay(attempt, resp.headers.get("Retry-After"))
+                            logger.warning(
+                                "Retrying Dropbox download %s (%s): %s",
+                                filename,
+                                resp.status,
+                                text,
+                            )
+                            await asyncio.sleep(delay)
+                        else:
+                            logger.error(f"Error downloading video: {text}")
+                            return None
+                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    if attempt < (_DOWNLOAD_VIDEO_RETRY_ATTEMPTS - 1):
+                        delay = _compute_delay(attempt, None)
+                        logger.warning("Retrying Dropbox download %s after error: %s", filename, exc)
                         await asyncio.sleep(delay)
                     else:
-                        logger.error(f"Error downloading video: {text}")
+                        logger.error(f"Error downloading video for job {job_id}: {exc}")
                         return None
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                if attempt < (retry_attempts - 1):
-                    delay = _compute_delay(attempt, None)
-                    logger.warning("Retrying Dropbox download %s after error: %s", filename, exc)
-                    await asyncio.sleep(delay)
-                else:
-                    logger.error(f"Error downloading video for job {job_id}: {exc}")
-                    return None
-            if temp_path.exists():
-                with contextlib.suppress(Exception):
-                    temp_path.unlink()
+                if temp_path.exists():
+                    with contextlib.suppress(Exception):
+                        temp_path.unlink()
+    except TimeoutError:
+        logger.error(
+            "Timed out downloading video for job %s after %.0f seconds",
+            job_id,
+            _DOWNLOAD_VIDEO_GLOBAL_TIMEOUT_SECONDS,
+        )
+        return None
 
     except Exception as e:
         logger.error(f"Error downloading video for job {job_id}: {e}")

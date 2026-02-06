@@ -339,6 +339,28 @@ async def _process_user(user: _WatcherUser, bot) -> None:
         await _process_job_for_user(user, job, bot)
 
 
+async def _process_users_parallel(users: list[_WatcherUser], bot) -> None:
+    if not users:
+        return
+
+    max_parallel = min(8, max(1, len(users)))
+    semaphore = asyncio.Semaphore(max_parallel)
+
+    async def _run_for_user(user: _WatcherUser) -> None:
+        async with semaphore:
+            await _process_user(user, bot)
+
+    tasks = [asyncio.create_task(_run_for_user(user)) for user in users]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for user, result in zip(users, results):
+        if isinstance(result, Exception):
+            logger.error(
+                "Watcher: user processing failed for user %s: %s",
+                user.telegram_user_id,
+                result,
+            )
+
+
 async def job_progress_watcher(bot) -> None:
     """Monitor Deadline jobs and send completion/preview notifications."""
     try:
@@ -369,7 +391,6 @@ async def job_progress_watcher(bot) -> None:
                 auto_preview_count,
             )
 
-            for user in users:
-                await _process_user(user, bot)
+            await _process_users_parallel(users, bot)
     except asyncio.CancelledError:
         logger.info("Job progress watcher cancelled")

@@ -4,6 +4,7 @@ import logging
 from typing import Optional, Tuple
 from cryptography.fernet import Fernet
 from app.core.config import settings
+from app.core.bot_core import get_aiosession
 from app.storage.database import get_db_connection
 import aiohttp
 
@@ -65,18 +66,18 @@ async def authenticate_user(username: str, password: str, telegram_user_id: int)
         True if authentication successful, False otherwise
     """
     try:
-        async with aiohttp.ClientSession() as session:
-            auth = aiohttp.BasicAuth(username, password)
-            async with session.get(
-                f"{settings.deadline_api_url}/jobs",
-                auth=auth,
-                ssl=settings.deadline_tls_verify,
-            ) as resp:
-                if resp.status == 200:
-                    return True
-                else:
-                    logger.warning(f"Deadline RCS auth failed for user {username}: {resp.status}")
-                    return False
+        session = await get_aiosession()
+        auth = aiohttp.BasicAuth(username, password)
+        async with session.get(
+            f"{settings.deadline_api_url}/jobs",
+            auth=auth,
+            ssl=settings.deadline_tls_verify,
+        ) as resp:
+            if resp.status == 200:
+                return True
+            else:
+                logger.warning(f"Deadline RCS auth failed for user {username}: {resp.status}")
+                return False
     except Exception as e:
         logger.error(f"Error authenticating user {username} via Deadline RCS: {e}")
         return False

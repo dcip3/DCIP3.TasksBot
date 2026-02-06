@@ -15,7 +15,6 @@ from app.core.bot_core import bot, download_states, stop_downloads
 from app.core.config import settings
 from app.core.path_utils import extract_dropbox_path
 from app.core.preview_text import build_preview_caption
-from app.core.maintenance import cleanup_old_files, cleanup_temp_and_conv
 from app.integrations.dropbox_helpers import (
     download_exr_folder,
     fetch_dropbox_metadata,
@@ -97,8 +96,6 @@ async def render_preview_via_server_pipeline(callback_query: CallbackQuery, job_
                         await progress.edit_text("⏹️ Preview generation cancelled.", reply_markup=None)
                 try:
                     cleanup_job_files(job_id)
-                    cleanup_temp_and_conv()
-                    cleanup_old_files(max_age_hours=6)
                 except Exception as cleanup_error:
                     logger.error("Error cleaning up after cancellation: %s", cleanup_error)
                 with contextlib.suppress(Exception):
@@ -369,9 +366,8 @@ async def render_preview_via_server_pipeline(callback_query: CallbackQuery, job_
             logger.error("Error cleaning up job files after failure: %s", cleanup_error)
     finally:
         try:
-            cleanup_temp_and_conv()
-            cleanup_old_files(max_age_hours=6)
+            cleanup_job_files(job_id)
         except Exception as cleanup_error:
-            logger.error("Error cleaning up directories after preview workflow: %s", cleanup_error)
+            logger.error("Error cleaning up job files after preview workflow: %s", cleanup_error)
         download_states.pop(job_id, None)
         stop_downloads.pop(job_id, None)
