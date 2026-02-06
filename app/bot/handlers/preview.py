@@ -18,7 +18,7 @@ from app.core.bot_core import bot, download_states, stop_downloads
 from app.core.config import settings
 from app.core.path_utils import extract_dropbox_path
 from app.core.preview_text import build_preview_caption
-from app.core.maintenance import cleanup_old_files, cleanup_temp_and_conv
+from app.core.maintenance import cleanup_old_files
 from app.integrations.dropbox_helpers import (
     count_exr_files,
     get_fresh_access_token,
@@ -240,7 +240,12 @@ async def _maybe_send_single_frame_preview(
     }
     session_dbx = await get_dropbox_session()
     try:
-        total_files = await count_exr_files(session_dbx, dropbox_path, headers_dbx)
+        total_files = await count_exr_files(
+            session_dbx,
+            dropbox_path,
+            headers_dbx,
+            stop_after=2,
+        )
     except Exception as exc:
         logger.warning("Single-frame check failed for job %s: %s", job_id, exc)
         return False
@@ -1012,7 +1017,6 @@ async def send_dbx_video_callback(callback_query: CallbackQuery) -> None:
 
             cleanup_job_files(job_id)
             cleanup_old_files(max_age_hours=6)
-            cleanup_temp_and_conv()
 
             with contextlib.suppress(Exception):
                 Path(video_path).unlink()

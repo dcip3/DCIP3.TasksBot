@@ -5,6 +5,7 @@ import Imath
 from pathlib import Path
 import subprocess
 import os
+import sys
 import logging
 import contextlib
 import gc
@@ -18,6 +19,31 @@ from dataclasses import dataclass
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+GC_RSS_THRESHOLD_MB = 1024
+
+
+def _get_process_rss_mb() -> Optional[float]:
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        with open("/proc/self/statm", "r", encoding="utf-8") as fh:
+            parts = fh.read().split()
+        if len(parts) < 2:
+            return None
+        rss_pages = int(parts[1])
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        return (rss_pages * page_size) / (1024 * 1024)
+    except Exception:
+        return None
+
+
+def _maybe_collect_gc_for_memory_pressure() -> None:
+    rss_mb = _get_process_rss_mb()
+    if rss_mb is None:
+        return
+    if rss_mb >= GC_RSS_THRESHOLD_MB:
+        logger.debug("High RSS %.1fMB detected after EXR conversion, triggering gc.collect()", rss_mb)
+        gc.collect()
 
 @lru_cache(maxsize=1)
 def _get_default_cpu_processor() -> ocio.CPUProcessor:
@@ -93,7 +119,6 @@ def convert_single_exr_file_streaming(args):
             
             # Clear chunk memory immediately
             del r_chunk, g_chunk, b_chunk, rgb_chunk, flat_chunk
-            gc.collect()
         
         # Close EXR file before combining chunks
         exr.close()
@@ -117,7 +142,7 @@ def convert_single_exr_file_streaming(args):
         
         # Cleanup
         del processed_chunks, img
-        gc.collect()
+        _maybe_collect_gc_for_memory_pressure()
         
         # Delete source EXR file immediately after successful conversion
         try:

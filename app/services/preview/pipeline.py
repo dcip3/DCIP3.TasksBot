@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional
 
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -47,6 +47,27 @@ def _build_server_cancel_keyboard(job_id: str) -> InlineKeyboardMarkup:
     )
 
 
+async def _upload_video_to_dropbox_and_cleanup(
+    *,
+    session_dbx,
+    headers_dbx: dict,
+    dropbox_path: str,
+    video_path: Path,
+    job_id: str,
+) -> None:
+    try:
+        metadata = await fetch_dropbox_metadata(session_dbx, dropbox_path, headers_dbx)
+        uploaded_path = await upload_video_to_dropbox(video_path, metadata, job_id)
+        logger.info("Uploaded preview video for job %s to Dropbox path %s", job_id, uploaded_path)
+    except Exception as upload_error:
+        logger.error("Error uploading preview video for job %s in background: %s", job_id, upload_error)
+    finally:
+        try:
+            cleanup_job_files(job_id)
+        except Exception as cleanup_error:
+            logger.error("Error cleaning up job files after background upload: %s", cleanup_error)
+
+
 async def render_preview_via_server_pipeline(callback_query: CallbackQuery, job_id: str) -> None:
     """Generate preview on bot host: download frames, convert, assemble, upload, send."""
     if callback_query.from_user is None:
@@ -57,6 +78,7 @@ async def render_preview_via_server_pipeline(callback_query: CallbackQuery, job_
     cancel_keyboard: Optional[InlineKeyboardMarkup] = None
     stop_event: Optional[asyncio.Event] = None
     state: Optional[dict] = None
+    defer_cleanup = False
     try:
         base_message = callback_query.message
         if base_message:
@@ -76,6 +98,7 @@ async def render_preview_via_server_pipeline(callback_query: CallbackQuery, job_
         download_states[job_id] = {
             "progress_msg": progress_msg,
             "total_files": 0,
+            "downloaded_files": 0,
             "stop_kb": cancel_keyboard,
             "last_progress_ts": 0.0,
             "last_progress_percent": -1,
@@ -171,6 +194,7 @@ async def render_preview_via_server_pipeline(callback_query: CallbackQuery, job_
 
         if state is not None:
             state["total_files"] = total_files
+            state["downloaded_files"] = 0
             state["stop_kb"] = cancel_keyboard
 
         await download_exr_folder(
@@ -182,6 +206,7 @@ async def render_preview_via_server_pipeline(callback_query: CallbackQuery, job_
             job_id,
             download_states,
             stop_downloads,
+            prefetched_result=list_result,
         )
         if await finalize_cancellation():
             return
@@ -248,12 +273,8 @@ async def render_preview_via_server_pipeline(callback_query: CallbackQuery, job_
         if await finalize_cancellation():
             return
 
-        try:
-            metadata = await fetch_dropbox_metadata(session_dbx, dropbox_path, headers_dbx)
-            dropbox_video_path = await upload_video_to_dropbox(Path(video_path), metadata, job_id)
-        except Exception as upload_error:
-            logger.error("Error uploading video to Dropbox: %s", upload_error)
-            dropbox_video_path = dropbox_path
+        video_path_obj = Path(video_path)
+        expected_dropbox_video_path = str(PurePosixPath(dropbox_path).parent / video_path_obj.name)
 
         if await finalize_cancellation():
             return
@@ -262,7 +283,6 @@ async def render_preview_via_server_pipeline(callback_query: CallbackQuery, job_
             "📏 Step 3: Checking file size...",
             reply_markup=cancel_keyboard,
         )
-        video_path_obj = Path(video_path)
         max_video_size_mb = 45.0
         video_size_mb = get_file_size_mb(video_path_obj)
 
@@ -276,7 +296,7 @@ async def render_preview_via_server_pipeline(callback_query: CallbackQuery, job_
 
         preparation = await prepare_video_for_delivery(
             video_path_obj,
-            dropbox_video_path,
+            expected_dropbox_video_path,
             max_size_mb=max_video_size_mb,
             initial_size_mb=video_size_mb,
         )
@@ -295,9 +315,10 @@ async def render_preview_via_server_pipeline(callback_query: CallbackQuery, job_
             return
 
         video_filename = final_video_path.name
+        expected_dropbox_video_path = str(PurePosixPath(dropbox_path).parent / video_filename)
         project_name = video_filename.replace(".mp4", "")
         try:
-            path_parts = (dropbox_video_path or "").split("/")
+            path_parts = (expected_dropbox_video_path or "").split("/")
             for idx_part, part in enumerate(path_parts):
                 if part == "render" and idx_part + 1 < len(path_parts):
                     project_name = path_parts[idx_part + 1]
@@ -305,7 +326,7 @@ async def render_preview_via_server_pipeline(callback_query: CallbackQuery, job_
         except Exception:
             pass
 
-        caption = build_preview_caption(project_name, dropbox_video_path or None)
+        caption = build_preview_caption(project_name, expected_dropbox_video_path or None)
         if fallback_message:
             if callback_query.message:
                 await callback_query.message.answer(
@@ -332,6 +353,17 @@ async def render_preview_via_server_pipeline(callback_query: CallbackQuery, job_
                     caption=caption,
                     parse_mode="HTML",
                 )
+
+        asyncio.create_task(
+            _upload_video_to_dropbox_and_cleanup(
+                session_dbx=session_dbx,
+                headers_dbx=headers_dbx,
+                dropbox_path=dropbox_path,
+                video_path=final_video_path,
+                job_id=job_id,
+            )
+        )
+        defer_cleanup = True
 
         with contextlib.suppress(Exception):
             await progress_msg.delete()
@@ -365,9 +397,10 @@ async def render_preview_via_server_pipeline(callback_query: CallbackQuery, job_
         except Exception as cleanup_error:
             logger.error("Error cleaning up job files after failure: %s", cleanup_error)
     finally:
-        try:
-            cleanup_job_files(job_id)
-        except Exception as cleanup_error:
-            logger.error("Error cleaning up job files after preview workflow: %s", cleanup_error)
+        if not defer_cleanup:
+            try:
+                cleanup_job_files(job_id)
+            except Exception as cleanup_error:
+                logger.error("Error cleaning up job files after preview workflow: %s", cleanup_error)
         download_states.pop(job_id, None)
         stop_downloads.pop(job_id, None)

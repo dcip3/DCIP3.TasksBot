@@ -4,6 +4,8 @@ import json
 import logging
 import random
 import contextlib
+import os
+import sys
 from typing import Optional, List, Dict, Any
 from pathlib import Path, PurePosixPath
 import asyncio
@@ -106,6 +108,40 @@ RETRY_STATUSES = {401, 408, 429, 500, 502, 503, 504}
 RETRY_ATTEMPTS = 3
 RETRY_BASE_DELAY = 0.5
 RETRY_MAX_DELAY = 8.0
+DOWNLOAD_CHUNK_SIZE_BYTES = 512 * 1024
+GC_RSS_THRESHOLD_MB = 1024
+GC_CHECK_EVERY_BATCHES = 6
+_gc_batch_counter = 0
+
+
+def _get_process_rss_mb() -> Optional[float]:
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        with open("/proc/self/statm", "r", encoding="utf-8") as fh:
+            parts = fh.read().split()
+        if len(parts) < 2:
+            return None
+        rss_pages = int(parts[1])
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        return (rss_pages * page_size) / (1024 * 1024)
+    except Exception:
+        return None
+
+
+def _maybe_collect_gc_for_memory_pressure() -> None:
+    global _gc_batch_counter
+    _gc_batch_counter += 1
+    if _gc_batch_counter < GC_CHECK_EVERY_BATCHES:
+        return
+    _gc_batch_counter = 0
+
+    rss_mb = _get_process_rss_mb()
+    if rss_mb is None:
+        return
+    if rss_mb >= GC_RSS_THRESHOLD_MB:
+        logger.debug("High RSS %.1fMB detected, triggering gc.collect()", rss_mb)
+        gc.collect()
 
 def _parse_retry_after(value: Optional[str]) -> Optional[float]:
     if not value:
@@ -247,10 +283,19 @@ async def list_folder_cached(session_dbx, path, headers_dbx):
     list_folder_cache.set(key, result)
     return result
 
-async def count_exr_files(session_dbx: aiohttp.ClientSession, path: str, headers_dbx: dict) -> int:
+async def count_exr_files(
+    session_dbx: aiohttp.ClientSession,
+    path: str,
+    headers_dbx: dict,
+    *,
+    stop_after: Optional[int] = None,
+) -> int:
     """
     Counts EXR/JPG/PNG files recursively in a Dropbox folder (excluding cryptomatte and conflicted copies).
     """
+    if stop_after is not None and stop_after <= 0:
+        return 0
+
     # Create a copy of headers and serialize Dropbox-API-Path-Root
     headers_copy = headers_dbx.copy()
     if "Dropbox-API-Path-Root" in headers_copy:
@@ -270,8 +315,18 @@ async def count_exr_files(session_dbx: aiohttp.ClientSession, path: str, headers
             continue
         if entry[".tag"] == "file" and _is_preview_frame(entry["name"]):
             count += 1
+            if stop_after is not None and count >= stop_after:
+                return count
         elif entry[".tag"] == "folder":
-            count += await count_exr_files(session_dbx, entry["path_display"], headers_dbx)
+            nested_limit = None if stop_after is None else max(stop_after - count, 0)
+            count += await count_exr_files(
+                session_dbx,
+                entry["path_display"],
+                headers_dbx,
+                stop_after=nested_limit,
+            )
+            if stop_after is not None and count >= stop_after:
+                return count
     return count
 
 # FileQueue defaults to batch_size=8
@@ -369,9 +424,9 @@ async def download_file_parallel(
                         # Ensure parent directory exists
                         local_file.parent.mkdir(parents=True, exist_ok=True)
                         
-                        # Write file in chunks
+                        # Write file in larger chunks to reduce write overhead.
                         async with aiofiles.open(local_file, 'wb') as f:
-                            async for chunk in resp.content.iter_chunked(8192):  # 8KB chunks
+                            async for chunk in resp.content.iter_chunked(DOWNLOAD_CHUNK_SIZE_BYTES):
                                 await f.write(chunk)
                         return True
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
@@ -398,19 +453,22 @@ async def download_exr_folder(
     local_folder: Path,
     job_id: str,
     download_states: dict,
-    stop_downloads: dict
+    stop_downloads: dict,
+    prefetched_result: Optional[dict] = None,
 ):
     """
     Download and convert preview frames from Dropbox folder.
     Uses parallel processing with batching for efficiency.
     """
-    # Use cached list-folder response instead of direct request
-    result = await list_folder_cached(session_dbx, path, headers_dbx)
+    result = (
+        prefetched_result
+        if prefetched_result is not None
+        else await list_folder_cached(session_dbx, path, headers_dbx)
+    )
     if not result:
         return
-    
-    # Create file queue with larger batch size for parallel processing
-    file_queue = FileQueue(batch_size=8)  # Increased from 3 to 5
+    max_parallel_downloads = max(1, int(getattr(settings, "max_concurrent_downloads", 2)))
+    file_queue = FileQueue(batch_size=max(8, max_parallel_downloads * 2))
     
     # Create conversion directory
     conv_folder = Path(settings.conv_dir) / local_folder.name
@@ -446,7 +504,7 @@ async def download_exr_folder(
             break
             
         # Download files in parallel
-        semaphore = asyncio.Semaphore(5)  # Allow 5 concurrent downloads
+        semaphore = asyncio.Semaphore(max_parallel_downloads)
         download_tasks = []
         
         for file_info in batch:
@@ -495,6 +553,9 @@ async def download_exr_folder(
                     conversion_items.append(local_file)
                 else:
                     file_queue.mark_completed(str(local_file))
+                    state = download_states.get(job_id)
+                    if state is not None:
+                        state["downloaded_files"] = int(state.get("downloaded_files", 0)) + 1
             else:
                 file_queue.mark_failed(str(local_file))
                 logger.error(f"Failed to download {local_file.name}")
@@ -512,6 +573,9 @@ async def download_exr_folder(
                     success, _, error = result
                     if success:
                         file_queue.mark_completed(str(local_file))
+                        state = download_states.get(job_id)
+                        if state is not None:
+                            state["downloaded_files"] = int(state.get("downloaded_files", 0)) + 1
                     else:
                         file_queue.mark_failed(str(local_file))
                         logger.error(f"Failed to convert {local_file}: {error}")
@@ -520,8 +584,9 @@ async def download_exr_folder(
         if job_id in download_states:
             state = download_states[job_id]
             total_files = state.get("total_files", 0)
-            downloaded_count = len(file_queue.completed)
+            downloaded_count = int(state.get("downloaded_files", 0))
             percent = int((downloaded_count / total_files) * 100) if total_files else 0
+            percent = max(0, min(percent, 100))
             
             progress_msg = state.get("progress_msg")
             try:
@@ -535,8 +600,7 @@ async def download_exr_folder(
             except Exception:
                 pass
         
-        # Force memory cleanup after each batch
-        gc.collect()
+        _maybe_collect_gc_for_memory_pressure()
 
 async def upload_video_to_dropbox(video_path: Path, metadata: dict, job_id: Optional[str] = None) -> str:
     """
