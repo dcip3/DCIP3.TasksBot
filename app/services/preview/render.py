@@ -47,6 +47,21 @@ class PreviewSubmissionError(RuntimeError):
     def __init__(self, user_message: str, log_message: Optional[str] = None):
         super().__init__(log_message or user_message)
         self.user_message = user_message
+
+
+def _resolve_preview_helper_script() -> Optional[Path]:
+    current = Path(__file__).resolve()
+    candidates = [
+        current.parents[2] / "scripts" / "deadline_preview_worker.py",  # repo/app + scripts
+        current.parents[3] / "scripts" / "deadline_preview_worker.py",  # repo root + scripts
+        Path.cwd() / "scripts" / "deadline_preview_worker.py",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def _sanitize_windows_filename(name: str) -> str:
     """Replace characters that are invalid in Windows file names."""
     return re.sub(r'[\\/:*?"<>|]', "_", name)
@@ -197,9 +212,9 @@ async def create_video_from_job(
     except (TypeError, ValueError):
         frame_rate = 25.0
 
-    helper_script = Path(__file__).resolve().parents[2] / "scripts" / "deadline_preview_worker.py"
-    if not helper_script.exists():
-        logger.error("Preview helper script not found: %s", helper_script)
+    helper_script = _resolve_preview_helper_script()
+    if helper_script is None:
+        logger.error("Preview helper script not found in expected locations")
         raise PreviewSubmissionError(
             "Preview helper script is missing on the bot host."
         )
@@ -591,7 +606,11 @@ async def check_video_exists_in_dropbox(
         fullpath = outdirs[0]
         dropbox_path = extract_dropbox_path(fullpath, settings.dropbox_root_marker)
         if not dropbox_path:
-            logger.error(f"Failed to normalize Dropbox path for job {job_id}: {fullpath}")
+            logger.info(
+                "Skipping Dropbox lookup for job %s: output path is outside configured Dropbox root (%s)",
+                job_id,
+                fullpath,
+            )
             return None
 
         # Get metadata for the folder

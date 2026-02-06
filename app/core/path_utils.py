@@ -67,13 +67,11 @@ def normalize_dropbox_path(path: Optional[str]) -> Optional[str]:
 
 
 def extract_dropbox_path(fullpath: Optional[str], root_marker: str) -> Optional[str]:
-    if not fullpath:
+    if not fullpath or not root_marker:
         return None
     full = str(fullpath)
-    if root_marker:
-        idx = full.find(root_marker)
-        if idx != -1:
-            trimmed = full[idx:]
-            return normalize_dropbox_path(trimmed)
-    # Fallback for drive-letter paths without an explicit root marker.
-    return normalize_dropbox_path(full)
+    idx = full.find(root_marker)
+    if idx == -1:
+        return None
+    trimmed = full[idx:]
+    return normalize_dropbox_path(trimmed)
