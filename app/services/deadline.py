@@ -22,6 +22,10 @@ _JOBS_CACHE_TTL_SECONDS = 5.0
 _JOBS_CACHE_MAX_ENTRIES = 256
 _jobs_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 _jobs_cache_lock = asyncio.Lock()
+_WORKERS_CACHE_TTL_SECONDS = 20.0
+_WORKERS_CACHE_MAX_ENTRIES = 256
+_workers_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+_workers_cache_lock = asyncio.Lock()
 
 
 class DeadlineSubmissionError(RuntimeError):
@@ -70,6 +74,10 @@ def _jobs_cache_key(login: str) -> str:
     return str(login or "").strip().lower()
 
 
+def _workers_cache_key(login: str) -> str:
+    return str(login or "").strip().lower()
+
+
 def _prune_jobs_cache() -> None:
     now = time.monotonic()
     expired_keys = [
@@ -89,6 +97,26 @@ def _prune_jobs_cache() -> None:
     ]
     _jobs_cache.clear()
     _jobs_cache.update(survivors)
+
+
+def _prune_workers_cache() -> None:
+    now = time.monotonic()
+    expired_keys = [
+        key
+        for key, (expires_at, _) in _workers_cache.items()
+        if expires_at <= now
+    ]
+    for key in expired_keys:
+        _workers_cache.pop(key, None)
+
+    if len(_workers_cache) <= _WORKERS_CACHE_MAX_ENTRIES:
+        return
+
+    survivors = sorted(_workers_cache.items(), key=lambda item: item[1][0], reverse=True)[
+        :_WORKERS_CACHE_MAX_ENTRIES
+    ]
+    _workers_cache.clear()
+    _workers_cache.update(survivors)
 
 
 async def _fetch_jobs_by_credentials(
@@ -132,6 +160,10 @@ def _invalidate_jobs_cache(login: str) -> None:
     _jobs_cache.pop(_jobs_cache_key(login), None)
 
 
+def _invalidate_workers_cache(login: str) -> None:
+    _workers_cache.pop(_workers_cache_key(login), None)
+
+
 # ==========================================================================
 # === DEADLINE API FUNCTIONS ===
 # ==========================================================================
@@ -163,8 +195,21 @@ async def get_jobs_list(telegram_user_id: int) -> List[Dict[str, Any]]:
     )
 
 
-async def _fetch_workers(login: str, password: str) -> List[Dict[str, Any]]:
+async def _fetch_workers(
+    login: str,
+    password: str,
+    *,
+    use_cache: bool = True,
+    force_refresh: bool = False,
+) -> List[Dict[str, Any]]:
     """Fetch workers list using provided Deadline credentials."""
+    cache_key = _workers_cache_key(login)
+    now = time.monotonic()
+    if use_cache and not force_refresh:
+        cached = _workers_cache.get(cache_key)
+        if cached and cached[0] > now:
+            return cached[1]
+
     try:
         session = await get_aiosession()
         headers = aiohttp.BasicAuth(login, password)
@@ -173,6 +218,11 @@ async def _fetch_workers(login: str, password: str) -> List[Dict[str, Any]]:
             if resp.status == 200:
                 data = await resp.json()
                 logger.info(f"Slaves API returned {len(data) if isinstance(data, list) else 'non-list'} items")
+                if isinstance(data, list) and use_cache:
+                    async with _workers_cache_lock:
+                        expires_at = time.monotonic() + _WORKERS_CACHE_TTL_SECONDS
+                        _workers_cache[cache_key] = (expires_at, data)
+                        _prune_workers_cache()
                 return data
             response_text = await resp.text()
             logger.error(f"Failed to get slaves: {resp.status}, response: {response_text}")
@@ -207,6 +257,42 @@ async def get_workers_list(telegram_user_id: int) -> List[Dict[str, Any]]:
 async def get_workers_by_credentials(login: str, password: str) -> List[Dict[str, Any]]:
     """Return list of workers using raw credentials."""
     return await _fetch_workers(login, password)
+
+
+async def get_job_info_direct(login: str, password: str, job_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch one job by id using a targeted Deadline query, fallback to cached list lookup."""
+    session = await get_aiosession()
+    auth = aiohttp.BasicAuth(login, password)
+    try:
+        async with session.get(
+            f"{settings.deadline_api_url}/jobs",
+            params={"JobID": job_id},
+            auth=auth,
+            ssl=settings.deadline_tls_verify,
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if isinstance(data, dict):
+                    if data.get("_id") == job_id:
+                        return data
+                    jobs = data.get("Jobs")
+                    if isinstance(jobs, list):
+                        match = next((job for job in jobs if job.get("_id") == job_id), None)
+                        if match is not None:
+                            return match
+                elif isinstance(data, list):
+                    match = next((job for job in data if job.get("_id") == job_id), None)
+                    if match is not None:
+                        return match
+                    if len(data) == 1 and isinstance(data[0], dict):
+                        return data[0]
+            else:
+                text = await resp.text()
+                logger.debug("Direct job query failed for %s: %s %s", job_id, resp.status, text)
+    except Exception as exc:
+        logger.debug("Direct job query exception for %s: %s", job_id, exc)
+
+    return await get_job_info(login, password, job_id)
 
 
 async def get_worker_report_contents(

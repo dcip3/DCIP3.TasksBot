@@ -299,9 +299,6 @@ async def _start_deadline_preview(callback_query: CallbackQuery, job_id: str) ->
         await callback_query.answer("Error: user not found.", show_alert=True)
         return
 
-    if await _maybe_send_single_frame_preview(callback_query, job_id):
-        return
-
     default_worker = await get_preview_default_worker(callback_query.from_user.id)
     # Use a fresh progress message to avoid editing the job card message.
     progress_msg: Optional[Message] = None

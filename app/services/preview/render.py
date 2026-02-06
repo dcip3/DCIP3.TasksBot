@@ -39,6 +39,9 @@ _DOWNLOAD_VIDEO_GLOBAL_TIMEOUT_SECONDS = 90.0
 _DOWNLOAD_VIDEO_RETRY_ATTEMPTS = 4
 _DOWNLOAD_VIDEO_RETRY_BASE_DELAY = 0.25
 _DOWNLOAD_VIDEO_RETRY_MAX_DELAY = 2.0
+_SCRIPT_CACHE_PATH: Optional[Path] = None
+_SCRIPT_CACHE_MTIME_NS: Optional[int] = None
+_SCRIPT_CACHE_B64: Optional[str] = None
 
 
 class PreviewSubmissionError(RuntimeError):
@@ -60,6 +63,26 @@ def _resolve_preview_helper_script() -> Optional[Path]:
         if candidate.exists():
             return candidate
     return None
+
+
+def _load_preview_helper_script_b64(script_path: Path) -> str:
+    global _SCRIPT_CACHE_PATH, _SCRIPT_CACHE_MTIME_NS, _SCRIPT_CACHE_B64
+    stat = script_path.stat()
+    mtime_ns = int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000)))
+    if (
+        _SCRIPT_CACHE_B64 is not None
+        and _SCRIPT_CACHE_PATH == script_path
+        and _SCRIPT_CACHE_MTIME_NS == mtime_ns
+    ):
+        return _SCRIPT_CACHE_B64
+
+    script_bytes = script_path.read_bytes()
+    compressed_script = zlib.compress(script_bytes)
+    encoded = base64.b64encode(compressed_script).decode("ascii")
+    _SCRIPT_CACHE_PATH = script_path
+    _SCRIPT_CACHE_MTIME_NS = mtime_ns
+    _SCRIPT_CACHE_B64 = encoded
+    return encoded
 
 
 def _sanitize_windows_filename(name: str) -> str:
@@ -219,9 +242,7 @@ async def create_video_from_job(
             "Preview helper script is missing on the bot host."
         )
 
-    script_bytes = helper_script.read_bytes()
-    compressed_script = zlib.compress(script_bytes)
-    script_b64 = base64.b64encode(compressed_script).decode("ascii")
+    script_b64 = _load_preview_helper_script_b64(helper_script)
 
     aux_files: List[Union[str, Path, Tuple[Union[str, Path], str]]] = []
 
@@ -321,10 +342,12 @@ async def create_video_from_job(
     if not is_windows_path:
         python_args_str = " ".join(shlex.quote(arg) for arg in python_args)
 
-    tasks = await get_job_tasks(login, password, job_id)
-    slave_counter: Counter[str] = Counter(
-        task.get("Slave") for task in tasks if isinstance(task, dict) and task.get("Slave")
-    )
+    slave_counter: Counter[str] = Counter()
+    if not specific_worker and not use_any_machine:
+        tasks = await get_job_tasks(login, password, job_id)
+        slave_counter = Counter(
+            task.get("Slave") for task in tasks if isinstance(task, dict) and task.get("Slave")
+        )
 
     # Prefer the worker that created/submitted the job
     job_creator_machine = props.get("Mach")
