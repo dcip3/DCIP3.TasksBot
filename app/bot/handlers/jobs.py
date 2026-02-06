@@ -2,6 +2,7 @@ import asyncio
 import html
 import logging
 import re
+from collections import deque
 from datetime import datetime, timedelta, timezone
 
 from aiogram import F, Router
@@ -33,6 +34,98 @@ router = Router()
 
 _PROGRESS_RE = re.compile(r"(\d+(?:\.\d+)?)")
 _FRAMES_RE = re.compile(r"^\s*(-?\d+)(?:\s*-\s*(-?\d+)(?:\s*x\s*(\d+))?)?\s*$")
+_ETA_HISTORY_TTL_SECONDS = 3 * 60 * 60
+_ETA_SHORT_WINDOW_SECONDS = 7 * 60
+_ETA_LONG_WINDOW_SECONDS = 25 * 60
+_ETA_EMA_ALPHA = 0.28
+_ETA_MAX_TREND_BOOST = 1.30
+_ETA_MIN_TREND_BOOST = 0.78
+_ETA_MIN_PREDICTED_RATE = 1e-6
+_ETA_MAX_SMOOTHING_GAP_SECONDS = 20 * 60
+_ETA_HISTORY: dict[str, deque[tuple[datetime, float, float]]] = {}
+_ETA_SMOOTHED_SECONDS: dict[str, tuple[datetime, float]] = {}
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _prune_eta_state(now_utc: datetime) -> None:
+    cutoff = now_utc - timedelta(seconds=_ETA_HISTORY_TTL_SECONDS)
+    to_delete: list[str] = []
+    for job_id, history in _ETA_HISTORY.items():
+        while history and history[0][0] < cutoff:
+            history.popleft()
+        if not history:
+            to_delete.append(job_id)
+    for job_id in to_delete:
+        _ETA_HISTORY.pop(job_id, None)
+        _ETA_SMOOTHED_SECONDS.pop(job_id, None)
+
+
+def _track_eta_history(
+    job_id: str,
+    now_utc: datetime,
+    completed_frames: float,
+    total_frames: float,
+) -> deque[tuple[datetime, float, float]]:
+    history = _ETA_HISTORY.setdefault(job_id, deque())
+    if history:
+        _, prev_completed, prev_total = history[-1]
+        total_changed = abs(prev_total - total_frames) > 0.01
+        progress_reset = completed_frames + 0.5 < prev_completed
+        if total_changed or progress_reset:
+            history.clear()
+            _ETA_SMOOTHED_SECONDS.pop(job_id, None)
+
+    history.append((now_utc, completed_frames, total_frames))
+    cutoff = now_utc - timedelta(seconds=_ETA_HISTORY_TTL_SECONDS)
+    while history and history[0][0] < cutoff:
+        history.popleft()
+    return history
+
+
+def _estimate_rate_over_window(
+    history: deque[tuple[datetime, float, float]],
+    now_utc: datetime,
+    window_seconds: int,
+    min_duration_seconds: int,
+    min_frame_delta: float,
+) -> float | None:
+    if len(history) < 2:
+        return None
+
+    latest_time, latest_completed, _ = history[-1]
+    cutoff = now_utc - timedelta(seconds=window_seconds)
+    baseline = history[0]
+    for sample in reversed(history):
+        if sample[0] <= cutoff:
+            baseline = sample
+            break
+
+    base_time, base_completed, _ = baseline
+    elapsed = (latest_time - base_time).total_seconds()
+    frame_delta = latest_completed - base_completed
+    if elapsed < min_duration_seconds or frame_delta < min_frame_delta:
+        return None
+    return frame_delta / elapsed
+
+
+def _smooth_eta_seconds(job_id: str, now_utc: datetime, eta_seconds: float) -> float:
+    prev = _ETA_SMOOTHED_SECONDS.get(job_id)
+    if prev is None:
+        _ETA_SMOOTHED_SECONDS[job_id] = (now_utc, eta_seconds)
+        return eta_seconds
+
+    prev_time, prev_eta = prev
+    gap_seconds = (now_utc - prev_time).total_seconds()
+    if gap_seconds < 0 or gap_seconds > _ETA_MAX_SMOOTHING_GAP_SECONDS:
+        _ETA_SMOOTHED_SECONDS[job_id] = (now_utc, eta_seconds)
+        return eta_seconds
+
+    smoothed = (_ETA_EMA_ALPHA * eta_seconds) + ((1.0 - _ETA_EMA_ALPHA) * prev_eta)
+    _ETA_SMOOTHED_SECONDS[job_id] = (now_utc, smoothed)
+    return smoothed
 
 def _escape_pre(value: object) -> str:
     return html.escape(str(value))
@@ -83,7 +176,21 @@ def _count_frames(value: object) -> int | None:
         total += ((end - start) // step) + 1
     return total or None
 
-def _compute_progress_from_tasks(tasks: list[dict], total_tasks: int) -> str | None:
+def _parse_task_datetime(value: object) -> datetime | None:
+    if not value:
+        return None
+    raw = str(value).strip()
+    if not raw or raw == "0001-01-01T00:00:00Z":
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+def _get_frame_progress_metrics(tasks: list[dict]) -> tuple[float, float] | None:
     if not tasks:
         return None
     frame_counts: list[int] = []
@@ -92,22 +199,31 @@ def _compute_progress_from_tasks(tasks: list[dict], total_tasks: int) -> str | N
         if frames is None:
             return None
         frame_counts.append(frames)
-    total_frames = sum(frame_counts)
+    total_frames = float(sum(frame_counts))
     if total_frames <= 0:
         return None
-    completed = 0.0
+
+    completed_frames = 0.0
     for task, frames in zip(tasks, frame_counts):
         stat = task.get("Stat", 1)
         if stat == 5:
-            completed += frames
+            completed_frames += frames
             continue
         prog_ratio = _parse_progress_ratio(task.get("Prog"))
         if prog_ratio is None:
             continue
         if stat in {3, 4}:
-            completed += frames * prog_ratio
-    if completed > total_frames:
-        completed = float(total_frames)
+            completed_frames += frames * prog_ratio
+
+    if completed_frames > total_frames:
+        completed_frames = total_frames
+    return total_frames, completed_frames
+
+def _compute_progress_from_tasks(tasks: list[dict], total_tasks: int) -> str | None:
+    metrics = _get_frame_progress_metrics(tasks)
+    if metrics is None:
+        return None
+    total_frames, completed = metrics
     percent = int((completed / total_frames) * 100) if total_frames else 0
     done_str = (
         str(int(round(completed)))
@@ -241,36 +357,138 @@ def _extract_preview_meta(props: dict) -> tuple[bool, str | None]:
     return is_preview_job, source_id
 
 
-def _calculate_eta(tasks: list[dict], total_tasks: int, completed_chunks: int) -> str:
+def _calculate_eta(
+    job_id: str | None,
+    tasks: list[dict],
+    total_tasks: int,
+    completed_chunks: int,
+) -> str:
     eta_str = "N/A"
     try:
-        if tasks:
-            durations = []
-            for task in tasks:
-                if task.get("Stat") == 5:
-                    start_str = task.get("StartRen")
-                    comp_str = task.get("Comp")
-                    if (
-                        start_str
-                        and comp_str
-                        and start_str != "0001-01-01T00:00:00Z"
-                        and comp_str != "0001-01-01T00:00:00Z"
-                    ):
-                        try:
-                            start_time = datetime.fromisoformat(start_str)
-                            comp_time = datetime.fromisoformat(comp_str)
-                            duration_val = (comp_time - start_time).total_seconds()
-                            durations.append(duration_val)
-                        except Exception:  # pragma: no cover - defensive
-                            pass
+        now_utc = datetime.now(timezone.utc)
+        _prune_eta_state(now_utc)
+        if not tasks:
+            return eta_str
 
-            if durations:
-                avg_duration = sum(durations) / len(durations)
-                remaining = total_tasks - completed_chunks
-                total_eta_seconds = avg_duration * remaining
+        metrics = _get_frame_progress_metrics(tasks)
+        if metrics is not None:
+            total_frames, completed_frames = metrics
+            remaining_frames = max(total_frames - completed_frames, 0.0)
+            if remaining_frames <= 0:
+                return "0:00:00"
+
+            history: deque[tuple[datetime, float, float]] | None = None
+            if job_id:
+                history = _track_eta_history(
+                    job_id=job_id,
+                    now_utc=now_utc,
+                    completed_frames=completed_frames,
+                    total_frames=total_frames,
+                )
+
+            finished_seconds = 0.0
+            finished_frames = 0.0
+            running_seconds = 0.0
+            running_frames = 0.0
+
+            for task in tasks:
+                frames = _count_frames(task.get("Frames"))
+                if not frames:
+                    continue
+                stat = task.get("Stat", 1)
+                start_time = _parse_task_datetime(task.get("StartRen"))
+                if start_time is None:
+                    continue
+
+                if stat == 5:
+                    comp_time = _parse_task_datetime(task.get("Comp"))
+                    if comp_time is None or comp_time <= start_time:
+                        continue
+                    finished_seconds += (comp_time - start_time).total_seconds()
+                    finished_frames += float(frames)
+                    continue
+
+                if stat == 4:
+                    prog_ratio = _parse_progress_ratio(task.get("Prog"))
+                    if prog_ratio is None or prog_ratio <= 0:
+                        continue
+                    rendered_frames = float(frames) * prog_ratio
+                    # Show ETA as soon as we can infer at least ~1 rendered frame.
+                    if rendered_frames < 1.0:
+                        continue
+                    elapsed = (now_utc - start_time).total_seconds()
+                    if elapsed <= 0:
+                        continue
+                    running_seconds += elapsed
+                    running_frames += rendered_frames
+
+            bootstrap_rate: float | None = None
+            if finished_frames > 0 and finished_seconds > 0:
+                bootstrap_rate = finished_frames / finished_seconds
+            elif running_frames > 0 and running_seconds > 0:
+                bootstrap_rate = running_frames / running_seconds
+
+            predicted_rate: float | None = bootstrap_rate
+            if history is not None:
+                short_rate = _estimate_rate_over_window(
+                    history=history,
+                    now_utc=now_utc,
+                    window_seconds=_ETA_SHORT_WINDOW_SECONDS,
+                    min_duration_seconds=90,
+                    min_frame_delta=0.75,
+                )
+                long_rate = _estimate_rate_over_window(
+                    history=history,
+                    now_utc=now_utc,
+                    window_seconds=_ETA_LONG_WINDOW_SECONDS,
+                    min_duration_seconds=5 * 60,
+                    min_frame_delta=2.5,
+                )
+                if short_rate is not None and long_rate is not None:
+                    blended_rate = (0.70 * short_rate) + (0.30 * long_rate)
+                    trend_ratio = short_rate / max(long_rate, _ETA_MIN_PREDICTED_RATE)
+                    trend_boost = _clamp(
+                        trend_ratio ** 0.35,
+                        _ETA_MIN_TREND_BOOST,
+                        _ETA_MAX_TREND_BOOST,
+                    )
+                    predicted_rate = blended_rate * trend_boost
+                elif short_rate is not None:
+                    predicted_rate = short_rate
+                elif long_rate is not None:
+                    predicted_rate = long_rate
+
+            if predicted_rate is not None and predicted_rate > _ETA_MIN_PREDICTED_RATE:
+                total_eta_seconds = remaining_frames / predicted_rate
                 if total_eta_seconds > 0:
+                    if job_id:
+                        total_eta_seconds = _smooth_eta_seconds(
+                            job_id=job_id,
+                            now_utc=now_utc,
+                            eta_seconds=total_eta_seconds,
+                        )
                     eta_td = timedelta(seconds=int(total_eta_seconds))
                     eta_str = str(eta_td)
+                return eta_str
+
+        # Fallback to task-level estimation if frame-based metrics are unavailable.
+        durations = []
+        for task in tasks:
+            if task.get("Stat") == 5:
+                start_time = _parse_task_datetime(task.get("StartRen"))
+                comp_time = _parse_task_datetime(task.get("Comp"))
+                if start_time is None or comp_time is None or comp_time <= start_time:
+                    continue
+                duration_val = (comp_time - start_time).total_seconds()
+                durations.append(duration_val)
+
+        if durations:
+            avg_duration = sum(durations) / len(durations)
+            remaining = total_tasks - completed_chunks
+            total_eta_seconds = avg_duration * remaining
+            if total_eta_seconds > 0:
+                eta_td = timedelta(seconds=int(total_eta_seconds))
+                eta_str = str(eta_td)
     except Exception as exc:  # pragma: no cover - defensive
         logger.error("Error calculating ETA: %s", exc)
     return eta_str
@@ -563,10 +781,16 @@ async def job_info_callback(callback_query: CallbackQuery) -> None:
             name = full_name.split("/")[-1] if "/" in full_name else full_name
             stat = job.get("Stat", 0)
             stat_name = settings.job_status_map.get(stat, "Unknown")
+            current_job_id = job.get("_id")
 
             eta_str = "N/A"
             if stat in {1, 6}:
-                eta_str = _calculate_eta(tasks or [], total_tasks, completed_chunks)
+                eta_str = _calculate_eta(
+                    current_job_id,
+                    tasks or [],
+                    total_tasks,
+                    completed_chunks,
+                )
 
             indent = ""
             info_lines = [
@@ -580,7 +804,6 @@ async def job_info_callback(callback_query: CallbackQuery) -> None:
                 info_lines.append(f"{indent}⏱️ ETA: <code>{html.escape(str(eta_str))}</code>")
             info_text = "\n".join(info_lines)
 
-            current_job_id = job.get("_id")
             is_preview_job, preview_source_id = _extract_preview_meta(props)
             buttons = _build_job_action_buttons(
                 current_job_id,
@@ -644,7 +867,12 @@ async def job_update_callback(callback_query: CallbackQuery) -> None:
 
         eta_str = "N/A"
         if stat in {1, 6}:
-            eta_str = _calculate_eta(tasks or [], total_tasks, completed_chunks)
+            eta_str = _calculate_eta(
+                job_id,
+                tasks or [],
+                total_tasks,
+                completed_chunks,
+            )
 
         info_lines = [
             "Job Info:",
