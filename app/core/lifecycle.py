@@ -88,10 +88,10 @@ async def on_startup(bot) -> None:
         replace_existing=True,
     )
 
-    def cleanup_preview_tokens() -> None:
+    async def cleanup_preview_tokens() -> None:
         from app.core.preview_upload import cleanup_preview_upload_tokens
 
-        asyncio.create_task(cleanup_preview_upload_tokens())
+        await cleanup_preview_upload_tokens()
 
     scheduler.add_job(
         cleanup_preview_tokens,

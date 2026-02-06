@@ -46,10 +46,8 @@ class PreviewUploadTokenStore:
         self._schema_ready = False
         self._schema_lock = asyncio.Lock()
 
-    async def _open_db(self) -> aiosqlite.Connection:
-        conn = await aiosqlite.connect(settings.sqlite_db_path)
-        await conn.execute("PRAGMA journal_mode=WAL")
-        return conn
+    def _open_db(self) -> aiosqlite.Connection:
+        return aiosqlite.connect(settings.sqlite_db_path)
 
     async def _ensure_schema(self, conn: aiosqlite.Connection) -> None:
         if self._schema_ready:
@@ -134,7 +132,8 @@ class PreviewUploadTokenStore:
         token = secrets.token_urlsafe(32)
         now = int(time.time())
         expires_at = now + self._ttl_seconds
-        async with await self._open_db() as conn:
+        async with self._open_db() as conn:
+            await conn.execute("PRAGMA journal_mode=WAL")
             await self._ensure_schema(conn)
             await conn.execute(
                 """
@@ -149,7 +148,8 @@ class PreviewUploadTokenStore:
         return token
 
     async def update(self, token: str, **updates: object) -> bool:
-        async with await self._open_db() as conn:
+        async with self._open_db() as conn:
+            await conn.execute("PRAGMA journal_mode=WAL")
             await self._ensure_schema(conn)
             async with conn.execute(
                 "SELECT expires_at, payload_json FROM preview_upload_tokens WHERE token = ?",
@@ -179,7 +179,8 @@ class PreviewUploadTokenStore:
             return True
 
     async def get(self, token: str) -> Optional[PreviewUploadPayload]:
-        async with await self._open_db() as conn:
+        async with self._open_db() as conn:
+            await conn.execute("PRAGMA journal_mode=WAL")
             await self._ensure_schema(conn)
             async with conn.execute(
                 "SELECT expires_at, payload_json FROM preview_upload_tokens WHERE token = ?",
@@ -199,20 +200,23 @@ class PreviewUploadTokenStore:
         payload = await self.get(token)
         if payload is None:
             return None
-        async with await self._open_db() as conn:
+        async with self._open_db() as conn:
+            await conn.execute("PRAGMA journal_mode=WAL")
             await self._ensure_schema(conn)
             await conn.execute("DELETE FROM preview_upload_tokens WHERE token = ?", (token,))
             await conn.commit()
         return payload
 
     async def drop(self, token: str) -> None:
-        async with await self._open_db() as conn:
+        async with self._open_db() as conn:
+            await conn.execute("PRAGMA journal_mode=WAL")
             await self._ensure_schema(conn)
             await conn.execute("DELETE FROM preview_upload_tokens WHERE token = ?", (token,))
             await conn.commit()
 
     async def cleanup(self) -> None:
-        async with await self._open_db() as conn:
+        async with self._open_db() as conn:
+            await conn.execute("PRAGMA journal_mode=WAL")
             await self._ensure_schema(conn)
             await self._cleanup(conn)
             await conn.commit()

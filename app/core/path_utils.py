@@ -42,17 +42,38 @@ def normalize_display_path(path: Optional[str]) -> Optional[str]:
 def normalize_dropbox_path(path: Optional[str]) -> Optional[str]:
     if not path:
         return None
-    normalized = str(path).replace("\\", "/").strip()
-    if not normalized:
+    raw = str(path).replace("\\", "/").strip()
+    if not raw:
         return None
-    return f"/{normalized.lstrip('/')}"
+
+    # Strip optional Windows drive prefix (e.g. "Y:/").
+    if len(raw) >= 2 and raw[1] == ":" and raw[0].isalpha():
+        raw = raw[2:]
+
+    parts = []
+    for part in raw.split("/"):
+        part = part.strip()
+        if not part or part == ".":
+            continue
+        if part == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(part)
+
+    if not parts:
+        return None
+    return "/" + "/".join(parts)
 
 
 def extract_dropbox_path(fullpath: Optional[str], root_marker: str) -> Optional[str]:
-    if not fullpath or not root_marker:
+    if not fullpath:
         return None
-    idx = str(fullpath).find(root_marker)
-    if idx == -1:
-        return None
-    trimmed = str(fullpath)[idx:]
-    return normalize_dropbox_path(trimmed)
+    full = str(fullpath)
+    if root_marker:
+        idx = full.find(root_marker)
+        if idx != -1:
+            trimmed = full[idx:]
+            return normalize_dropbox_path(trimmed)
+    # Fallback for drive-letter paths without an explicit root marker.
+    return normalize_dropbox_path(full)
