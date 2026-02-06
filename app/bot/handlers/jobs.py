@@ -230,7 +230,12 @@ def _compute_progress_from_tasks(tasks: list[dict], total_tasks: int) -> str | N
         if abs(completed - round(completed)) < 0.05
         else f"{completed:.1f}"
     )
-    return f"{percent}% {done_str}/{total_frames}"
+    total_str = (
+        str(int(round(total_frames)))
+        if abs(total_frames - round(total_frames)) < 0.05
+        else f"{total_frames:.1f}"
+    )
+    return f"{percent}% {done_str}/{total_str}"
 
 def _build_jobs_overview(
     combined_jobs: list[dict],
