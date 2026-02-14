@@ -151,7 +151,8 @@ async def _fetch_jobs_by_credentials(
 
     if use_cache:
         async with _jobs_cache_lock:
-            _jobs_cache[cache_key] = (now + _JOBS_CACHE_TTL_SECONDS, data)
+            expires_at = time.monotonic() + _JOBS_CACHE_TTL_SECONDS
+            _jobs_cache[cache_key] = (expires_at, data)
             _prune_jobs_cache()
     return data
 
@@ -192,6 +193,22 @@ async def get_jobs_list(telegram_user_id: int) -> List[Dict[str, Any]]:
         default=[],
         operation_name="get jobs",
         call=_op,
+    )
+
+
+async def get_jobs_by_credentials(
+    login: str,
+    password: str,
+    *,
+    use_cache: bool = True,
+    force_refresh: bool = False,
+) -> List[Dict[str, Any]]:
+    """Return Deadline jobs for provided credentials (cached by login by default)."""
+    return await _fetch_jobs_by_credentials(
+        login,
+        password,
+        use_cache=use_cache,
+        force_refresh=force_refresh,
     )
 
 

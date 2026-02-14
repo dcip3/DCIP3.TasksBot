@@ -1,24 +1,32 @@
-"""Background watcher for job completion, notifications, and auto-preview workflows."""
+"""Background watcher for preview completion and auto-preview workflows."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from app.auth import _decrypt_password
-from app.core.bot_core import notified_jobs
+from app.core.bot_core import auto_preview_jobs, notified_jobs
 from app.core.config import settings
 from app.storage.database import get_db_connection
 from app.services.preview.runtime import (
     _notify_preview_job_completion,
     _notify_preview_job_failure,
+    _run_auto_preview_for_job,
     preview_message_registry,
 )
+from app.storage.user_settings import VALID_PREVIEW_RENDER_METHODS, _normalize_scope
 
 logger = logging.getLogger(__name__)
+
+_AUTO_PREVIEW_SCAN_INTERVAL_SECONDS = 30
+_AUTO_PREVIEW_HISTORY_RETENTION_SECONDS = 14 * 24 * 60 * 60
+_AUTO_PREVIEW_HISTORY_CLEANUP_INTERVAL_SECONDS = 60 * 60
+_last_auto_preview_history_cleanup_monotonic = 0.0
 
 
 @dataclass(slots=True)
@@ -26,6 +34,23 @@ class _WatcherUser:
     telegram_user_id: int
     login: str
     password: str
+    notifications_enabled: bool
+    notification_scope: str
+    auto_scope: str
+    preview_method: Optional[str]
+    preview_worker: Optional[str]
+    auto_preview_enabled: bool
+
+
+def _job_matches_scope(scope_value: str, login_value: str, props: dict, job_entry: dict) -> bool:
+    if scope_value != "own":
+        return True
+    job_owner = props.get("User") or job_entry.get("UserName") or ""
+    if not job_owner:
+        return False
+    normalized_login = str(login_value).split("\\")[-1].split("/")[-1].lower()
+    normalized_owner = str(job_owner).split("\\")[-1].split("/")[-1].lower()
+    return normalized_owner == normalized_login
 
 
 def _extract_preview_owner_id(props: dict, job_id: str) -> Optional[int]:
@@ -100,7 +125,13 @@ async def _load_watcher_users() -> list[_WatcherUser]:
             """
             SELECT telegram_user_id,
                    deadline_login,
-                   deadline_password
+                   deadline_password,
+                   notifications_enabled,
+                   notification_scope,
+                   preview_default_method,
+                   preview_default_worker,
+                   preview_auto_enabled,
+                   preview_auto_scope
             FROM user_sessions
             """
         ) as cursor:
@@ -111,18 +142,43 @@ async def _load_watcher_users() -> list[_WatcherUser]:
 
     users: list[_WatcherUser] = []
     for row in user_rows:
-        user_id, login, encrypted_password = row
+        (
+            user_id,
+            login,
+            encrypted_password,
+            notifications_enabled,
+            scope_raw,
+            preview_method_raw,
+            preview_worker,
+            preview_auto_enabled,
+            preview_auto_scope_raw,
+        ) = row
+
+        if not user_id or not login or not encrypted_password:
+            continue
 
         try:
             decrypted_password = _decrypt_password(encrypted_password)
         except Exception:
             decrypted_password = encrypted_password
 
+        scope = _normalize_scope(scope_raw)
+        auto_scope = _normalize_scope(preview_auto_scope_raw) if preview_auto_scope_raw else scope
+        preview_method = (preview_method_raw or "").strip().lower()
+        if preview_method not in VALID_PREVIEW_RENDER_METHODS:
+            preview_method = None
+
         users.append(
             _WatcherUser(
                 telegram_user_id=int(user_id),
                 login=str(login),
                 password=str(decrypted_password),
+                notifications_enabled=bool(notifications_enabled),
+                notification_scope=scope,
+                auto_scope=auto_scope,
+                preview_method=preview_method,
+                preview_worker=preview_worker,
+                auto_preview_enabled=bool(preview_auto_enabled),
             )
         )
 
@@ -201,6 +257,7 @@ async def _process_active_preview_job(
 
     if notified_key in notified_jobs:
         return
+
     notified_user_id = await _notify_preview_job_completion(
         user.telegram_user_id,
         job,
@@ -237,35 +294,217 @@ async def _process_active_previews_parallel(
             )
 
 
+async def _register_auto_preview_history(telegram_user_id: int, job_id: str) -> bool:
+    """Return True only for new (user, job) pairs, False when already processed."""
+    conn = get_db_connection()
+    if conn is None:
+        return True
+
+    try:
+        async with conn.execute(
+            """
+            SELECT 1
+            FROM auto_preview_history
+            WHERE telegram_user_id = ? AND job_id = ?
+            LIMIT 1
+            """,
+            (telegram_user_id, job_id),
+        ) as cursor:
+            if await cursor.fetchone():
+                return False
+
+        await conn.execute(
+            """
+            INSERT OR IGNORE INTO auto_preview_history (telegram_user_id, job_id, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (telegram_user_id, job_id, int(time.time())),
+        )
+        await conn.commit()
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Watcher: failed to access auto_preview_history for user %s job %s: %s",
+            telegram_user_id,
+            job_id,
+            exc,
+        )
+        # Fallback to in-memory dedupe only.
+        return True
+
+
+async def _maybe_cleanup_auto_preview_history() -> None:
+    global _last_auto_preview_history_cleanup_monotonic
+
+    now = time.monotonic()
+    if (now - _last_auto_preview_history_cleanup_monotonic) < _AUTO_PREVIEW_HISTORY_CLEANUP_INTERVAL_SECONDS:
+        return
+
+    _last_auto_preview_history_cleanup_monotonic = now
+    conn = get_db_connection()
+    if conn is None:
+        return
+
+    cutoff = int(time.time()) - _AUTO_PREVIEW_HISTORY_RETENTION_SECONDS
+    try:
+        await conn.execute(
+            "DELETE FROM auto_preview_history WHERE created_at < ?",
+            (cutoff,),
+        )
+        await conn.commit()
+    except Exception as exc:
+        logger.warning("Watcher: failed to cleanup auto_preview_history: %s", exc)
+
+
+async def _scan_auto_preview_candidates(users: list[_WatcherUser]) -> int:
+    """Find newly completed non-preview jobs and enqueue auto-preview generation."""
+    from app.services.deadline import get_jobs_by_credentials
+
+    auto_users = [
+        user
+        for user in users
+        if user.auto_preview_enabled and user.preview_method in {"server", "deadline"}
+    ]
+    if not auto_users:
+        return 0
+
+    await _maybe_cleanup_auto_preview_history()
+
+    max_parallel = min(4, max(1, len(auto_users)))
+    semaphore = asyncio.Semaphore(max_parallel)
+
+    async def _scan_user(user: _WatcherUser) -> int:
+        async with semaphore:
+            try:
+                jobs = await get_jobs_by_credentials(
+                    user.login,
+                    user.password,
+                    use_cache=True,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Watcher: failed to load jobs for auto-preview user %s: %s",
+                    user.telegram_user_id,
+                    exc,
+                )
+                return 0
+
+            scheduled = 0
+            for job in jobs:
+                if not isinstance(job, dict):
+                    continue
+
+                job_id_raw = job.get("_id")
+                job_id = str(job_id_raw).strip() if job_id_raw else ""
+                if not job_id:
+                    continue
+
+                props = job.get("Props") or {}
+                if not isinstance(props, dict):
+                    props = {}
+
+                if _is_preview_job(props):
+                    continue
+
+                if job.get("Stat", 0) != 3:
+                    continue
+
+                if not _is_recently_completed(job, props):
+                    continue
+
+                if not _job_matches_scope(user.auto_scope, user.login, props, job):
+                    continue
+
+                auto_key = (job_id, user.telegram_user_id)
+                if auto_key in auto_preview_jobs:
+                    continue
+
+                is_new = await _register_auto_preview_history(user.telegram_user_id, job_id)
+                if not is_new:
+                    auto_preview_jobs.add(auto_key)
+                    continue
+
+                auto_preview_jobs.add(auto_key)
+                job_name = str(props.get("Name") or "").split("/")[-1] or job_id
+                asyncio.create_task(
+                    _run_auto_preview_for_job(
+                        user.telegram_user_id,
+                        job_id,
+                        job_name,
+                        user.login,
+                        user.password,
+                        user.preview_method,
+                        user.preview_worker,
+                    )
+                )
+                scheduled += 1
+
+            return scheduled
+
+    tasks = [asyncio.create_task(_scan_user(user)) for user in auto_users]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    total_scheduled = 0
+    for user, result in zip(auto_users, results):
+        if isinstance(result, Exception):
+            logger.error(
+                "Watcher: auto-preview scan failed for user %s: %s",
+                user.telegram_user_id,
+                result,
+            )
+            continue
+        total_scheduled += int(result)
+
+    return total_scheduled
+
+
 async def job_progress_watcher(bot) -> None:
-    """Monitor active preview jobs and send completion/failure notifications."""
+    """Monitor active preview jobs and auto-preview candidates."""
+    del bot  # Runtime preview helpers use shared bot instance from bot_core.
+
+    next_interval = settings.job_watcher_interval_normal
+    next_auto_scan_at = 0.0
     try:
         while True:
-            has_active_previews = len(preview_message_registry) > 0
-            sleep_interval = (
-                settings.job_watcher_interval_preview
-                if has_active_previews
-                else settings.job_watcher_interval_normal
-            )
-
-            if has_active_previews:
-                logger.debug(
-                    "Active preview jobs: %s, using fast polling (%ss)",
-                    len(preview_message_registry),
-                    sleep_interval,
-                )
-
-            await asyncio.sleep(sleep_interval)
-            if not has_active_previews:
-                continue
-
+            loop_started = time.monotonic()
             users = await _load_watcher_users()
-            targets = _collect_active_preview_targets(users)
-            logger.info(
-                "Job progress watcher: Monitoring %d active preview jobs for %d users",
-                len(targets),
-                len(users),
+
+            active_targets = _collect_active_preview_targets(users)
+            if active_targets:
+                logger.debug(
+                    "Watcher: processing %d active preview jobs",
+                    len(active_targets),
+                )
+                await _process_active_previews_parallel(active_targets)
+
+            auto_enabled_users = [
+                user
+                for user in users
+                if user.auto_preview_enabled and user.preview_method in {"server", "deadline"}
+            ]
+            scheduled_count = 0
+            auto_scan_interval = min(
+                settings.job_watcher_interval_normal,
+                _AUTO_PREVIEW_SCAN_INTERVAL_SECONDS,
             )
-            await _process_active_previews_parallel(targets)
+            if auto_enabled_users and loop_started >= next_auto_scan_at:
+                scheduled_count = await _scan_auto_preview_candidates(auto_enabled_users)
+                next_auto_scan_at = loop_started + auto_scan_interval
+                if scheduled_count:
+                    logger.info(
+                        "Watcher: scheduled %d auto-preview job(s)",
+                        scheduled_count,
+                    )
+            elif not auto_enabled_users:
+                next_auto_scan_at = 0.0
+
+            if active_targets:
+                next_interval = settings.job_watcher_interval_preview
+            elif auto_enabled_users:
+                next_interval = auto_scan_interval
+            else:
+                next_interval = settings.job_watcher_interval_normal
+
+            await asyncio.sleep(next_interval)
     except asyncio.CancelledError:
         logger.info("Job progress watcher cancelled")

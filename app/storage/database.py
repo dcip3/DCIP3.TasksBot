@@ -6,6 +6,7 @@ and provides basic database operations for the application.
 """
 
 import logging
+import time
 from pathlib import Path
 import aiosqlite
 from app.core.config import settings
@@ -72,6 +73,24 @@ async def init_db():
         CREATE INDEX IF NOT EXISTS idx_preview_upload_tokens_expires
         ON preview_upload_tokens(expires_at)
     """)
+
+    # Persist auto-preview dedupe history across restarts
+    await tasks_db_conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS auto_preview_history (
+            telegram_user_id INTEGER NOT NULL,
+            job_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (telegram_user_id, job_id)
+        )
+        """
+    )
+    await tasks_db_conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_auto_preview_history_created_at
+        ON auto_preview_history(created_at)
+        """
+    )
     
     # Create indexes for better performance
     await tasks_db_conn.execute("""
@@ -167,6 +186,16 @@ async def init_db():
             "Failed to backfill preview_auto_scope: %s",
             update_error,
         )
+
+    try:
+        cutoff = int(time.time()) - (14 * 24 * 60 * 60)
+        await tasks_db_conn.execute(
+            "DELETE FROM auto_preview_history WHERE created_at < ?",
+            (cutoff,),
+        )
+        await tasks_db_conn.commit()
+    except Exception as cleanup_error:
+        logger.warning("Failed to cleanup stale auto_preview_history rows: %s", cleanup_error)
 
     await tasks_db_conn.commit()
     logger.info("Database initialized successfully")
