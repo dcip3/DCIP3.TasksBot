@@ -17,7 +17,7 @@ from app.bot.job_helpers import (
     truncate_cell,
 )
 from app.core.config import settings
-from app.core.ui_helpers import authorized_only
+from app.core.ui_helpers import authorized_only, back_inline_button, inline_button
 from app.services.deadline import (
     delete_job_by_user_id,
     get_job_tasks_by_user_id,
@@ -300,12 +300,13 @@ def _build_jobs_overview(
         total_pages = (total_items + JOBS_PAGE_SIZE - 1) // JOBS_PAGE_SIZE
         nav_buttons = []
         if page > 0:
-            nav_buttons.append(
-                InlineKeyboardButton(text="⬅️ Back", callback_data=f"jobs_page:{page-1}")
-            )
+            nav_buttons.append(back_inline_button(callback_data=f"jobs_page:{page-1}"))
         if (page + 1) < total_pages:
             nav_buttons.append(
-                InlineKeyboardButton(text="Next ➡️", callback_data=f"jobs_page:{page+1}")
+                back_inline_button(
+                    callback_data=f"jobs_page:{page+1}",
+                    text="Next ➡️",
+                )
             )
         if nav_buttons:
             inline_keyboard.append(nav_buttons)
@@ -571,13 +572,17 @@ def _build_job_info_keyboard(
     if job_id:
         inline_keyboard.append(
             [
-                InlineKeyboardButton(text="⬅️ Back", callback_data="jobs_back"),
-                InlineKeyboardButton(text="🔄 Update", callback_data=f"job_update:{job_id}"),
+                back_inline_button(callback_data="jobs_back"),
+                inline_button(
+                    text="🔄 Update",
+                    callback_data=f"job_update:{job_id}",
+                    style="primary",
+                ),
             ]
         )
     else:
         inline_keyboard.append(
-            [InlineKeyboardButton(text="⬅️ Back", callback_data="jobs_back")]
+            [back_inline_button(callback_data="jobs_back")]
         )
 
     return InlineKeyboardMarkup(inline_keyboard=inline_keyboard)

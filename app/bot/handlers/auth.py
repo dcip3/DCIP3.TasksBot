@@ -3,7 +3,7 @@ from aiogram import F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 
 from app.auth import (
     authenticate_user,
@@ -11,7 +11,7 @@ from app.auth import (
     logout_user,
     save_deadline_credentials,
 )
-from app.core.ui_helpers import get_main_keyboard
+from app.core.ui_helpers import cancel_inline_button, get_main_keyboard
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +21,7 @@ def build_login_cancel_keyboard() -> InlineKeyboardMarkup:
     """Inline keyboard to cancel login flow."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✖️ Cancel", callback_data="login_cancel")]
+            [cancel_inline_button(callback_data="login_cancel")]
         ]
     )
 

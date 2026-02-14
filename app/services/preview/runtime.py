@@ -14,6 +14,7 @@ from aiogram.exceptions import TelegramRetryAfter
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 
 from app.core.bot_core import bot
+from app.core.ui_helpers import cancel_inline_button
 from app.integrations.video_helpers import get_file_size_mb, prepare_video_for_delivery
 
 logger = logging.getLogger(__name__)
@@ -55,7 +56,7 @@ async def _run_preview_animation(preview_job_id: str, chat_id: int, message_id: 
 
     cancel_keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✖️ Cancel", callback_data=f"preview_job_cancel:{preview_job_id}")]
+            [cancel_inline_button(callback_data=f"preview_job_cancel:{preview_job_id}")]
         ]
     )
 
@@ -687,10 +688,7 @@ async def _submit_auto_preview_deadline(
         InlineKeyboardMarkup(
             inline_keyboard=[
                 [
-                    InlineKeyboardButton(
-                        text="✖️ Cancel",
-                        callback_data=f"preview_job_cancel:{preview_id}",
-                    )
+                    cancel_inline_button(callback_data=f"preview_job_cancel:{preview_id}")
                 ]
             ]
         )

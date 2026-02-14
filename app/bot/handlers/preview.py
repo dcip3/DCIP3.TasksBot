@@ -19,6 +19,7 @@ from app.core.bot_core import bot, download_states, stop_downloads
 from app.core.config import settings
 from app.core.path_utils import extract_dropbox_path
 from app.core.preview_text import build_preview_caption
+from app.core.ui_helpers import cancel_inline_button
 from app.core.maintenance import cleanup_old_files
 from app.integrations.dropbox_helpers import (
     count_exr_files,
@@ -272,10 +273,7 @@ def _build_render_method_keyboard(job_id: str) -> InlineKeyboardMarkup:
                 ),
             ],
             [
-                InlineKeyboardButton(
-                    text="✖️ Cancel",
-                    callback_data="preview_cancel",
-                )
+                cancel_inline_button(callback_data="preview_cancel")
             ],
         ]
     )
@@ -518,10 +516,7 @@ async def create_new_video_process(
             InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
-                        InlineKeyboardButton(
-                            text="✖️ Cancel",
-                            callback_data=f"preview_job_cancel:{preview_id}",
-                        )
+                        cancel_inline_button(callback_data=f"preview_job_cancel:{preview_id}")
                     ]
                 ]
             )
@@ -570,7 +565,7 @@ async def create_new_video_process(
                         text="🖥️ Select Worker", callback_data=f"preview_select_worker:{job_id}"
                     ),
                 ],
-                [InlineKeyboardButton(text="✖️ Cancel", callback_data="preview_cancel")],
+                [cancel_inline_button(callback_data="preview_cancel")],
             ]
         )
         if progress_msg:
@@ -769,10 +764,7 @@ async def preview_select_worker_callback(callback_query: CallbackQuery) -> None:
         )
         keyboard_rows.append(
             [
-                InlineKeyboardButton(
-                    text="✖️ Cancel",
-                    callback_data="preview_cancel",
-                )
+                cancel_inline_button(callback_data="preview_cancel")
             ]
         )
 
@@ -946,10 +938,7 @@ async def show_worker_selection_for_preview(callback_query: CallbackQuery, job_i
     )
     keyboard_rows.append(
         [
-            InlineKeyboardButton(
-                text="✖️ Cancel",
-                callback_data="preview_cancel",
-            )
+            cancel_inline_button(callback_data="preview_cancel")
         ]
     )
 

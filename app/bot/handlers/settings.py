@@ -22,7 +22,13 @@ from app.storage.user_settings import (
     set_preview_default_method,
     set_preview_default_worker,
 )
-from app.core.ui_helpers import authorized_only
+from app.core.ui_helpers import (
+    authorized_only,
+    back_inline_button,
+    close_inline_button,
+    inline_button,
+    selectable_inline_button,
+)
 from app.services.deadline import get_workers_list
 
 logger = logging.getLogger(__name__)
@@ -60,28 +66,25 @@ def _build_settings_root_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(
+                inline_button(
                     text="🔔 Notifications",
                     callback_data="settings:notifications",
                 )
             ],
             [
-                InlineKeyboardButton(
+                inline_button(
                     text="🎬 Preview",
                     callback_data="settings:preview",
                 )
             ],
             [
-                InlineKeyboardButton(
+                inline_button(
                     text="🛠️ Worker Setup",
                     callback_data="settings:setup_script",
                 )
             ],
             [
-                InlineKeyboardButton(
-                    text="✖️ Close",
-                    callback_data="settings:close",
-                ),
+                close_inline_button(callback_data="settings:close"),
             ],
         ]
     )
@@ -107,33 +110,33 @@ def _render_notification_settings_text(enabled: bool, scope: str) -> str:
 
 def _build_notification_keyboard(enabled: bool, scope: str) -> InlineKeyboardMarkup:
     scope_normalized = scope.lower()
-    enable_label = ("✅ " if enabled else "◻ ") + "Receive notifications"
-    all_jobs_label = ("✅ " if scope_normalized == "all" else "◻ ") + "All jobs"
-    own_jobs_label = ("✅ " if scope_normalized == "own" else "◻ ") + "My jobs only"
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(
-                    text=enable_label,
+                selectable_inline_button(
+                    text="Receive notifications",
                     callback_data="settings:notif:toggle",
+                    selected=enabled,
+                    prefix_unselected="◻ ",
                 )
             ],
             [
-                InlineKeyboardButton(
-                    text=all_jobs_label,
+                selectable_inline_button(
+                    text="All jobs",
                     callback_data="settings:notif:scope:all",
+                    selected=scope_normalized == "all",
+                    prefix_unselected="◻ ",
                 ),
-                InlineKeyboardButton(
-                    text=own_jobs_label,
+                selectable_inline_button(
+                    text="My jobs only",
                     callback_data="settings:notif:scope:own",
+                    selected=scope_normalized == "own",
+                    prefix_unselected="◻ ",
                 ),
             ],
             [
-                InlineKeyboardButton(
-                    text="⬅️ Back",
-                    callback_data="settings:back:root",
-                ),
+                back_inline_button(callback_data="settings:back:root"),
             ],
         ]
     )
@@ -223,11 +226,10 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
 
         keyboard_rows.append(
             [
-                InlineKeyboardButton(
-                    text="✅ Auto"
-                    if default_worker == PREVIEW_DEFAULT_WORKER_AUTO
-                    else "Auto",
+                selectable_inline_button(
+                    text="Auto",
                     callback_data="settings:preview:worker:set:auto",
+                    selected=default_worker == PREVIEW_DEFAULT_WORKER_AUTO,
                 )
             ]
         )
@@ -239,33 +241,27 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
                     worker = workers[j]
                     info = worker.get("Info", {})
                     worker_name = info.get("Name", "Unknown")
-                    display_name = (
-                        f"✅ {worker_name}" if worker_name == default_worker else worker_name
-                    )
                     row.append(
-                        InlineKeyboardButton(
-                            text=display_name,
+                        selectable_inline_button(
+                            text=worker_name,
                             callback_data=f"settings:preview:worker:set:{worker_name}",
+                            selected=worker_name == default_worker,
                         )
                     )
                 keyboard_rows.append(row)
 
         keyboard_rows.append(
             [
-                InlineKeyboardButton(
-                    text="✅ ❓ Always ask"
-                    if default_worker is None
-                    else "❓ Always ask",
+                selectable_inline_button(
+                    text="❓ Always ask",
                     callback_data="settings:preview:worker:set:none",
+                    selected=default_worker is None,
                 )
             ]
         )
         keyboard_rows.append(
             [
-                InlineKeyboardButton(
-                    text="⬅️ Back",
-                    callback_data="settings:preview",
-                ),
+                back_inline_button(callback_data="settings:preview"),
             ]
         )
 
@@ -296,10 +292,10 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
         ]
 
         def _button(label: str, method_value: str, selected: bool) -> InlineKeyboardButton:
-            prefix = "✅ " if selected else ""
-            return InlineKeyboardButton(
-                text=f"{prefix}{label}",
+            return selectable_inline_button(
+                text=label,
                 callback_data=f"settings:preview:method:set:{method_value}",
+                selected=selected,
             )
 
         keyboard_rows = [
@@ -315,10 +311,7 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
                 )
             ],
             [
-                InlineKeyboardButton(
-                    text="⬅️ Back",
-                    callback_data="settings:preview",
-                ),
+                back_inline_button(callback_data="settings:preview"),
             ],
         ]
 
@@ -344,28 +337,25 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
         ]
         keyboard_rows = [
             [
-                InlineKeyboardButton(
+                inline_button(
                     text="⚡ Auto Preview",
                     callback_data="settings:preview:auto",
                 ),
             ],
             [
-                InlineKeyboardButton(
+                inline_button(
                     text="🎛 Default Method",
                     callback_data="settings:preview:method",
                 ),
             ],
             [
-                InlineKeyboardButton(
+                inline_button(
                     text="🖥️ Default Worker",
                     callback_data="settings:preview:worker",
                 ),
             ],
             [
-                InlineKeyboardButton(
-                    text="⬅️ Back",
-                    callback_data="settings:back:root",
-                ),
+                back_inline_button(callback_data="settings:back:root"),
             ],
         ]
         await _edit_or_send(
@@ -389,32 +379,31 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
             "Auto preview creates previews automatically when jobs finish.",
         ]
 
-        toggle_label = "✅ Auto preview enabled" if auto_enabled else "☐ Auto preview enabled"
-        all_jobs_label = ("✅ " if auto_scope == "all" else "◻ ") + "All jobs"
-        own_jobs_label = ("✅ " if auto_scope == "own" else "◻ ") + "My jobs only"
-
         keyboard_rows = [
             [
-                InlineKeyboardButton(
-                    text=toggle_label,
+                selectable_inline_button(
+                    text="Auto preview enabled",
                     callback_data="settings:preview:auto:toggle",
+                    selected=auto_enabled,
+                    prefix_unselected="◻ ",
                 )
             ],
             [
-                InlineKeyboardButton(
-                    text=all_jobs_label,
+                selectable_inline_button(
+                    text="All jobs",
                     callback_data="settings:preview:auto:scope:all",
+                    selected=auto_scope == "all",
+                    prefix_unselected="◻ ",
                 ),
-                InlineKeyboardButton(
-                    text=own_jobs_label,
+                selectable_inline_button(
+                    text="My jobs only",
                     callback_data="settings:preview:auto:scope:own",
+                    selected=auto_scope == "own",
+                    prefix_unselected="◻ ",
                 ),
             ],
             [
-                InlineKeyboardButton(
-                    text="⬅️ Back",
-                    callback_data="settings:preview",
-                ),
+                back_inline_button(callback_data="settings:preview"),
             ],
         ]
 

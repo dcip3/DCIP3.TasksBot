@@ -15,6 +15,7 @@ from app.core.bot_core import bot, download_states, stop_downloads
 from app.core.config import settings
 from app.core.path_utils import extract_dropbox_path
 from app.core.preview_text import build_preview_caption
+from app.core.ui_helpers import cancel_inline_button
 from app.integrations.dropbox_helpers import (
     download_exr_folder,
     fetch_dropbox_metadata,
@@ -38,10 +39,7 @@ def _build_server_cancel_keyboard(job_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(
-                    text="✖️ Cancel",
-                    callback_data=f"preview_server_cancel:{job_id}",
-                )
+                cancel_inline_button(callback_data=f"preview_server_cancel:{job_id}")
             ]
         ]
     )
