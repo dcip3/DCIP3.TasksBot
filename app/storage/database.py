@@ -91,6 +91,19 @@ async def init_db():
         ON auto_preview_history(created_at)
         """
     )
+
+    # Persist pool mode/edit preferences used by Pools UI
+    await tasks_db_conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pool_profiles (
+            pool_name TEXT PRIMARY KEY,
+            mode TEXT NOT NULL DEFAULT 'manual',
+            disk_letter TEXT,
+            manual_workers_json TEXT,
+            updated_at INTEGER NOT NULL
+        )
+        """
+    )
     
     # Create indexes for better performance
     await tasks_db_conn.execute("""

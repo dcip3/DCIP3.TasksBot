@@ -38,6 +38,12 @@ from app.services.deadline import (
     save_worker_settings_by_user_id,
     suspend_job_by_user_id,
 )
+from app.storage.pool_profiles import (
+    delete_pool_profile,
+    get_pool_profile,
+    rename_pool_profile,
+    set_pool_profile,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,10 +68,16 @@ _POOL_NAME_COLUMN_WIDTH = BATCH_COLUMN_WIDTH
 _POOL_WORKERS_COLUMN_WIDTH = 7
 _DISK_INPUT_RE = re.compile(r"^\s*([A-Za-z])(?:\s*:[\\/]?)?\s*$")
 _DRIVE_LETTER_RE = re.compile(r"([A-Za-z]):[\\/]")
+_POOL_NAME_MAX_LENGTH = 64
 
 
 class PoolCreateStates(StatesGroup):
-    DISK_LETTER = State()
+    POOL_NAME = State()
+    CREATE_DISK_LETTER = State()
+    CREATE_MANUAL_SELECT = State()
+    RENAME_POOL = State()
+    EDIT_DISK_LETTER = State()
+    EDIT_MANUAL_SELECT = State()
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -662,6 +674,17 @@ def _resolve_pool_by_index(pools: list[str], pool_index: int) -> str | None:
     return sorted_pools[pool_index]
 
 
+def _pool_index_by_name(pools: list[str], pool_name: str) -> int | None:
+    sorted_pools = _sorted_pool_names(pools)
+    target = str(pool_name or "").strip()
+    if not target:
+        return None
+    for idx, item in enumerate(sorted_pools):
+        if item == target:
+            return idx
+    return None
+
+
 async def _load_pool_worker_counts(
     telegram_user_id: int,
     pool_names: list[str],
@@ -681,34 +704,134 @@ async def _load_pool_worker_counts(
     return counts
 
 
-def _build_pool_info_text(pool_name: str, worker_names: list[str]) -> str:
+def _normalize_worker_name_list(worker_names: list[str]) -> list[str]:
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for item in worker_names:
+        name = str(item or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        normalized.append(name)
+    return sorted(normalized, key=str.lower)
+
+
+def _normalize_pool_mode(raw_mode: str | None) -> str:
+    return "disk" if str(raw_mode or "").strip().lower() == "disk" else "manual"
+
+
+def _normalize_disk_letter_value(raw_letter: str | None) -> str | None:
+    if not raw_letter:
+        return None
+    text = str(raw_letter).strip().upper()
+    if len(text) == 1 and text.isalpha():
+        return text
+    return None
+
+
+def _infer_disk_letter_for_pool_name(pool_name: str) -> str | None:
+    display_pool = _display_pool_name(pool_name)
+    if len(display_pool) == 1 and display_pool.isalpha():
+        return display_pool.upper()
+    return None
+
+
+async def _get_pool_profile_for_ui(pool_name: str, current_workers: list[str]) -> dict:
+    profile = await get_pool_profile(pool_name)
+    if profile:
+        mode = _normalize_pool_mode(profile.get("mode"))
+        disk_letter = _normalize_disk_letter_value(profile.get("disk_letter"))
+        manual_workers = _normalize_worker_name_list(profile.get("manual_workers", []))
+    else:
+        mode = "manual"
+        disk_letter = None
+        manual_workers = _normalize_worker_name_list(current_workers)
+
+    if mode == "disk" and not disk_letter:
+        disk_letter = _infer_disk_letter_for_pool_name(pool_name)
+
+    return {
+        "mode": mode,
+        "disk_letter": disk_letter,
+        "manual_workers": manual_workers,
+    }
+
+
+def _pool_mode_text(mode: str, disk_letter: str | None) -> str:
+    if mode == "disk":
+        if disk_letter:
+            return f"Disk ({disk_letter}:)"
+        return "Disk"
+    return "Manual"
+
+
+def _build_pool_info_text(pool_name: str, worker_names: list[str], profile: dict) -> str:
     display_pool_name = _display_pool_name(pool_name)
-    sorted_workers = sorted((str(name).strip() for name in worker_names if str(name).strip()), key=str.lower)
+    sorted_workers = _normalize_worker_name_list(worker_names)
     sample = ", ".join(sorted_workers[:8]) if sorted_workers else "-"
     if len(sorted_workers) > 8:
         sample += f" (+{len(sorted_workers) - 8})"
 
-    inferred_disk = display_pool_name if len(display_pool_name) == 1 and display_pool_name.isalpha() else "N/A"
+    mode = _normalize_pool_mode(profile.get("mode"))
+    disk_letter = _normalize_disk_letter_value(profile.get("disk_letter"))
     return "\n".join(
         [
             "Pool Info:",
             f"🗂️ Name: <code>{html.escape(display_pool_name)}</code>",
-            f"💽 Disk Hint: <code>{html.escape(inferred_disk)}</code>",
+            f"🧭 Mode: <code>{html.escape(_pool_mode_text(mode, disk_letter))}</code>",
             f"🖥️ Workers: <code>{len(sorted_workers)}</code>",
             f"📋 Sample: <code>{html.escape(sample)}</code>",
         ]
     )
 
 
-def _build_pool_info_keyboard(page: int, pool_index: int) -> InlineKeyboardMarkup:
+def _build_pool_mode_keyboard(pool_index: int, page: int, mode: str) -> list[InlineKeyboardButton]:
+    mode_disk_selected = mode == "disk"
+    disk_text = "✅ By Disk" if mode_disk_selected else "☐ By Disk"
+    manual_text = "✅ Manual" if not mode_disk_selected else "☐ Manual"
+    return [
+        inline_button(
+            text=disk_text,
+            callback_data=f"pool_mode:{pool_index}:{page}:disk",
+            style="success" if mode_disk_selected else None,
+        ),
+        inline_button(
+            text=manual_text,
+            callback_data=f"pool_mode:{pool_index}:{page}:manual",
+            style="success" if not mode_disk_selected else None,
+        ),
+    ]
+
+
+def _build_pool_info_keyboard(page: int, pool_index: int, profile: dict) -> InlineKeyboardMarkup:
+    mode = _normalize_pool_mode(profile.get("mode"))
+    disk_letter = _normalize_disk_letter_value(profile.get("disk_letter"))
+    if mode == "disk":
+        disk_suffix = f" ({disk_letter}:)" if disk_letter else ""
+        mode_action_button = InlineKeyboardButton(
+            text=f"💽 Change Disk{disk_suffix}",
+            callback_data=f"pool_disk_start:{pool_index}:{page}",
+        )
+    else:
+        mode_action_button = InlineKeyboardButton(
+            text="👥 Select Workers",
+            callback_data=f"pool_manual_start:{pool_index}:{page}",
+        )
+
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
+                    text="✏️ Rename",
+                    callback_data=f"pool_rename_start:{pool_index}:{page}",
+                ),
+                InlineKeyboardButton(
                     text="🗑️ Delete Pool",
                     callback_data=f"pool_delete:{pool_index}:{page}",
-                )
+                ),
             ],
+            _build_pool_mode_keyboard(pool_index, page, mode),
+            [mode_action_button],
             [
                 back_inline_button(callback_data=f"pools_back:{page}"),
                 inline_button(
@@ -728,6 +851,108 @@ def _parse_disk_letter(raw_text: str | None) -> str | None:
     if not match:
         return None
     return match.group(1).upper()
+
+
+def _parse_pool_name(raw_text: str | None) -> str | None:
+    if raw_text is None:
+        return None
+    value = str(raw_text).strip()
+    if not value:
+        return None
+    if len(value) > _POOL_NAME_MAX_LENGTH:
+        return None
+    if value.lower() == "none":
+        return None
+    return value
+
+
+def _build_pool_create_mode_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                inline_button(
+                    text="💽 By Disk",
+                    callback_data="pool_create_mode:disk",
+                ),
+                inline_button(
+                    text="👥 Manual",
+                    callback_data="pool_create_mode:manual",
+                ),
+            ],
+            [cancel_inline_button(callback_data="pool_create_cancel")],
+        ]
+    )
+
+
+def _workers_for_page(workers: list[str], page: int, page_size: int = 8) -> tuple[list[str], int, int]:
+    sorted_workers = _normalize_worker_name_list(workers)
+    total_pages = max(1, (len(sorted_workers) + page_size - 1) // page_size)
+    normalized_page = max(0, min(page, total_pages - 1))
+    start = normalized_page * page_size
+    stop = start + page_size
+    return sorted_workers[start:stop], normalized_page, total_pages
+
+
+def _build_pool_manual_selector(
+    *,
+    pool_name: str,
+    all_workers: list[str],
+    selected_workers: list[str],
+    page: int,
+) -> tuple[str, InlineKeyboardMarkup]:
+    selected_set = set(_normalize_worker_name_list(selected_workers))
+    sorted_workers = _normalize_worker_name_list(all_workers)
+    workers_slice, page, total_pages = _workers_for_page(sorted_workers, page, page_size=8)
+    start_index = page * 8
+
+    lines = [
+        f"Pool: <code>{html.escape(_display_pool_name(pool_name))}</code>",
+        f"Selected workers: <code>{len(selected_set)}</code>",
+        f"Page {page+1} of {total_pages}",
+    ]
+    text = "\n".join(lines)
+
+    inline_keyboard: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for idx, worker_name in enumerate(workers_slice, start=start_index):
+        selected = worker_name in selected_set
+        label_prefix = "✅ " if selected else "☐ "
+        row.append(
+            InlineKeyboardButton(
+                text=f"{label_prefix}{truncate_cell(worker_name, 24)}",
+                callback_data=f"pool_manual_toggle:{idx}:{page}",
+            )
+        )
+        if len(row) == 2:
+            inline_keyboard.append(row)
+            row = []
+    if row:
+        inline_keyboard.append(row)
+
+    nav_buttons: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav_buttons.append(back_inline_button(callback_data=f"pool_manual_page:{page-1}"))
+    if (page + 1) < total_pages:
+        nav_buttons.append(
+            back_inline_button(
+                callback_data=f"pool_manual_page:{page+1}",
+                text="Next ➡️",
+            )
+        )
+    if nav_buttons:
+        inline_keyboard.append(nav_buttons)
+
+    inline_keyboard.append(
+        [
+            inline_button(
+                text="Apply",
+                callback_data="pool_manual_apply",
+                style="primary",
+            )
+        ]
+    )
+    inline_keyboard.append([cancel_inline_button(callback_data="pool_manual_cancel")])
+    return text, InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
 
 
 def _worker_has_drive_letter(worker: dict, disk_letter: str) -> bool:
@@ -758,8 +983,9 @@ async def _render_pool_details(
         return False
 
     workers = await get_workers_for_pool_by_user_id(callback_query.from_user.id, pool_name)
-    info_text = _build_pool_info_text(pool_name, workers)
-    keyboard = _build_pool_info_keyboard(page, pool_index)
+    profile = await _get_pool_profile_for_ui(pool_name, workers)
+    info_text = _build_pool_info_text(pool_name, workers, profile)
+    keyboard = _build_pool_info_keyboard(page, pool_index, profile)
     await _edit_or_send_job_info(callback_query.message, info_text, keyboard)
     if answer_text:
         await callback_query.answer(answer_text)
@@ -770,58 +996,213 @@ async def _render_pool_details(
 
 async def _sync_pool_from_disk(
     telegram_user_id: int,
+    pool_name: str,
     disk_letter: str,
 ) -> tuple[bool, str, str]:
-    pool_name = disk_letter.upper()
+    normalized_pool_name = str(pool_name or "").strip()
+    if not normalized_pool_name:
+        return False, "", "Pool name is required."
+
+    normalized_disk = disk_letter.upper()
     workers = await get_workers_list(telegram_user_id)
     matched_workers = sorted(
         {
             _worker_name(worker)
             for worker in workers
-            if _worker_has_drive_letter(worker, disk_letter.upper())
+            if _worker_has_drive_letter(worker, normalized_disk)
         },
         key=str.lower,
     )
 
     if not matched_workers:
-        return False, pool_name, f"No workers found with disk {disk_letter}:\\"
+        return False, normalized_pool_name, f"No workers found with disk {normalized_disk}:\\"
 
-    current_workers = await get_workers_for_pool_by_user_id(telegram_user_id, pool_name)
+    current_workers = await get_workers_for_pool_by_user_id(telegram_user_id, normalized_pool_name)
     current_set = {name for name in current_workers if name}
     target_set = set(matched_workers)
 
-    created = await add_pools_by_user_id(telegram_user_id, [pool_name])
+    created = await add_pools_by_user_id(telegram_user_id, [normalized_pool_name])
     if not created:
-        return False, pool_name, f"Failed to create or ensure pool '{pool_name}'."
+        return False, normalized_pool_name, f"Failed to create or ensure pool '{normalized_pool_name}'."
 
     assigned = await add_pools_to_workers_by_user_id(
         telegram_user_id,
         matched_workers,
-        [pool_name],
+        [normalized_pool_name],
         overwrite=False,
     )
     if not assigned:
-        return False, pool_name, f"Pool '{pool_name}' created, but assigning workers failed."
+        return False, normalized_pool_name, f"Pool '{normalized_pool_name}' created, but assigning workers failed."
 
     stale_workers = sorted(current_set - target_set, key=str.lower)
     if stale_workers:
         removed = await delete_pools_from_workers_by_user_id(
             telegram_user_id,
-            [pool_name],
+            [normalized_pool_name],
             stale_workers,
         )
         if not removed:
             return (
                 False,
-                pool_name,
-                f"Pool '{pool_name}' updated, but failed to remove stale workers.",
+                normalized_pool_name,
+                f"Pool '{normalized_pool_name}' updated, but failed to remove stale workers.",
             )
 
     return (
         True,
-        pool_name,
-        f"Pool '{pool_name}' synced from disk {disk_letter}:\\ ({len(matched_workers)} workers).",
+        normalized_pool_name,
+        f"Pool '{normalized_pool_name}' synced from disk {normalized_disk}:\\ ({len(matched_workers)} workers).",
     )
+
+
+async def _sync_pool_manual_workers(
+    telegram_user_id: int,
+    pool_name: str,
+    selected_workers: list[str],
+) -> tuple[bool, str]:
+    normalized_pool_name = str(pool_name or "").strip()
+    if not normalized_pool_name:
+        return False, "Pool name is required."
+
+    target_workers = _normalize_worker_name_list(selected_workers)
+    current_workers = _normalize_worker_name_list(
+        await get_workers_for_pool_by_user_id(telegram_user_id, normalized_pool_name)
+    )
+
+    created = await add_pools_by_user_id(telegram_user_id, [normalized_pool_name])
+    if not created:
+        return False, f"Failed to create or ensure pool '{normalized_pool_name}'."
+
+    if target_workers:
+        assigned = await add_pools_to_workers_by_user_id(
+            telegram_user_id,
+            target_workers,
+            [normalized_pool_name],
+            overwrite=False,
+        )
+        if not assigned:
+            return False, f"Pool '{normalized_pool_name}' created, but assigning workers failed."
+
+    stale_workers = sorted(set(current_workers) - set(target_workers), key=str.lower)
+    if stale_workers:
+        removed = await delete_pools_from_workers_by_user_id(
+            telegram_user_id,
+            [normalized_pool_name],
+            stale_workers,
+        )
+        if not removed:
+            return False, f"Pool '{normalized_pool_name}' updated, but failed to remove stale workers."
+
+    return True, f"Pool '{normalized_pool_name}' synced manually ({len(target_workers)} workers)."
+
+
+def _pool_cancel_keyboard(callback_data: str = "pool_create_cancel") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[cancel_inline_button(callback_data=callback_data)]])
+
+
+def _pool_prompt_parse_page(callback_data: str | None, prefix: str) -> int:
+    if not callback_data:
+        return 0
+    raw = callback_data.split(":", 1)
+    if len(raw) != 2 or raw[0] != prefix:
+        return 0
+    try:
+        return int(raw[1])
+    except ValueError:
+        return 0
+
+
+def _pool_manual_state_context(state_data: dict) -> str:
+    context = str(state_data.get("pool_manual_context") or "").strip().lower()
+    if context in {"create", "edit"}:
+        return context
+    return ""
+
+
+def _pool_manual_payload_from_state(state_data: dict) -> tuple[str, list[str], list[str], int]:
+    pool_name = str(state_data.get("pool_name") or "").strip()
+    all_workers = _normalize_worker_name_list(state_data.get("manual_all_workers") or [])
+    selected_raw = _normalize_worker_name_list(state_data.get("manual_selected_workers") or [])
+    all_workers_set = set(all_workers)
+    selected_workers = [name for name in selected_raw if name in all_workers_set]
+    try:
+        page = int(state_data.get("manual_page", 0) or 0)
+    except (TypeError, ValueError):
+        page = 0
+    return pool_name, all_workers, selected_workers, page
+
+
+async def _render_pools_overview_by_page(
+    message: Message,
+    telegram_user_id: int,
+    page: int,
+) -> None:
+    pools = await get_pool_names_by_user_id(telegram_user_id)
+    pools_slice, normalized_page, _ = _pool_names_for_page(pools, page=page)
+    pool_worker_counts = await _load_pool_worker_counts(telegram_user_id, pools_slice)
+    text, keyboard = _build_pools_overview(
+        pools,
+        page=normalized_page,
+        pool_worker_counts=pool_worker_counts,
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def _render_pool_details_by_name(
+    message: Message,
+    telegram_user_id: int,
+    pool_name: str,
+    page: int,
+) -> bool:
+    normalized_pool_name = str(pool_name or "").strip()
+    if not normalized_pool_name:
+        return False
+
+    pools = await get_pool_names_by_user_id(telegram_user_id)
+    pool_index = _pool_index_by_name(pools, normalized_pool_name)
+    if pool_index is None:
+        return False
+
+    workers = await get_workers_for_pool_by_user_id(telegram_user_id, normalized_pool_name)
+    profile = await _get_pool_profile_for_ui(normalized_pool_name, workers)
+    info_text = _build_pool_info_text(normalized_pool_name, workers, profile)
+    keyboard = _build_pool_info_keyboard(page, pool_index, profile)
+    await message.answer(info_text, parse_mode="HTML", reply_markup=keyboard)
+    return True
+
+
+async def _update_pool_manual_selector_message(
+    callback_query: CallbackQuery,
+    state: FSMContext,
+    *,
+    page: int | None = None,
+    answer_text: str | None = None,
+) -> bool:
+    if callback_query.message is None:
+        return False
+
+    state_data = await state.get_data()
+    pool_name, all_workers, selected_workers, current_page = _pool_manual_payload_from_state(state_data)
+    if not pool_name:
+        return False
+    normalized_page = current_page if page is None else page
+    text, keyboard = _build_pool_manual_selector(
+        pool_name=pool_name,
+        all_workers=all_workers,
+        selected_workers=selected_workers,
+        page=normalized_page,
+    )
+    _, normalized_page, _ = _workers_for_page(all_workers, normalized_page, page_size=8)
+    await state.update_data(
+        manual_page=normalized_page,
+        manual_selected_workers=selected_workers,
+    )
+    await _edit_or_send_job_info(callback_query.message, text, keyboard)
+    if answer_text:
+        await callback_query.answer(answer_text)
+    else:
+        await callback_query.answer()
+    return True
 
 
 def _resolve_batch_label(props: dict) -> str:
@@ -1865,6 +2246,8 @@ async def pool_delete_callback(callback_query: CallbackQuery) -> None:
             await callback_query.answer("Failed to delete pool.", show_alert=True)
             return
 
+        await delete_pool_profile(pool_name)
+
         pools_after = await get_pool_names_by_user_id(callback_query.from_user.id)
         pools_slice, normalized_page, _ = _pool_names_for_page(pools_after, page=page)
         pool_worker_counts = await _load_pool_worker_counts(callback_query.from_user.id, pools_slice)
@@ -1888,7 +2271,28 @@ async def pool_delete_callback(callback_query: CallbackQuery) -> None:
 
 @router.callback_query(lambda c: c.data and c.data.startswith("pool_create_start:"))
 async def pool_create_start_callback(callback_query: CallbackQuery, state: FSMContext) -> None:
-    """Start pool creation workflow by asking for disk letter."""
+    """Start pool creation workflow by asking for pool name."""
+    if callback_query.from_user is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+
+    page = _pool_prompt_parse_page(callback_query.data, "pool_create_start")
+    await state.clear()
+    await state.set_state(PoolCreateStates.POOL_NAME)
+    await state.update_data(pools_page=page)
+
+    if callback_query.message:
+        await callback_query.message.answer(
+            "Send <b>Pool Name</b> for the new pool.",
+            parse_mode="HTML",
+            reply_markup=_pool_cancel_keyboard("pool_create_cancel"),
+        )
+    await callback_query.answer("Waiting for pool name.")
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("pool_create_mode:"))
+async def pool_create_mode_callback(callback_query: CallbackQuery, state: FSMContext) -> None:
+    """Handle mode selection during pool creation."""
     if callback_query.from_user is None:
         await callback_query.answer("Invalid request.", show_alert=True)
         return
@@ -1896,30 +2300,50 @@ async def pool_create_start_callback(callback_query: CallbackQuery, state: FSMCo
         await callback_query.answer("Invalid callback data.", show_alert=True)
         return
 
-    page_str = callback_query.data.split(":", 1)[1]
-    try:
-        page = int(page_str)
-    except ValueError:
-        page = 0
+    parts = callback_query.data.split(":", 1)
+    if len(parts) != 2:
+        await callback_query.answer("Invalid mode.", show_alert=True)
+        return
+    target_mode = _normalize_pool_mode(parts[1])
 
-    await state.set_state(PoolCreateStates.DISK_LETTER)
-    await state.update_data(pools_page=page)
+    state_data = await state.get_data()
+    pool_name = str(state_data.get("pool_name") or "").strip()
+    if not pool_name:
+        await callback_query.answer("Pool name missing. Start again.", show_alert=True)
+        return
 
-    prompt = (
-        "Enter disk letter for the pool (example: <code>Z</code>).\n"
-        "Pool name will be created as that letter."
+    if target_mode == "disk":
+        await state.set_state(PoolCreateStates.CREATE_DISK_LETTER)
+        if callback_query.message:
+            await callback_query.message.answer(
+                "Send disk letter for this pool (example: <code>Z</code>).",
+                parse_mode="HTML",
+                reply_markup=_pool_cancel_keyboard("pool_create_cancel"),
+            )
+        await callback_query.answer("Waiting for disk letter.")
+        return
+
+    workers = await get_workers_list(callback_query.from_user.id)
+    all_worker_names = _normalize_worker_name_list([_worker_name(worker) for worker in workers])
+    selected_workers = _normalize_worker_name_list(
+        await get_workers_for_pool_by_user_id(callback_query.from_user.id, pool_name)
     )
-    cancel_keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[[cancel_inline_button(callback_data="pool_create_cancel")]]
+    await state.set_state(PoolCreateStates.CREATE_MANUAL_SELECT)
+    await state.update_data(
+        pool_manual_context="create",
+        manual_all_workers=all_worker_names,
+        manual_selected_workers=selected_workers,
+        manual_page=0,
     )
-
     if callback_query.message:
-        await callback_query.message.answer(
-            prompt,
-            parse_mode="HTML",
-            reply_markup=cancel_keyboard,
+        text, keyboard = _build_pool_manual_selector(
+            pool_name=pool_name,
+            all_workers=all_worker_names,
+            selected_workers=selected_workers,
+            page=0,
         )
-    await callback_query.answer("Send disk letter in chat.")
+        await _edit_or_send_job_info(callback_query.message, text, keyboard)
+    await callback_query.answer()
 
 
 @router.callback_query(lambda c: c.data == "pool_create_cancel")
@@ -1928,13 +2352,94 @@ async def pool_create_cancel_callback(callback_query: CallbackQuery, state: FSMC
     await state.clear()
     if callback_query.message:
         try:
-            await callback_query.message.edit_text("Pool creation cancelled.")
+            await callback_query.message.edit_text("Pool flow cancelled.")
         except Exception:
-            await callback_query.message.answer("Pool creation cancelled.")
-    await callback_query.answer("Cancelled.", show_alert=False)
+            await callback_query.message.answer("Pool flow cancelled.")
+    await callback_query.answer("Cancelled.")
 
 
-@router.message(StateFilter(PoolCreateStates.DISK_LETTER))
+@router.callback_query(lambda c: c.data == "pool_edit_cancel")
+async def pool_edit_cancel_callback(callback_query: CallbackQuery, state: FSMContext) -> None:
+    """Cancel pool edit flow and return to pool details when possible."""
+    if callback_query.from_user is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+
+    state_data = await state.get_data()
+    page = int(state_data.get("pools_page", 0) or 0)
+    pool_index_raw = state_data.get("pool_index")
+    pool_name = str(state_data.get("pool_name") or "").strip()
+    await state.clear()
+
+    pool_index: int | None
+    try:
+        pool_index = int(pool_index_raw)
+    except (TypeError, ValueError):
+        pool_index = None
+
+    if callback_query.message and pool_index is not None:
+        rendered = await _render_pool_details(callback_query, pool_index, page, answer_text="Cancelled.")
+        if rendered:
+            return
+
+    if callback_query.message and pool_name:
+        rendered = await _render_pool_details_by_name(
+            callback_query.message,
+            callback_query.from_user.id,
+            pool_name,
+            page,
+        )
+        if rendered:
+            await callback_query.answer("Cancelled.")
+            return
+
+    if callback_query.message:
+        try:
+            await callback_query.message.edit_text("Pool edit cancelled.")
+        except Exception:
+            await callback_query.message.answer("Pool edit cancelled.")
+    await callback_query.answer("Cancelled.")
+
+
+@router.message(StateFilter(PoolCreateStates.POOL_NAME))
+async def pool_create_pool_name_message(message: Message, state: FSMContext) -> None:
+    """Handle pool name input for pool creation."""
+    if message.from_user is None:
+        await message.answer("Error: user not found.")
+        return
+
+    pool_name = _parse_pool_name(message.text)
+    if pool_name is None:
+        await message.answer(
+            "Invalid pool name. Use 1-64 symbols, and avoid <code>none</code>.",
+            parse_mode="HTML",
+            reply_markup=_pool_cancel_keyboard("pool_create_cancel"),
+        )
+        return
+
+    pools = await get_pool_names_by_user_id(message.from_user.id)
+    existing_lut = {str(pool).strip().lower() for pool in pools}
+    if pool_name.lower() in existing_lut:
+        await message.answer(
+            "Pool already exists. Open it in Pools list and edit there.",
+            reply_markup=_pool_cancel_keyboard("pool_create_cancel"),
+        )
+        return
+
+    await state.update_data(pool_name=pool_name)
+    await message.answer(
+        "\n".join(
+            [
+                f"Pool Name: <code>{html.escape(_display_pool_name(pool_name))}</code>",
+                "Choose creation mode:",
+            ]
+        ),
+        parse_mode="HTML",
+        reply_markup=_build_pool_create_mode_keyboard(),
+    )
+
+
+@router.message(StateFilter(PoolCreateStates.CREATE_DISK_LETTER))
 async def pool_create_disk_letter_message(message: Message, state: FSMContext) -> None:
     """Handle disk letter input for pool creation."""
     if message.from_user is None:
@@ -1944,34 +2449,572 @@ async def pool_create_disk_letter_message(message: Message, state: FSMContext) -
     disk_letter = _parse_disk_letter(message.text)
     if disk_letter is None:
         await message.answer(
-            "Invalid input. Please send a single disk letter (example: <code>Z</code>).",
+            "Invalid input. Send a single disk letter (example: <code>Z</code>).",
             parse_mode="HTML",
+            reply_markup=_pool_cancel_keyboard("pool_create_cancel"),
         )
         return
 
     data = await state.get_data()
+    pool_name = str(data.get("pool_name") or "").strip()
     page = int(data.get("pools_page", 0) or 0)
+    if not pool_name:
+        await state.clear()
+        await message.answer("Pool name missing. Start again from Pools.")
+        return
 
-    success, _pool_name, status_message = await _sync_pool_from_disk(
+    success, _, status_message = await _sync_pool_from_disk(
         message.from_user.id,
+        pool_name,
         disk_letter,
     )
     if not success:
         await message.answer(f"❌ {status_message}")
         return
 
+    current_workers = await get_workers_for_pool_by_user_id(message.from_user.id, pool_name)
+    await set_pool_profile(
+        pool_name,
+        mode="disk",
+        disk_letter=disk_letter,
+        manual_workers=current_workers,
+    )
     await state.clear()
     await message.answer(f"✅ {status_message}")
+    rendered = await _render_pool_details_by_name(message, message.from_user.id, pool_name, page)
+    if not rendered:
+        await _render_pools_overview_by_page(message, message.from_user.id, page)
+
+
+@router.message(StateFilter(PoolCreateStates.EDIT_DISK_LETTER))
+async def pool_edit_disk_letter_message(message: Message, state: FSMContext) -> None:
+    """Handle disk letter input for pool edit mode."""
+    if message.from_user is None:
+        await message.answer("Error: user not found.")
+        return
+
+    disk_letter = _parse_disk_letter(message.text)
+    if disk_letter is None:
+        await message.answer(
+            "Invalid input. Send a single disk letter (example: <code>Z</code>).",
+            parse_mode="HTML",
+            reply_markup=_pool_cancel_keyboard("pool_edit_cancel"),
+        )
+        return
+
+    state_data = await state.get_data()
+    pool_name = str(state_data.get("pool_name") or "").strip()
+    page = int(state_data.get("pools_page", 0) or 0)
+    if not pool_name:
+        await state.clear()
+        await message.answer("Pool not found. Open Pools list and try again.")
+        return
+
+    success, _, status_message = await _sync_pool_from_disk(
+        message.from_user.id,
+        pool_name,
+        disk_letter,
+    )
+    if not success:
+        await message.answer(f"❌ {status_message}")
+        return
+
+    profile = await get_pool_profile(pool_name)
+    manual_workers = _normalize_worker_name_list((profile or {}).get("manual_workers", []))
+    await set_pool_profile(
+        pool_name,
+        mode="disk",
+        disk_letter=disk_letter,
+        manual_workers=manual_workers,
+    )
+    await state.clear()
+    await message.answer(f"✅ {status_message}")
+    rendered = await _render_pool_details_by_name(message, message.from_user.id, pool_name, page)
+    if not rendered:
+        await _render_pools_overview_by_page(message, message.from_user.id, page)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("pool_mode:"))
+async def pool_mode_callback(callback_query: CallbackQuery, state: FSMContext) -> None:
+    """Switch pool mode between disk and manual."""
+    if callback_query.from_user is None or callback_query.message is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    parts = callback_query.data.split(":", 3)
+    if len(parts) != 4:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    try:
+        pool_index = int(parts[1])
+        page = int(parts[2])
+    except ValueError:
+        await callback_query.answer("Invalid pool selection.", show_alert=True)
+        return
+    target_mode = _normalize_pool_mode(parts[3])
+
+    pools = await get_pool_names_by_user_id(callback_query.from_user.id)
+    pool_name = _resolve_pool_by_index(pools, pool_index)
+    if pool_name is None:
+        await callback_query.answer("Pool not found.", show_alert=True)
+        return
+
+    workers = await get_workers_for_pool_by_user_id(callback_query.from_user.id, pool_name)
+    profile = await _get_pool_profile_for_ui(pool_name, workers)
+    current_mode = _normalize_pool_mode(profile.get("mode"))
+    if current_mode == target_mode:
+        await callback_query.answer("Mode already selected.")
+        return
+
+    if target_mode == "manual":
+        await set_pool_profile(
+            pool_name,
+            mode="manual",
+            disk_letter=None,
+            manual_workers=workers,
+        )
+        await _render_pool_details(
+            callback_query,
+            pool_index,
+            page,
+            answer_text="Mode set to Manual.",
+        )
+        return
+
+    disk_letter = _normalize_disk_letter_value(profile.get("disk_letter")) or _infer_disk_letter_for_pool_name(
+        pool_name
+    )
+    if disk_letter is None:
+        await state.set_state(PoolCreateStates.EDIT_DISK_LETTER)
+        await state.update_data(
+            pool_name=pool_name,
+            pool_index=pool_index,
+            pools_page=page,
+        )
+        await callback_query.message.answer(
+            f"Send disk letter for pool <code>{html.escape(_display_pool_name(pool_name))}</code>.",
+            parse_mode="HTML",
+            reply_markup=_pool_cancel_keyboard("pool_edit_cancel"),
+        )
+        await callback_query.answer("Waiting for disk letter.")
+        return
+
+    success, _, status_message = await _sync_pool_from_disk(
+        callback_query.from_user.id,
+        pool_name,
+        disk_letter,
+    )
+    if not success:
+        await callback_query.answer(status_message, show_alert=True)
+        return
+
+    await set_pool_profile(
+        pool_name,
+        mode="disk",
+        disk_letter=disk_letter,
+        manual_workers=_normalize_worker_name_list(profile.get("manual_workers", [])),
+    )
+    await _render_pool_details(
+        callback_query,
+        pool_index,
+        page,
+        answer_text=status_message,
+    )
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("pool_disk_start:"))
+async def pool_disk_start_callback(callback_query: CallbackQuery, state: FSMContext) -> None:
+    """Start disk letter edit flow for a pool."""
+    if callback_query.from_user is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    parts = callback_query.data.split(":", 2)
+    if len(parts) != 3:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+    try:
+        pool_index = int(parts[1])
+        page = int(parts[2])
+    except ValueError:
+        await callback_query.answer("Invalid pool selection.", show_alert=True)
+        return
+
+    pools = await get_pool_names_by_user_id(callback_query.from_user.id)
+    pool_name = _resolve_pool_by_index(pools, pool_index)
+    if pool_name is None:
+        await callback_query.answer("Pool not found.", show_alert=True)
+        return
+
+    await state.set_state(PoolCreateStates.EDIT_DISK_LETTER)
+    await state.update_data(
+        pool_name=pool_name,
+        pool_index=pool_index,
+        pools_page=page,
+    )
+    if callback_query.message:
+        await callback_query.message.answer(
+            f"Send new disk letter for pool <code>{html.escape(_display_pool_name(pool_name))}</code>.",
+            parse_mode="HTML",
+            reply_markup=_pool_cancel_keyboard("pool_edit_cancel"),
+        )
+    await callback_query.answer("Waiting for disk letter.")
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("pool_manual_start:"))
+async def pool_manual_start_callback(callback_query: CallbackQuery, state: FSMContext) -> None:
+    """Open manual worker selector for a pool."""
+    if callback_query.from_user is None or callback_query.message is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    parts = callback_query.data.split(":", 2)
+    if len(parts) != 3:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+    try:
+        pool_index = int(parts[1])
+        page = int(parts[2])
+    except ValueError:
+        await callback_query.answer("Invalid pool selection.", show_alert=True)
+        return
+
+    pools = await get_pool_names_by_user_id(callback_query.from_user.id)
+    pool_name = _resolve_pool_by_index(pools, pool_index)
+    if pool_name is None:
+        await callback_query.answer("Pool not found.", show_alert=True)
+        return
+
+    workers = await get_workers_list(callback_query.from_user.id)
+    all_worker_names = _normalize_worker_name_list([_worker_name(worker) for worker in workers])
+    current_workers = _normalize_worker_name_list(
+        await get_workers_for_pool_by_user_id(callback_query.from_user.id, pool_name)
+    )
+    profile = await _get_pool_profile_for_ui(pool_name, current_workers)
+    selected_workers = _normalize_worker_name_list(profile.get("manual_workers") or current_workers)
+
+    await state.set_state(PoolCreateStates.EDIT_MANUAL_SELECT)
+    await state.update_data(
+        pool_manual_context="edit",
+        pool_name=pool_name,
+        pool_index=pool_index,
+        pools_page=page,
+        manual_all_workers=all_worker_names,
+        manual_selected_workers=selected_workers,
+        manual_page=0,
+    )
+    text, keyboard = _build_pool_manual_selector(
+        pool_name=pool_name,
+        all_workers=all_worker_names,
+        selected_workers=selected_workers,
+        page=0,
+    )
+    await _edit_or_send_job_info(callback_query.message, text, keyboard)
+    await callback_query.answer()
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("pool_manual_toggle:"))
+async def pool_manual_toggle_callback(callback_query: CallbackQuery, state: FSMContext) -> None:
+    """Toggle worker checkbox in manual selector."""
+    if callback_query.message is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    state_data = await state.get_data()
+    context = _pool_manual_state_context(state_data)
+    if not context:
+        await callback_query.answer("Manual selector is not active.", show_alert=True)
+        return
+
+    parts = callback_query.data.split(":", 2)
+    if len(parts) != 3:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+    try:
+        worker_index = int(parts[1])
+        page = int(parts[2])
+    except ValueError:
+        await callback_query.answer("Invalid worker selection.", show_alert=True)
+        return
+
+    _, all_workers, selected_workers, _ = _pool_manual_payload_from_state(state_data)
+    if worker_index < 0 or worker_index >= len(all_workers):
+        await callback_query.answer("Worker not found.", show_alert=True)
+        return
+
+    worker_name = all_workers[worker_index]
+    selected_set = set(selected_workers)
+    if worker_name in selected_set:
+        selected_set.remove(worker_name)
+    else:
+        selected_set.add(worker_name)
+    await state.update_data(manual_selected_workers=sorted(selected_set, key=str.lower))
+    await _update_pool_manual_selector_message(callback_query, state, page=page)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("pool_manual_page:"))
+async def pool_manual_page_callback(callback_query: CallbackQuery, state: FSMContext) -> None:
+    """Handle pagination inside manual selector."""
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    state_data = await state.get_data()
+    context = _pool_manual_state_context(state_data)
+    if not context:
+        await callback_query.answer("Manual selector is not active.", show_alert=True)
+        return
+
+    page = _pool_prompt_parse_page(callback_query.data, "pool_manual_page")
+    await _update_pool_manual_selector_message(callback_query, state, page=page)
+
+
+@router.callback_query(lambda c: c.data == "pool_manual_apply")
+async def pool_manual_apply_callback(callback_query: CallbackQuery, state: FSMContext) -> None:
+    """Apply selected workers for manual mode."""
+    if callback_query.from_user is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+
+    state_data = await state.get_data()
+    context = _pool_manual_state_context(state_data)
+    if not context:
+        await callback_query.answer("Manual selector is not active.", show_alert=True)
+        return
+
+    pool_name, _all_workers, selected_workers, _ = _pool_manual_payload_from_state(state_data)
+    if not pool_name:
+        await callback_query.answer("Pool name missing.", show_alert=True)
+        return
+    page = int(state_data.get("pools_page", 0) or 0)
+
+    success, status_message = await _sync_pool_manual_workers(
+        callback_query.from_user.id,
+        pool_name,
+        selected_workers,
+    )
+    if not success:
+        await callback_query.answer(status_message, show_alert=True)
+        return
+
+    await set_pool_profile(
+        pool_name,
+        mode="manual",
+        disk_letter=None,
+        manual_workers=selected_workers,
+    )
+    await state.clear()
+
+    if callback_query.message:
+        if context == "edit":
+            pools = await get_pool_names_by_user_id(callback_query.from_user.id)
+            pool_index = _pool_index_by_name(pools, pool_name)
+            if pool_index is not None:
+                rendered = await _render_pool_details(
+                    callback_query,
+                    pool_index,
+                    page,
+                    answer_text="Applied.",
+                )
+                if rendered:
+                    return
+            await _render_pools_overview_by_page(
+                callback_query.message,
+                callback_query.from_user.id,
+                page,
+            )
+        else:
+            await callback_query.message.answer(f"✅ {status_message}")
+            rendered = await _render_pool_details_by_name(
+                callback_query.message,
+                callback_query.from_user.id,
+                pool_name,
+                page,
+            )
+            if not rendered:
+                await _render_pools_overview_by_page(
+                    callback_query.message,
+                    callback_query.from_user.id,
+                    page,
+                )
+    await callback_query.answer("Applied.")
+
+
+@router.callback_query(lambda c: c.data == "pool_manual_cancel")
+async def pool_manual_cancel_callback(callback_query: CallbackQuery, state: FSMContext) -> None:
+    """Cancel manual selector."""
+    if callback_query.from_user is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+
+    state_data = await state.get_data()
+    context = _pool_manual_state_context(state_data)
+    pool_name = str(state_data.get("pool_name") or "").strip()
+    page = int(state_data.get("pools_page", 0) or 0)
+    await state.clear()
+
+    if callback_query.message:
+        if context == "edit" and pool_name:
+            pools = await get_pool_names_by_user_id(callback_query.from_user.id)
+            pool_index = _pool_index_by_name(pools, pool_name)
+            if pool_index is not None:
+                rendered = await _render_pool_details(
+                    callback_query,
+                    pool_index,
+                    page,
+                    answer_text="Cancelled.",
+                )
+                if rendered:
+                    return
+        try:
+            await callback_query.message.edit_text("Selection cancelled.")
+        except Exception:
+            await callback_query.message.answer("Selection cancelled.")
+    await callback_query.answer("Cancelled.")
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("pool_rename_start:"))
+async def pool_rename_start_callback(callback_query: CallbackQuery, state: FSMContext) -> None:
+    """Start pool rename flow."""
+    if callback_query.from_user is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    parts = callback_query.data.split(":", 2)
+    if len(parts) != 3:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+    try:
+        pool_index = int(parts[1])
+        page = int(parts[2])
+    except ValueError:
+        await callback_query.answer("Invalid pool selection.", show_alert=True)
+        return
+
+    pools = await get_pool_names_by_user_id(callback_query.from_user.id)
+    pool_name = _resolve_pool_by_index(pools, pool_index)
+    if pool_name is None:
+        await callback_query.answer("Pool not found.", show_alert=True)
+        return
+
+    await state.set_state(PoolCreateStates.RENAME_POOL)
+    await state.update_data(
+        pool_name=pool_name,
+        pool_index=pool_index,
+        pools_page=page,
+    )
+    if callback_query.message:
+        await callback_query.message.answer(
+            f"Send new name for pool <code>{html.escape(_display_pool_name(pool_name))}</code>.",
+            parse_mode="HTML",
+            reply_markup=_pool_cancel_keyboard("pool_edit_cancel"),
+        )
+    await callback_query.answer("Waiting for new name.")
+
+
+@router.message(StateFilter(PoolCreateStates.RENAME_POOL))
+async def pool_rename_message(message: Message, state: FSMContext) -> None:
+    """Handle pool rename input."""
+    if message.from_user is None:
+        await message.answer("Error: user not found.")
+        return
+
+    new_pool_name = _parse_pool_name(message.text)
+    if new_pool_name is None:
+        await message.answer(
+            "Invalid pool name. Use 1-64 symbols, and avoid <code>none</code>.",
+            parse_mode="HTML",
+            reply_markup=_pool_cancel_keyboard("pool_edit_cancel"),
+        )
+        return
+
+    state_data = await state.get_data()
+    old_pool_name = str(state_data.get("pool_name") or "").strip()
+    page = int(state_data.get("pools_page", 0) or 0)
+    if not old_pool_name:
+        await state.clear()
+        await message.answer("Pool not found. Open Pools and retry.")
+        return
+
+    if new_pool_name.lower() == old_pool_name.lower():
+        await message.answer(
+            "New name should differ from current one.",
+            reply_markup=_pool_cancel_keyboard("pool_edit_cancel"),
+        )
+        return
 
     pools = await get_pool_names_by_user_id(message.from_user.id)
-    pools_slice, normalized_page, _ = _pool_names_for_page(pools, page=page)
-    pool_worker_counts = await _load_pool_worker_counts(message.from_user.id, pools_slice)
-    text, keyboard = _build_pools_overview(
-        pools,
-        page=normalized_page,
-        pool_worker_counts=pool_worker_counts,
+    existing_lut = {str(pool).strip().lower() for pool in pools}
+    if new_pool_name.lower() in existing_lut:
+        await message.answer(
+            "Pool with this name already exists.",
+            reply_markup=_pool_cancel_keyboard("pool_edit_cancel"),
+        )
+        return
+
+    old_workers = await get_workers_for_pool_by_user_id(message.from_user.id, old_pool_name)
+    created = await add_pools_by_user_id(message.from_user.id, [new_pool_name])
+    if not created:
+        await message.answer("Failed to create new pool for rename.")
+        return
+
+    if old_workers:
+        assigned = await add_pools_to_workers_by_user_id(
+            message.from_user.id,
+            old_workers,
+            [new_pool_name],
+            overwrite=False,
+        )
+        if not assigned:
+            await message.answer("Failed to move workers to new pool name.")
+            return
+
+    deleted = await delete_pools_by_user_id(message.from_user.id, [old_pool_name])
+    if not deleted:
+        await message.answer(
+            "Workers moved, but deleting old pool failed. Please delete it manually."
+        )
+        return
+
+    old_profile = await get_pool_profile(old_pool_name)
+    if old_profile:
+        moved = await rename_pool_profile(old_pool_name, new_pool_name)
+        if not moved:
+            await set_pool_profile(
+                new_pool_name,
+                mode=_normalize_pool_mode(old_profile.get("mode")),
+                disk_letter=_normalize_disk_letter_value(old_profile.get("disk_letter")),
+                manual_workers=_normalize_worker_name_list(old_profile.get("manual_workers", [])),
+            )
+            await delete_pool_profile(old_pool_name)
+    else:
+        await delete_pool_profile(old_pool_name)
+
+    await state.clear()
+    await message.answer(
+        f"✅ Pool renamed: <code>{html.escape(_display_pool_name(old_pool_name))}</code> -> "
+        f"<code>{html.escape(_display_pool_name(new_pool_name))}</code>",
+        parse_mode="HTML",
     )
-    await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+    rendered = await _render_pool_details_by_name(message, message.from_user.id, new_pool_name, page)
+    if not rendered:
+        await _render_pools_overview_by_page(message, message.from_user.id, page)
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("requeue_job:"))
