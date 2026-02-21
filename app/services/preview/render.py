@@ -132,15 +132,6 @@ async def create_video_from_job(
         )
 
     props = job_info.get("Props", {})
-    status_value = job_info.get("Stat")
-    status_text = str(status_value).strip().lower() if status_value is not None else ""
-    completed_statuses = {"3", "complete", "completed", "finished", "done", "succeeded", "success"}
-    is_job_completed = False
-    if isinstance(status_value, int):
-        is_job_completed = status_value == 3
-    elif status_text:
-        is_job_completed = status_text in completed_statuses
-
     outdirs = job_info.get("OutDir", [])
     if not outdirs:
         logger.error("No OutDir found for job %s", job_id)
@@ -421,8 +412,6 @@ async def create_video_from_job(
         "ExtraInfoKeyValue3": f"PreviewTelegram={telegram_user_id}",
         "ExtraInfoKeyValue4": f"PreviewSource={job_id}",
     }
-    if not is_job_completed:
-        preview_job_info["JobDependency0"] = job_id
     if props.get("Pool"):
         preview_job_info["Pool"] = props["Pool"]
     if props.get("SecPool"):
