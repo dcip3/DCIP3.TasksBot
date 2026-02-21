@@ -22,9 +22,11 @@ from app.services.deadline import (
     delete_job_by_user_id,
     get_job_tasks_by_user_id,
     get_jobs_list,
+    get_worker_infosettings_by_user_id,
     get_workers_list,
     requeue_job_by_user_id,
     resume_job_by_user_id,
+    save_worker_settings_by_user_id,
     suspend_job_by_user_id,
 )
 
@@ -44,6 +46,8 @@ _ETA_MIN_PREDICTED_RATE = 1e-6
 _ETA_MAX_SMOOTHING_GAP_SECONDS = 20 * 60
 _ETA_HISTORY: dict[str, deque[tuple[datetime, float, float]]] = {}
 _ETA_SMOOTHED_SECONDS: dict[str, tuple[datetime, float]] = {}
+_WORKERS_PAGE_SIZE = 8
+_WORKER_NAME_COLUMN_WIDTH = BATCH_COLUMN_WIDTH - 2
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -317,6 +321,219 @@ def _build_jobs_overview(
         return text, keyboard
 
     return f"<pre>{header}\n{batch_text}</pre>", None
+
+
+def _worker_name(worker: dict) -> str:
+    info = worker.get("Info", {})
+    name = str(info.get("Name") or "").strip()
+    return name or "Unknown"
+
+
+def _worker_status(worker: dict) -> str:
+    info = worker.get("Info", {})
+    stat_num = info.get("Stat", 0)
+    base_status = settings.worker_status_map.get(stat_num, f"Unknown ({stat_num})")
+    worker_settings = worker.get("Settings", {})
+    if isinstance(worker_settings, dict):
+        enabled_raw = worker_settings.get("Enable")
+        if isinstance(enabled_raw, bool) and not enabled_raw:
+            return f"Dis ({base_status})"
+    return base_status
+
+
+def _worker_status_icon(worker: dict) -> str:
+    worker_settings = worker.get("Settings", {})
+    if isinstance(worker_settings, dict):
+        enabled_raw = worker_settings.get("Enable")
+        if isinstance(enabled_raw, bool) and not enabled_raw:
+            return "🚫"
+
+    info = worker.get("Info", {})
+    stat_num = info.get("Stat", 0)
+    if stat_num == 1:  # Rendering
+        return "▶️"
+    if stat_num == 2:  # Idle
+        return "🟢"
+    if stat_num == 3:  # Offline
+        return "⚫"
+    if stat_num == 4:  # Stalled
+        return "⚠️"
+    if stat_num == 8:  # StartingJob
+        return "⏳"
+    return "❓"
+
+
+def _sorted_workers(workers: list[dict]) -> list[dict]:
+    return sorted(workers, key=lambda item: _worker_name(item).lower())
+
+
+def _normalize_workers_page(page: int, total_items: int) -> tuple[int, int]:
+    total_pages = max(1, (total_items + _WORKERS_PAGE_SIZE - 1) // _WORKERS_PAGE_SIZE)
+    normalized_page = max(0, min(page, total_pages - 1))
+    return normalized_page, total_pages
+
+
+def _build_workers_overview(
+    workers: list[dict],
+    page: int,
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    sorted_workers = _sorted_workers(workers)
+    if not sorted_workers:
+        return "<pre>No workers found.</pre>", None
+
+    page, total_pages = _normalize_workers_page(page, len(sorted_workers))
+    start = page * _WORKERS_PAGE_SIZE
+    stop = start + _WORKERS_PAGE_SIZE
+    workers_slice = sorted_workers[start:stop]
+
+    lines: list[str] = []
+    worker_buttons: list[InlineKeyboardButton] = []
+    for idx, worker in enumerate(workers_slice, start=start):
+        name = _worker_name(worker)
+        status = _worker_status(worker)
+        icon = _worker_status_icon(worker)
+        display_name = truncate_cell(name, _WORKER_NAME_COLUMN_WIDTH)
+        lines.append(
+            f"{icon} {_escape_pre(display_name):<{_WORKER_NAME_COLUMN_WIDTH}}  {_escape_pre(status)}"
+        )
+        worker_buttons.append(
+            InlineKeyboardButton(
+                text=display_name,
+                callback_data=f"worker_info:{idx}:{page}",
+            )
+        )
+
+    inline_keyboard: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for idx, button in enumerate(worker_buttons, start=1):
+        row.append(button)
+        if idx % 2 == 0:
+            inline_keyboard.append(row)
+            row = []
+    if row:
+        inline_keyboard.append(row)
+
+    nav_buttons: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav_buttons.append(back_inline_button(callback_data=f"workers_page:{page-1}"))
+    if (page + 1) < total_pages:
+        nav_buttons.append(
+            back_inline_button(
+                callback_data=f"workers_page:{page+1}",
+                text="Next ➡️",
+            )
+        )
+    if nav_buttons:
+        inline_keyboard.append(nav_buttons)
+
+    header = f"{'':2}{'Name':<{_WORKER_NAME_COLUMN_WIDTH}}   Status"
+    header += f"\n{'-'*40}"
+    body = "\n".join(lines) if lines else "No data"
+    page_info = f"Page {page+1} of {total_pages}"
+    text = f"<pre>{header}\n{body}\n{page_info}</pre>\n\nSelect a worker for details:"
+    return text, InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
+
+
+def _build_worker_info_text(worker_entry: dict) -> str:
+    info = worker_entry.get("Info", {}) if isinstance(worker_entry, dict) else {}
+    name = str(info.get("Name") or "Unknown")
+    status_line = _worker_status(worker_entry)
+    current_job = str(info.get("JobName") or "").strip() or "Idle"
+
+    return "\n".join(
+        [
+            "Worker Info:",
+            f"🖥️ Name: <code>{html.escape(name)}</code>",
+            f"⚙️ Status: <code>{html.escape(str(status_line))}</code>",
+            f"🎬 Current Job: <code>{html.escape(current_job)}</code>",
+        ]
+    )
+
+
+def _worker_enable_value(worker_entry: dict) -> bool | None:
+    if not isinstance(worker_entry, dict):
+        return None
+    worker_settings = worker_entry.get("Settings", {})
+    if not isinstance(worker_settings, dict):
+        return None
+    enabled_raw = worker_settings.get("Enable")
+    return enabled_raw if isinstance(enabled_raw, bool) else None
+
+
+def _build_worker_info_keyboard(
+    page: int,
+    worker_index: int,
+    enabled: bool | None,
+) -> InlineKeyboardMarkup:
+    if enabled is True:
+        toggle_text = "🚫 Disable"
+        target_value = 0
+    else:
+        toggle_text = "✅ Enable"
+        target_value = 1
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=toggle_text,
+                    callback_data=f"worker_toggle_enable:{worker_index}:{page}:{target_value}",
+                )
+            ],
+            [
+                back_inline_button(callback_data=f"workers_back:{page}"),
+                inline_button(
+                    text="🔄 Update",
+                    callback_data=f"worker_update:{worker_index}:{page}",
+                    style="primary",
+                ),
+            ],
+        ]
+    )
+
+
+def _resolve_worker_by_index(workers: list[dict], worker_index: int) -> dict | None:
+    sorted_workers = _sorted_workers(workers)
+    if worker_index < 0 or worker_index >= len(sorted_workers):
+        return None
+    return sorted_workers[worker_index]
+
+
+async def _render_worker_details(
+    callback_query: CallbackQuery,
+    worker_index: int,
+    page: int,
+    *,
+    answer_text: str | None = None,
+) -> bool:
+    if callback_query.from_user is None or callback_query.message is None:
+        return False
+
+    workers = await get_workers_list(callback_query.from_user.id)
+    selected_worker = _resolve_worker_by_index(workers, worker_index)
+    if selected_worker is None:
+        await callback_query.answer("Worker not found.", show_alert=True)
+        return False
+
+    worker_name = _worker_name(selected_worker)
+    worker_entry = await get_worker_infosettings_by_user_id(
+        callback_query.from_user.id,
+        worker_name,
+    )
+    details = worker_entry or selected_worker
+    info_text = _build_worker_info_text(details)
+    keyboard = _build_worker_info_keyboard(
+        page,
+        worker_index,
+        _worker_enable_value(details),
+    )
+    await _edit_or_send_job_info(callback_query.message, info_text, keyboard)
+    if answer_text:
+        await callback_query.answer(answer_text)
+    else:
+        await callback_query.answer()
+    return True
+
 
 def _resolve_batch_label(props: dict) -> str:
     batch = (props.get("Batch") or "").strip()
@@ -917,7 +1134,7 @@ async def job_update_callback(callback_query: CallbackQuery) -> None:
 @router.message(F.text == "🖥️ Workers")
 @authorized_only
 async def handle_workers(message: Message) -> None:
-    """Display worker list."""
+    """Display worker list with pagination and inline actions."""
     if message.from_user is None:
         await message.answer("Error: User information not available.")
         return
@@ -935,25 +1152,225 @@ async def handle_workers(message: Message) -> None:
             )
             return
 
-        lines = []
-        for worker in workers:
-            info = worker.get("Info", {})
-            name = info.get("Name", "Unknown")
-            stat_num = info.get("Stat", 0)
-            stat = settings.worker_status_map.get(stat_num, f"Unknown ({stat_num})")
-            lines.append(f"{name:<24} {stat}")
-
-        header = f"{'Name':<24} Status"
-        header += f"\n{'-'*40}"
-        body = "\n".join(lines) if lines else "No data"
-
-        await message.answer(f"<pre>{header}\n{body}</pre>", parse_mode="HTML")
+        text, keyboard = _build_workers_overview(workers, page=0)
+        await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
 
     except Exception as exc:
         logger.exception(
             "Error handling workers for user %s", message.from_user.id
         )
         await message.answer("Error occurred while fetching workers.")
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("workers_page:"))
+async def workers_page_callback(callback_query: CallbackQuery) -> None:
+    """Handle pagination for workers list."""
+    if callback_query.from_user is None or callback_query.message is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    page_str = callback_query.data.split(":", 1)[1]
+    try:
+        page = int(page_str)
+    except ValueError:
+        await callback_query.answer("Invalid page number.", show_alert=True)
+        return
+
+    try:
+        workers = await get_workers_list(callback_query.from_user.id)
+        if not workers:
+            await callback_query.message.edit_text("No workers found.")
+            await callback_query.answer()
+            return
+
+        text, keyboard = _build_workers_overview(workers, page=page)
+        await callback_query.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+        await callback_query.answer()
+    except Exception:
+        logger.exception(
+            "Error handling workers page for user %s", callback_query.from_user.id
+        )
+        await callback_query.answer("Error occurred while fetching workers.", show_alert=True)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("workers_back:"))
+async def workers_back_callback(callback_query: CallbackQuery) -> None:
+    """Return from worker details to workers list."""
+    if callback_query.from_user is None or callback_query.message is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    page_str = callback_query.data.split(":", 1)[1]
+    try:
+        page = int(page_str)
+    except ValueError:
+        page = 0
+
+    try:
+        workers = await get_workers_list(callback_query.from_user.id)
+        if not workers:
+            await callback_query.message.edit_text("No workers found.")
+            await callback_query.answer()
+            return
+        text, keyboard = _build_workers_overview(workers, page=page)
+        await callback_query.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+        await callback_query.answer()
+    except Exception:
+        logger.exception(
+            "Error handling workers back for user %s", callback_query.from_user.id
+        )
+        await callback_query.answer("Error occurred while fetching workers.", show_alert=True)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("worker_info:"))
+async def worker_info_callback(callback_query: CallbackQuery) -> None:
+    """Show detailed information for selected worker."""
+    if callback_query.from_user is None or callback_query.message is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    parts = callback_query.data.split(":", 2)
+    if len(parts) != 3:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    try:
+        worker_index = int(parts[1])
+        page = int(parts[2])
+    except ValueError:
+        await callback_query.answer("Invalid worker selection.", show_alert=True)
+        return
+
+    try:
+        await _render_worker_details(callback_query, worker_index, page)
+    except Exception:
+        logger.exception(
+            "Error handling worker info for user %s", callback_query.from_user.id
+        )
+        await callback_query.answer("Error occurred while fetching worker info.", show_alert=True)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("worker_update:"))
+async def worker_update_callback(callback_query: CallbackQuery) -> None:
+    """Refresh selected worker details."""
+    if callback_query.from_user is None or callback_query.message is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    parts = callback_query.data.split(":", 2)
+    if len(parts) != 3:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    try:
+        worker_index = int(parts[1])
+        page = int(parts[2])
+    except ValueError:
+        await callback_query.answer("Invalid worker selection.", show_alert=True)
+        return
+
+    try:
+        await _render_worker_details(
+            callback_query,
+            worker_index,
+            page,
+            answer_text="Updated",
+        )
+    except Exception:
+        logger.exception(
+            "Error updating worker info for user %s", callback_query.from_user.id
+        )
+        await callback_query.answer("Error occurred while updating worker info.", show_alert=True)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("worker_toggle_enable:"))
+async def worker_toggle_enable_callback(callback_query: CallbackQuery) -> None:
+    """Toggle worker Enable flag via Deadline savesettings."""
+    if callback_query.from_user is None or callback_query.message is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    parts = callback_query.data.split(":", 4)
+    if len(parts) != 4:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    try:
+        worker_index = int(parts[1])
+        page = int(parts[2])
+        target_enable = bool(int(parts[3]))
+    except ValueError:
+        await callback_query.answer("Invalid action.", show_alert=True)
+        return
+
+    try:
+        workers = await get_workers_list(callback_query.from_user.id)
+        selected_worker = _resolve_worker_by_index(workers, worker_index)
+        if selected_worker is None:
+            await callback_query.answer("Worker not found.", show_alert=True)
+            return
+
+        worker_name = _worker_name(selected_worker)
+        worker_entry = await get_worker_infosettings_by_user_id(
+            callback_query.from_user.id,
+            worker_name,
+        )
+        if not worker_entry:
+            await callback_query.answer("Worker settings unavailable.", show_alert=True)
+            return
+
+        settings_payload = worker_entry.get("Settings", {})
+        if not isinstance(settings_payload, dict):
+            await callback_query.answer("Worker settings unavailable.", show_alert=True)
+            return
+
+        settings_payload = dict(settings_payload)
+        settings_payload["Name"] = str(settings_payload.get("Name") or worker_name)
+        settings_payload["Enable"] = target_enable
+
+        saved = await save_worker_settings_by_user_id(
+            callback_query.from_user.id,
+            settings_payload,
+        )
+        if not saved:
+            await callback_query.answer("Failed to update worker status.", show_alert=True)
+            return
+
+        toast_text = "Worker enabled." if target_enable else "Worker disabled."
+        await _render_worker_details(
+            callback_query,
+            worker_index,
+            page,
+            answer_text=toast_text,
+        )
+    except Exception:
+        logger.exception(
+            "Error toggling worker enable for user %s", callback_query.from_user.id
+        )
+        await callback_query.answer("Error updating worker status.", show_alert=True)
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("requeue_job:"))

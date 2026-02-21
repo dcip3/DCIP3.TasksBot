@@ -276,6 +276,176 @@ async def get_workers_by_credentials(login: str, password: str) -> List[Dict[str
     return await _fetch_workers(login, password)
 
 
+async def get_worker_infosettings(
+    login: str,
+    password: str,
+    worker_names: List[str],
+) -> List[Dict[str, Any]]:
+    """Fetch InfoSettings for one or more workers by name."""
+    filtered_names: List[str] = []
+    seen: set[str] = set()
+    for name in worker_names:
+        if not name:
+            continue
+        normalized = str(name).strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        filtered_names.append(normalized)
+
+    if not filtered_names:
+        return []
+
+    params: List[Tuple[str, str]] = [("Data", "infosettings")]
+    for name in filtered_names:
+        params.append(("Name", name))
+
+    try:
+        session = await get_aiosession()
+        auth = aiohttp.BasicAuth(login, password)
+        async with session.get(
+            f"{settings.deadline_api_url}/slaves",
+            params=params,
+            auth=auth,
+            ssl=settings.deadline_tls_verify,
+        ) as resp:
+            if resp.status != 200:
+                response_text = await resp.text()
+                logger.error(
+                    "Failed to get worker infosettings: %s, response: %s",
+                    resp.status,
+                    response_text,
+                )
+                return []
+
+            data = await resp.json()
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                workers = data.get("Workers")
+                if isinstance(workers, list):
+                    return workers
+                return [data]
+            return []
+    except Exception as exc:
+        logger.error("Error getting worker infosettings: %s", exc)
+        return []
+
+
+async def get_worker_infosettings_by_user_id(
+    telegram_user_id: int,
+    worker_name: str,
+) -> Optional[Dict[str, Any]]:
+    """Fetch worker InfoSettings by Telegram user context."""
+
+    async def _op(login: str, password: str) -> Optional[Dict[str, Any]]:
+        entries = await get_worker_infosettings(login, password, [worker_name])
+        if not entries:
+            return None
+        return entries[0]
+
+    return await _with_user_credentials(
+        telegram_user_id,
+        default=None,
+        operation_name=f"get worker infosettings ({worker_name})",
+        call=_op,
+    )
+
+
+async def save_worker_info(
+    login: str,
+    password: str,
+    worker_info: Dict[str, Any],
+) -> bool:
+    """Save worker info via Deadline /slaves Command=saveinfo."""
+    try:
+        session = await get_aiosession()
+        auth = aiohttp.BasicAuth(login, password)
+        payload = {
+            "Command": "saveinfo",
+            "SlaveInfo": worker_info,
+        }
+        async with session.put(
+            f"{settings.deadline_api_url}/slaves",
+            json=payload,
+            auth=auth,
+            ssl=settings.deadline_tls_verify,
+        ) as resp:
+            response_text = await resp.text()
+            if resp.status != 200:
+                logger.error(
+                    "Failed to save worker info: %s, response: %s",
+                    resp.status,
+                    response_text,
+                )
+                return False
+            _invalidate_workers_cache(login)
+            return True
+    except Exception as exc:
+        logger.error("Error saving worker info: %s", exc)
+        return False
+
+
+async def save_worker_settings(
+    login: str,
+    password: str,
+    worker_settings: Dict[str, Any],
+) -> bool:
+    """Save worker settings via Deadline /slaves Command=savesettings."""
+    try:
+        session = await get_aiosession()
+        auth = aiohttp.BasicAuth(login, password)
+        payload = {
+            "Command": "savesettings",
+            "SlaveSettings": worker_settings,
+        }
+        async with session.put(
+            f"{settings.deadline_api_url}/slaves",
+            json=payload,
+            auth=auth,
+            ssl=settings.deadline_tls_verify,
+        ) as resp:
+            response_text = await resp.text()
+            if resp.status != 200:
+                logger.error(
+                    "Failed to save worker settings: %s, response: %s",
+                    resp.status,
+                    response_text,
+                )
+                return False
+            _invalidate_workers_cache(login)
+            return True
+    except Exception as exc:
+        logger.error("Error saving worker settings: %s", exc)
+        return False
+
+
+async def save_worker_info_by_user_id(
+    telegram_user_id: int,
+    worker_info: Dict[str, Any],
+) -> bool:
+    """Save worker info using Telegram user credentials."""
+    return await _with_user_credentials(
+        telegram_user_id,
+        default=False,
+        operation_name="save worker info",
+        call=lambda login, password: save_worker_info(login, password, worker_info),
+    )
+
+
+async def save_worker_settings_by_user_id(
+    telegram_user_id: int,
+    worker_settings: Dict[str, Any],
+) -> bool:
+    """Save worker settings using Telegram user credentials."""
+    return await _with_user_credentials(
+        telegram_user_id,
+        default=False,
+        operation_name="save worker settings",
+        call=lambda login, password: save_worker_settings(login, password, worker_settings),
+    )
+
+
 async def get_job_info_direct(login: str, password: str, job_id: str) -> Optional[Dict[str, Any]]:
     """Fetch one job by id using a targeted Deadline query, fallback to cached list lookup."""
     session = await get_aiosession()
