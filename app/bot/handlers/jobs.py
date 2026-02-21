@@ -6,7 +6,10 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 
 from aiogram import F, Router
+from aiogram.filters import StateFilter
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from app.bot.job_helpers import (
@@ -17,12 +20,18 @@ from app.bot.job_helpers import (
     truncate_cell,
 )
 from app.core.config import settings
-from app.core.ui_helpers import authorized_only, back_inline_button, inline_button
+from app.core.ui_helpers import authorized_only, back_inline_button, cancel_inline_button, inline_button
 from app.services.deadline import (
+    add_pools_by_user_id,
+    add_pools_to_workers_by_user_id,
     delete_job_by_user_id,
+    delete_pools_by_user_id,
+    delete_pools_from_workers_by_user_id,
     get_job_tasks_by_user_id,
     get_jobs_list,
+    get_pool_names_by_user_id,
     get_worker_infosettings_by_user_id,
+    get_workers_for_pool_by_user_id,
     get_workers_list,
     requeue_job_by_user_id,
     resume_job_by_user_id,
@@ -48,6 +57,15 @@ _ETA_HISTORY: dict[str, deque[tuple[datetime, float, float]]] = {}
 _ETA_SMOOTHED_SECONDS: dict[str, tuple[datetime, float]] = {}
 _WORKERS_PAGE_SIZE = 8
 _WORKER_NAME_COLUMN_WIDTH = BATCH_COLUMN_WIDTH - 2
+_POOLS_PAGE_SIZE = 8
+_POOL_NAME_COLUMN_WIDTH = BATCH_COLUMN_WIDTH
+_POOL_WORKERS_COLUMN_WIDTH = 7
+_DISK_INPUT_RE = re.compile(r"^\s*([A-Za-z])(?:\s*:[\\/]?)?\s*$")
+_DRIVE_LETTER_RE = re.compile(r"([A-Za-z]):[\\/]")
+
+
+class PoolCreateStates(StatesGroup):
+    DISK_LETTER = State()
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -533,6 +551,277 @@ async def _render_worker_details(
     else:
         await callback_query.answer()
     return True
+
+
+def _sorted_pool_names(pools: list[str]) -> list[str]:
+    return sorted(
+        (
+            str(pool).strip()
+            for pool in pools
+            if str(pool).strip() and str(pool).strip().lower() != "none"
+        ),
+        key=str.lower,
+    )
+
+
+def _display_pool_name(pool_name: str) -> str:
+    """Normalize pool label for UI while keeping original value for API calls."""
+    normalized = str(pool_name).strip()
+    if len(normalized) == 1 and normalized.isalpha():
+        return normalized.upper()
+    return normalized
+
+
+def _normalize_pools_page(page: int, total_items: int) -> tuple[int, int]:
+    total_pages = max(1, (total_items + _POOLS_PAGE_SIZE - 1) // _POOLS_PAGE_SIZE)
+    normalized_page = max(0, min(page, total_pages - 1))
+    return normalized_page, total_pages
+
+
+def _pool_names_for_page(pools: list[str], page: int) -> tuple[list[str], int, int]:
+    sorted_pools = _sorted_pool_names(pools)
+    normalized_page, total_pages = _normalize_pools_page(page, len(sorted_pools))
+    start = normalized_page * _POOLS_PAGE_SIZE
+    stop = start + _POOLS_PAGE_SIZE
+    return sorted_pools[start:stop], normalized_page, total_pages
+
+
+def _build_pools_overview(
+    pools: list[str],
+    page: int,
+    pool_worker_counts: dict[str, int] | None = None,
+) -> tuple[str, InlineKeyboardMarkup]:
+    sorted_pools = _sorted_pool_names(pools)
+    pools_slice, page, total_pages = _pool_names_for_page(pools, page)
+    start = page * _POOLS_PAGE_SIZE
+
+    lines: list[str] = []
+    pool_buttons: list[InlineKeyboardButton] = []
+    for idx, pool_name in enumerate(pools_slice, start=start):
+        display_name = truncate_cell(_display_pool_name(pool_name), _POOL_NAME_COLUMN_WIDTH)
+        workers_count = (
+            "-"
+            if pool_worker_counts is None or pool_name not in pool_worker_counts
+            else str(pool_worker_counts[pool_name])
+        )
+        lines.append(
+            f"{_escape_pre(display_name):<{_POOL_NAME_COLUMN_WIDTH}} {workers_count:^{_POOL_WORKERS_COLUMN_WIDTH}}"
+        )
+        pool_buttons.append(
+            InlineKeyboardButton(
+                text=display_name,
+                callback_data=f"pool_info:{idx}:{page}",
+            )
+        )
+
+    inline_keyboard: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for idx, button in enumerate(pool_buttons, start=1):
+        row.append(button)
+        if idx % 2 == 0:
+            inline_keyboard.append(row)
+            row = []
+    if row:
+        inline_keyboard.append(row)
+
+    inline_keyboard.append(
+        [
+            inline_button(
+                text="➕ Create Pool",
+                callback_data=f"pool_create_start:{page}",
+                style="primary",
+            )
+        ]
+    )
+
+    nav_buttons: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav_buttons.append(back_inline_button(callback_data=f"pools_page:{page-1}"))
+    if (page + 1) < total_pages:
+        nav_buttons.append(
+            back_inline_button(
+                callback_data=f"pools_page:{page+1}",
+                text="Next ➡️",
+            )
+        )
+    if nav_buttons:
+        inline_keyboard.append(nav_buttons)
+
+    header = f"{'Pool Name':<{_POOL_NAME_COLUMN_WIDTH}} {'Workers':^{_POOL_WORKERS_COLUMN_WIDTH}}"
+    header += f"\n{'-'*40}"
+    body = "\n".join(lines) if lines else "No pools yet"
+    page_info = f"Page {page+1} of {total_pages}"
+    text = f"<pre>{header}\n{body}\n{page_info}</pre>\n\nSelect a pool for details:"
+    return text, InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
+
+
+def _resolve_pool_by_index(pools: list[str], pool_index: int) -> str | None:
+    sorted_pools = _sorted_pool_names(pools)
+    if pool_index < 0 or pool_index >= len(sorted_pools):
+        return None
+    return sorted_pools[pool_index]
+
+
+async def _load_pool_worker_counts(
+    telegram_user_id: int,
+    pool_names: list[str],
+) -> dict[str, int]:
+    if not pool_names:
+        return {}
+
+    semaphore = asyncio.Semaphore(min(6, max(1, len(pool_names))))
+    counts: dict[str, int] = {}
+
+    async def _load_one(pool_name: str) -> None:
+        async with semaphore:
+            workers = await get_workers_for_pool_by_user_id(telegram_user_id, pool_name)
+            counts[pool_name] = len([name for name in workers if str(name).strip()])
+
+    await asyncio.gather(*(_load_one(pool_name) for pool_name in pool_names))
+    return counts
+
+
+def _build_pool_info_text(pool_name: str, worker_names: list[str]) -> str:
+    display_pool_name = _display_pool_name(pool_name)
+    sorted_workers = sorted((str(name).strip() for name in worker_names if str(name).strip()), key=str.lower)
+    sample = ", ".join(sorted_workers[:8]) if sorted_workers else "-"
+    if len(sorted_workers) > 8:
+        sample += f" (+{len(sorted_workers) - 8})"
+
+    inferred_disk = display_pool_name if len(display_pool_name) == 1 and display_pool_name.isalpha() else "N/A"
+    return "\n".join(
+        [
+            "Pool Info:",
+            f"🗂️ Name: <code>{html.escape(display_pool_name)}</code>",
+            f"💽 Disk Hint: <code>{html.escape(inferred_disk)}</code>",
+            f"🖥️ Workers: <code>{len(sorted_workers)}</code>",
+            f"📋 Sample: <code>{html.escape(sample)}</code>",
+        ]
+    )
+
+
+def _build_pool_info_keyboard(page: int, pool_index: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🗑️ Delete Pool",
+                    callback_data=f"pool_delete:{pool_index}:{page}",
+                )
+            ],
+            [
+                back_inline_button(callback_data=f"pools_back:{page}"),
+                inline_button(
+                    text="🔄 Update",
+                    callback_data=f"pool_update:{pool_index}:{page}",
+                    style="primary",
+                ),
+            ],
+        ]
+    )
+
+
+def _parse_disk_letter(raw_text: str | None) -> str | None:
+    if raw_text is None:
+        return None
+    match = _DISK_INPUT_RE.match(raw_text)
+    if not match:
+        return None
+    return match.group(1).upper()
+
+
+def _worker_has_drive_letter(worker: dict, disk_letter: str) -> bool:
+    info = worker.get("Info", {})
+    disk_str = str(info.get("DiskStr") or "")
+    if not disk_str:
+        return False
+    for found in _DRIVE_LETTER_RE.findall(disk_str):
+        if found.upper() == disk_letter:
+            return True
+    return False
+
+
+async def _render_pool_details(
+    callback_query: CallbackQuery,
+    pool_index: int,
+    page: int,
+    *,
+    answer_text: str | None = None,
+) -> bool:
+    if callback_query.from_user is None or callback_query.message is None:
+        return False
+
+    pools = await get_pool_names_by_user_id(callback_query.from_user.id)
+    pool_name = _resolve_pool_by_index(pools, pool_index)
+    if pool_name is None:
+        await callback_query.answer("Pool not found.", show_alert=True)
+        return False
+
+    workers = await get_workers_for_pool_by_user_id(callback_query.from_user.id, pool_name)
+    info_text = _build_pool_info_text(pool_name, workers)
+    keyboard = _build_pool_info_keyboard(page, pool_index)
+    await _edit_or_send_job_info(callback_query.message, info_text, keyboard)
+    if answer_text:
+        await callback_query.answer(answer_text)
+    else:
+        await callback_query.answer()
+    return True
+
+
+async def _sync_pool_from_disk(
+    telegram_user_id: int,
+    disk_letter: str,
+) -> tuple[bool, str, str]:
+    pool_name = disk_letter.upper()
+    workers = await get_workers_list(telegram_user_id)
+    matched_workers = sorted(
+        {
+            _worker_name(worker)
+            for worker in workers
+            if _worker_has_drive_letter(worker, disk_letter.upper())
+        },
+        key=str.lower,
+    )
+
+    if not matched_workers:
+        return False, pool_name, f"No workers found with disk {disk_letter}:\\"
+
+    current_workers = await get_workers_for_pool_by_user_id(telegram_user_id, pool_name)
+    current_set = {name for name in current_workers if name}
+    target_set = set(matched_workers)
+
+    created = await add_pools_by_user_id(telegram_user_id, [pool_name])
+    if not created:
+        return False, pool_name, f"Failed to create or ensure pool '{pool_name}'."
+
+    assigned = await add_pools_to_workers_by_user_id(
+        telegram_user_id,
+        matched_workers,
+        [pool_name],
+        overwrite=False,
+    )
+    if not assigned:
+        return False, pool_name, f"Pool '{pool_name}' created, but assigning workers failed."
+
+    stale_workers = sorted(current_set - target_set, key=str.lower)
+    if stale_workers:
+        removed = await delete_pools_from_workers_by_user_id(
+            telegram_user_id,
+            [pool_name],
+            stale_workers,
+        )
+        if not removed:
+            return (
+                False,
+                pool_name,
+                f"Pool '{pool_name}' updated, but failed to remove stale workers.",
+            )
+
+    return (
+        True,
+        pool_name,
+        f"Pool '{pool_name}' synced from disk {disk_letter}:\\ ({len(matched_workers)} workers).",
+    )
 
 
 def _resolve_batch_label(props: dict) -> str:
@@ -1371,6 +1660,318 @@ async def worker_toggle_enable_callback(callback_query: CallbackQuery) -> None:
             "Error toggling worker enable for user %s", callback_query.from_user.id
         )
         await callback_query.answer("Error updating worker status.", show_alert=True)
+
+
+@router.message(F.text == "🗂️ Pools")
+@authorized_only
+async def handle_pools(message: Message) -> None:
+    """Display pools list with pagination and create action."""
+    if message.from_user is None:
+        await message.answer("Error: User information not available.")
+        return
+
+    logger.info("Pools button pressed by user %s", message.from_user.id)
+
+    try:
+        pools = await get_pool_names_by_user_id(message.from_user.id)
+        pools_slice, normalized_page, _ = _pool_names_for_page(pools, page=0)
+        pool_worker_counts = await _load_pool_worker_counts(message.from_user.id, pools_slice)
+        text, keyboard = _build_pools_overview(
+            pools,
+            page=normalized_page,
+            pool_worker_counts=pool_worker_counts,
+        )
+        await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+    except Exception:
+        logger.exception("Error handling pools for user %s", message.from_user.id)
+        await message.answer("Error occurred while fetching pools.")
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("pools_page:"))
+async def pools_page_callback(callback_query: CallbackQuery) -> None:
+    """Handle pagination for pools list."""
+    if callback_query.from_user is None or callback_query.message is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    page_str = callback_query.data.split(":", 1)[1]
+    try:
+        page = int(page_str)
+    except ValueError:
+        await callback_query.answer("Invalid page number.", show_alert=True)
+        return
+
+    try:
+        pools = await get_pool_names_by_user_id(callback_query.from_user.id)
+        pools_slice, normalized_page, _ = _pool_names_for_page(pools, page=page)
+        pool_worker_counts = await _load_pool_worker_counts(callback_query.from_user.id, pools_slice)
+        text, keyboard = _build_pools_overview(
+            pools,
+            page=normalized_page,
+            pool_worker_counts=pool_worker_counts,
+        )
+        await callback_query.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+        await callback_query.answer()
+    except Exception:
+        logger.exception(
+            "Error handling pools page for user %s", callback_query.from_user.id
+        )
+        await callback_query.answer("Error occurred while fetching pools.", show_alert=True)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("pools_back:"))
+async def pools_back_callback(callback_query: CallbackQuery) -> None:
+    """Return from pool details to pools list."""
+    if callback_query.from_user is None or callback_query.message is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    page_str = callback_query.data.split(":", 1)[1]
+    try:
+        page = int(page_str)
+    except ValueError:
+        page = 0
+
+    try:
+        pools = await get_pool_names_by_user_id(callback_query.from_user.id)
+        pools_slice, normalized_page, _ = _pool_names_for_page(pools, page=page)
+        pool_worker_counts = await _load_pool_worker_counts(callback_query.from_user.id, pools_slice)
+        text, keyboard = _build_pools_overview(
+            pools,
+            page=normalized_page,
+            pool_worker_counts=pool_worker_counts,
+        )
+        await callback_query.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+        await callback_query.answer()
+    except Exception:
+        logger.exception(
+            "Error handling pools back for user %s", callback_query.from_user.id
+        )
+        await callback_query.answer("Error occurred while fetching pools.", show_alert=True)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("pool_info:"))
+async def pool_info_callback(callback_query: CallbackQuery) -> None:
+    """Show detailed information for selected pool."""
+    if callback_query.from_user is None or callback_query.message is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    parts = callback_query.data.split(":", 2)
+    if len(parts) != 3:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    try:
+        pool_index = int(parts[1])
+        page = int(parts[2])
+    except ValueError:
+        await callback_query.answer("Invalid pool selection.", show_alert=True)
+        return
+
+    try:
+        await _render_pool_details(callback_query, pool_index, page)
+    except Exception:
+        logger.exception(
+            "Error handling pool info for user %s", callback_query.from_user.id
+        )
+        await callback_query.answer("Error occurred while fetching pool info.", show_alert=True)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("pool_update:"))
+async def pool_update_callback(callback_query: CallbackQuery) -> None:
+    """Refresh selected pool details."""
+    if callback_query.from_user is None or callback_query.message is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    parts = callback_query.data.split(":", 2)
+    if len(parts) != 3:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    try:
+        pool_index = int(parts[1])
+        page = int(parts[2])
+    except ValueError:
+        await callback_query.answer("Invalid pool selection.", show_alert=True)
+        return
+
+    try:
+        await _render_pool_details(
+            callback_query,
+            pool_index,
+            page,
+            answer_text="Updated",
+        )
+    except Exception:
+        logger.exception(
+            "Error updating pool info for user %s", callback_query.from_user.id
+        )
+        await callback_query.answer("Error occurred while updating pool info.", show_alert=True)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("pool_delete:"))
+async def pool_delete_callback(callback_query: CallbackQuery) -> None:
+    """Delete selected pool."""
+    if callback_query.from_user is None or callback_query.message is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    parts = callback_query.data.split(":", 2)
+    if len(parts) != 3:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    try:
+        pool_index = int(parts[1])
+        page = int(parts[2])
+    except ValueError:
+        await callback_query.answer("Invalid pool selection.", show_alert=True)
+        return
+
+    try:
+        pools = await get_pool_names_by_user_id(callback_query.from_user.id)
+        pool_name = _resolve_pool_by_index(pools, pool_index)
+        if pool_name is None:
+            await callback_query.answer("Pool not found.", show_alert=True)
+            return
+
+        deleted = await delete_pools_by_user_id(callback_query.from_user.id, [pool_name])
+        if not deleted:
+            await callback_query.answer("Failed to delete pool.", show_alert=True)
+            return
+
+        pools_after = await get_pool_names_by_user_id(callback_query.from_user.id)
+        pools_slice, normalized_page, _ = _pool_names_for_page(pools_after, page=page)
+        pool_worker_counts = await _load_pool_worker_counts(callback_query.from_user.id, pools_slice)
+        text, keyboard = _build_pools_overview(
+            pools_after,
+            page=normalized_page,
+            pool_worker_counts=pool_worker_counts,
+        )
+        await callback_query.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+        await callback_query.answer("Pool deleted.")
+    except Exception:
+        logger.exception(
+            "Error deleting pool for user %s", callback_query.from_user.id
+        )
+        await callback_query.answer("Error occurred while deleting pool.", show_alert=True)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("pool_create_start:"))
+async def pool_create_start_callback(callback_query: CallbackQuery, state: FSMContext) -> None:
+    """Start pool creation workflow by asking for disk letter."""
+    if callback_query.from_user is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    page_str = callback_query.data.split(":", 1)[1]
+    try:
+        page = int(page_str)
+    except ValueError:
+        page = 0
+
+    await state.set_state(PoolCreateStates.DISK_LETTER)
+    await state.update_data(pools_page=page)
+
+    prompt = (
+        "Enter disk letter for the pool (example: <code>Z</code>).\n"
+        "Pool name will be created as that letter."
+    )
+    cancel_keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[cancel_inline_button(callback_data="pool_create_cancel")]]
+    )
+
+    if callback_query.message:
+        await callback_query.message.answer(
+            prompt,
+            parse_mode="HTML",
+            reply_markup=cancel_keyboard,
+        )
+    await callback_query.answer("Send disk letter in chat.")
+
+
+@router.callback_query(lambda c: c.data == "pool_create_cancel")
+async def pool_create_cancel_callback(callback_query: CallbackQuery, state: FSMContext) -> None:
+    """Cancel pool creation workflow."""
+    await state.clear()
+    if callback_query.message:
+        try:
+            await callback_query.message.edit_text("Pool creation cancelled.")
+        except Exception:
+            await callback_query.message.answer("Pool creation cancelled.")
+    await callback_query.answer("Cancelled.", show_alert=False)
+
+
+@router.message(StateFilter(PoolCreateStates.DISK_LETTER))
+async def pool_create_disk_letter_message(message: Message, state: FSMContext) -> None:
+    """Handle disk letter input for pool creation."""
+    if message.from_user is None:
+        await message.answer("Error: user not found.")
+        return
+
+    disk_letter = _parse_disk_letter(message.text)
+    if disk_letter is None:
+        await message.answer(
+            "Invalid input. Please send a single disk letter (example: <code>Z</code>).",
+            parse_mode="HTML",
+        )
+        return
+
+    data = await state.get_data()
+    page = int(data.get("pools_page", 0) or 0)
+
+    success, _pool_name, status_message = await _sync_pool_from_disk(
+        message.from_user.id,
+        disk_letter,
+    )
+    if not success:
+        await message.answer(f"❌ {status_message}")
+        return
+
+    await state.clear()
+    await message.answer(f"✅ {status_message}")
+
+    pools = await get_pool_names_by_user_id(message.from_user.id)
+    pools_slice, normalized_page, _ = _pool_names_for_page(pools, page=page)
+    pool_worker_counts = await _load_pool_worker_counts(message.from_user.id, pools_slice)
+    text, keyboard = _build_pools_overview(
+        pools,
+        page=normalized_page,
+        pool_worker_counts=pool_worker_counts,
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("requeue_job:"))
