@@ -100,9 +100,10 @@ def group_and_combine_jobs(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
         # Determine batch-level status with priority: Active > Pending > Suspended > Failed > Completed > Unknown
         status_list = [j.get("Stat", 0) for j in batch_jobs]
+        has_active_status = any(stat == 1 for stat in status_list)
         has_running = any(_has_running_tasks(job) for job in batch_jobs)
-        has_pending = any(stat in {1, 6} for stat in status_list)
-        if has_running:
+        has_pending = any(stat == 6 for stat in status_list)
+        if has_running or has_active_status:
             batch_stat = 1      # Active
         elif has_pending:
             batch_stat = 6      # Pending
@@ -152,8 +153,10 @@ async def group_and_sort_jobs(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]
 
     # Sort by DateParsed descending (newest first)
     combined_jobs.sort(key=lambda j: j["DateParsed"], reverse=True)
-    # Render-active batches first (stable sort keeps DateParsed ordering within groups)
-    combined_jobs.sort(key=lambda j: 0 if j.get("Stat") == 1 else 1)
+    # Priority groups (stable sort keeps DateParsed ordering within groups):
+    # 1) Active, 2) Pending, 3) everything else.
+    status_priority = {1: 0, 6: 1}
+    combined_jobs.sort(key=lambda j: status_priority.get(j.get("Stat"), 2))
 
     return combined_jobs
 
