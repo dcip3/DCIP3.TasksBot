@@ -66,6 +66,7 @@ async def init_db():
             token TEXT PRIMARY KEY,
             expires_at INTEGER NOT NULL,
             created_at INTEGER NOT NULL,
+            claimed_until INTEGER NOT NULL DEFAULT 0,
             payload_json TEXT NOT NULL
         )
     """)
@@ -73,6 +74,19 @@ async def init_db():
         CREATE INDEX IF NOT EXISTS idx_preview_upload_tokens_expires
         ON preview_upload_tokens(expires_at)
     """)
+    try:
+        await tasks_db_conn.execute(
+            "ALTER TABLE preview_upload_tokens ADD COLUMN claimed_until INTEGER NOT NULL DEFAULT 0"
+        )
+        await tasks_db_conn.commit()
+        logger.info("Added claimed_until column to preview_upload_tokens table")
+    except aiosqlite.OperationalError as column_error:
+        message = str(column_error).lower()
+        if "duplicate column name" in message:
+            logger.debug("claimed_until column already exists on preview_upload_tokens table")
+        else:
+            logger.error("Failed to ensure claimed_until column: %s", column_error)
+            raise
 
     # Persist auto-preview dedupe history across restarts
     await tasks_db_conn.execute(

@@ -43,6 +43,7 @@ class PreviewUploadTokenStore:
     def __init__(self, ttl_seconds: int, max_size: int = 10000) -> None:
         self._ttl_seconds = int(ttl_seconds)
         self._max_size = max_size
+        self._claim_lease_seconds = 5 * 60
         self._schema_ready = False
         self._schema_lock = asyncio.Lock()
 
@@ -61,10 +62,19 @@ class PreviewUploadTokenStore:
                     token TEXT PRIMARY KEY,
                     expires_at INTEGER NOT NULL,
                     created_at INTEGER NOT NULL,
+                    claimed_until INTEGER NOT NULL DEFAULT 0,
                     payload_json TEXT NOT NULL
                 )
                 """
             )
+            try:
+                await conn.execute(
+                    "ALTER TABLE preview_upload_tokens ADD COLUMN claimed_until INTEGER NOT NULL DEFAULT 0"
+                )
+            except aiosqlite.OperationalError as column_error:
+                message = str(column_error).lower()
+                if "duplicate column name" not in message:
+                    raise
             await conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_preview_upload_tokens_expires
@@ -138,14 +148,68 @@ class PreviewUploadTokenStore:
             await conn.execute(
                 """
                 INSERT OR REPLACE INTO preview_upload_tokens
-                (token, expires_at, created_at, payload_json)
-                VALUES (?, ?, ?, ?)
+                (token, expires_at, created_at, claimed_until, payload_json)
+                VALUES (?, ?, ?, 0, ?)
                 """,
                 (token, expires_at, now, self._serialize_payload(payload)),
             )
             await self._cleanup(conn)
             await conn.commit()
         return token
+
+    async def claim(self, token: str) -> Optional[PreviewUploadPayload]:
+        """Atomically claim a token so only one upload request can process it."""
+        now = int(time.time())
+        claim_until = now + self._claim_lease_seconds
+        async with self._open_db() as conn:
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await self._ensure_schema(conn)
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                async with conn.execute(
+                    """
+                    SELECT expires_at, claimed_until, payload_json
+                    FROM preview_upload_tokens
+                    WHERE token = ?
+                    """,
+                    (token,),
+                ) as cur:
+                    row = await cur.fetchone()
+                if not row:
+                    await conn.rollback()
+                    return None
+
+                expires_at, claimed_until, payload_json = row
+                if int(expires_at) <= now:
+                    await conn.execute(
+                        "DELETE FROM preview_upload_tokens WHERE token = ?",
+                        (token,),
+                    )
+                    await conn.commit()
+                    return None
+
+                if int(claimed_until or 0) > now:
+                    await conn.rollback()
+                    return None
+
+                payload = self._deserialize_payload(payload_json)
+                if payload is None:
+                    await conn.execute(
+                        "DELETE FROM preview_upload_tokens WHERE token = ?",
+                        (token,),
+                    )
+                    await conn.commit()
+                    return None
+
+                await conn.execute(
+                    "UPDATE preview_upload_tokens SET claimed_until = ? WHERE token = ?",
+                    (claim_until, token),
+                )
+                await conn.commit()
+                return payload
+            except Exception:
+                await conn.rollback()
+                raise
 
     async def update(self, token: str, **updates: object) -> bool:
         async with self._open_db() as conn:
@@ -197,15 +261,52 @@ class PreviewUploadTokenStore:
             return self._deserialize_payload(payload_json)
 
     async def consume(self, token: str) -> Optional[PreviewUploadPayload]:
-        payload = await self.get(token)
-        if payload is None:
-            return None
+        async with self._open_db() as conn:
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await self._ensure_schema(conn)
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                async with conn.execute(
+                    "SELECT expires_at, payload_json FROM preview_upload_tokens WHERE token = ?",
+                    (token,),
+                ) as cur:
+                    row = await cur.fetchone()
+                if not row:
+                    await conn.rollback()
+                    return None
+                expires_at, payload_json = row
+                if int(expires_at) <= int(time.time()):
+                    await conn.execute("DELETE FROM preview_upload_tokens WHERE token = ?", (token,))
+                    await conn.commit()
+                    return None
+                payload = self._deserialize_payload(payload_json)
+                if payload is None:
+                    await conn.execute("DELETE FROM preview_upload_tokens WHERE token = ?", (token,))
+                    await conn.commit()
+                    return None
+                await conn.execute("DELETE FROM preview_upload_tokens WHERE token = ?", (token,))
+                await conn.commit()
+                return payload
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def release_claim(self, token: str) -> None:
+        async with self._open_db() as conn:
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await self._ensure_schema(conn)
+            await conn.execute(
+                "UPDATE preview_upload_tokens SET claimed_until = 0 WHERE token = ?",
+                (token,),
+            )
+            await conn.commit()
+
+    async def consume_claimed(self, token: str) -> None:
         async with self._open_db() as conn:
             await conn.execute("PRAGMA journal_mode=WAL")
             await self._ensure_schema(conn)
             await conn.execute("DELETE FROM preview_upload_tokens WHERE token = ?", (token,))
             await conn.commit()
-        return payload
 
     async def drop(self, token: str) -> None:
         async with self._open_db() as conn:
@@ -336,55 +437,66 @@ async def _handle_preview_upload(request: web.Request) -> web.Response:
     if not token:
         return web.Response(status=401, text="Missing token")
 
-    payload = await _token_store.get(token)
+    payload = await _token_store.claim(token)
     if payload is None:
-        return web.Response(status=403, text="Invalid or expired token")
+        return web.Response(status=403, text="Invalid, expired, or in-progress token")
 
-    if payload.preview_job_id:
-        notified_key = (payload.preview_job_id, payload.telegram_user_id)
-        if notified_key in notified_jobs:
-            await _token_store.consume(token)
-            return web.Response(status=200, text="Preview already delivered")
-
-    max_size_bytes = settings.preview_upload_max_mb * 1024 * 1024
-    if request.content_length and request.content_length > max_size_bytes:
-        return web.Response(status=413, text="Payload too large")
-
-    temp_dir = Path(settings.temp_dir)
-    temp_dir.mkdir(parents=True, exist_ok=True)
-
-    header_name = request.headers.get("X-Preview-Filename")
-    filename = header_name or payload.expected_filename or "preview.mp4"
-    filename = _sanitize_filename(filename)
-
-    upload_dir = temp_dir / f"upload_{token}"
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    temp_path = upload_dir / filename
-    bytes_written = 0
-    try:
-        async with aiofiles.open(temp_path, "wb") as handle:
-            async for chunk in request.content.iter_chunked(1024 * 1024):
-                if not chunk:
-                    continue
-                bytes_written += len(chunk)
-                if bytes_written > max_size_bytes:
-                    temp_path.unlink(missing_ok=True)
-                    return web.Response(status=413, text="Payload too large")
-                await handle.write(chunk)
-    except Exception as exc:
-        logger.error("Failed to write preview upload: %s", exc)
-        temp_path.unlink(missing_ok=True)
-        return web.Response(status=500, text="Upload failed")
+    should_release_claim = True
 
     try:
-        await _deliver_preview(payload, temp_path)
-    except Exception as exc:
-        logger.error("Failed to deliver preview upload: %s", exc)
-        temp_path.unlink(missing_ok=True)
-        return web.Response(status=500, text="Delivery failed")
+        if payload.preview_job_id:
+            notified_key = (payload.preview_job_id, payload.telegram_user_id)
+            if notified_key in notified_jobs:
+                await _token_store.consume_claimed(token)
+                should_release_claim = False
+                return web.Response(status=200, text="Preview already delivered")
 
-    await _token_store.consume(token)
-    return web.Response(status=200, text="OK")
+        max_size_bytes = settings.preview_upload_max_mb * 1024 * 1024
+        if request.content_length and request.content_length > max_size_bytes:
+            return web.Response(status=413, text="Payload too large")
+
+        temp_dir = Path(settings.temp_dir)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
+        header_name = request.headers.get("X-Preview-Filename")
+        filename = header_name or payload.expected_filename or "preview.mp4"
+        filename = _sanitize_filename(filename)
+
+        upload_dir = temp_dir / f"upload_{token}"
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        temp_path = upload_dir / filename
+        bytes_written = 0
+        try:
+            async with aiofiles.open(temp_path, "wb") as handle:
+                async for chunk in request.content.iter_chunked(1024 * 1024):
+                    if not chunk:
+                        continue
+                    bytes_written += len(chunk)
+                    if bytes_written > max_size_bytes:
+                        temp_path.unlink(missing_ok=True)
+                        return web.Response(status=413, text="Payload too large")
+                    await handle.write(chunk)
+        except Exception as exc:
+            logger.error("Failed to write preview upload: %s", exc)
+            temp_path.unlink(missing_ok=True)
+            return web.Response(status=500, text="Upload failed")
+
+        try:
+            await _deliver_preview(payload, temp_path)
+        except Exception as exc:
+            logger.error("Failed to deliver preview upload: %s", exc)
+            temp_path.unlink(missing_ok=True)
+            return web.Response(status=500, text="Delivery failed")
+
+        await _token_store.consume_claimed(token)
+        should_release_claim = False
+        return web.Response(status=200, text="OK")
+    finally:
+        if should_release_claim:
+            try:
+                await _token_store.release_claim(token)
+            except Exception as exc:
+                logger.warning("Failed to release preview upload token claim: %s", exc)
 
 
 async def _deliver_preview(payload: PreviewUploadPayload, temp_path: Path) -> None:

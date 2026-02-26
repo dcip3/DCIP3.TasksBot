@@ -64,6 +64,7 @@ def group_and_combine_jobs(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         for key in (
             "RunningTasks",
             "RunningChunks",
+            "RenderingChunks",
             "TasksRunning",
             "TasksInProgress",
             "ActiveTasks",
@@ -100,10 +101,9 @@ def group_and_combine_jobs(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
         # Determine batch-level status with priority: Active > Pending > Suspended > Failed > Completed > Unknown
         status_list = [j.get("Stat", 0) for j in batch_jobs]
-        has_active_status = any(stat == 1 for stat in status_list)
         has_running = any(_has_running_tasks(job) for job in batch_jobs)
-        has_pending = any(stat == 6 for stat in status_list)
-        if has_running or has_active_status:
+        has_pending = any(stat in {1, 6} for stat in status_list)
+        if has_running:
             batch_stat = 1      # Active
         elif has_pending:
             batch_stat = 6      # Pending
