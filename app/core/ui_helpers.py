@@ -34,7 +34,6 @@ def get_main_keyboard() -> ReplyKeyboardMarkup:
             KeyboardButton(text="🖥️ Workers", request_contact=False, request_location=False),
         ],
         [
-            KeyboardButton(text="🗂️ Pools", request_contact=False, request_location=False),
             KeyboardButton(text="⚙️ Settings", request_contact=False, request_location=False),
         ],
     ]

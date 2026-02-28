@@ -18,7 +18,6 @@ HELP_TEXT = (
     "Buttons:\n"
     "📂 Jobs — browse jobs and actions.\n"
     "🖥️ Workers — check render node status.\n"
-    "🗂️ Pools — manage worker pools (including disk-based pools).\n"
     "⚙️ Settings — notifications and preview defaults.\n"
     "\n"
     "Commands:\n"
