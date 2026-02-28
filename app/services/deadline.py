@@ -352,40 +352,6 @@ async def get_worker_infosettings_by_user_id(
     )
 
 
-async def save_worker_info(
-    login: str,
-    password: str,
-    worker_info: Dict[str, Any],
-) -> bool:
-    """Save worker info via Deadline /slaves Command=saveinfo."""
-    try:
-        session = await get_aiosession()
-        auth = aiohttp.BasicAuth(login, password)
-        payload = {
-            "Command": "saveinfo",
-            "SlaveInfo": worker_info,
-        }
-        async with session.put(
-            f"{settings.deadline_api_url}/slaves",
-            json=payload,
-            auth=auth,
-            ssl=settings.deadline_tls_verify,
-        ) as resp:
-            response_text = await resp.text()
-            if resp.status != 200:
-                logger.error(
-                    "Failed to save worker info: %s, response: %s",
-                    resp.status,
-                    response_text,
-                )
-                return False
-            _invalidate_workers_cache(login)
-            return True
-    except Exception as exc:
-        logger.error("Error saving worker info: %s", exc)
-        return False
-
-
 async def save_worker_settings(
     login: str,
     password: str,
@@ -418,19 +384,6 @@ async def save_worker_settings(
     except Exception as exc:
         logger.error("Error saving worker settings: %s", exc)
         return False
-
-
-async def save_worker_info_by_user_id(
-    telegram_user_id: int,
-    worker_info: Dict[str, Any],
-) -> bool:
-    """Save worker info using Telegram user credentials."""
-    return await _with_user_credentials(
-        telegram_user_id,
-        default=False,
-        operation_name="save worker info",
-        call=lambda login, password: save_worker_info(login, password, worker_info),
-    )
 
 
 async def save_worker_settings_by_user_id(

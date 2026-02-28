@@ -1025,29 +1025,3 @@ async def send_dbx_video_callback(callback_query: CallbackQuery) -> None:
     except Exception as exc:
         logger.error("Error handling send_dbx_video for user %s: %s", callback_query.from_user.id, exc)
         await callback_query.answer("Error occurred while downloading video.", show_alert=True)
-
-
-@router.callback_query(lambda c: c.data and c.data.startswith("create_new_video:"))
-async def create_new_video_callback(callback_query: CallbackQuery) -> None:
-    """Handle create new video button press."""
-    if callback_query.from_user is None:
-        await callback_query.answer("Error: User information not available.", show_alert=True)
-        return
-
-    if callback_query.data is None:
-        await callback_query.answer("Invalid callback data.", show_alert=True)
-        return
-
-    job_id = callback_query.data.split(":", 1)[1]
-
-    try:
-        await _prompt_render_method(
-            callback_query,
-            job_id,
-            "Select a preview render method:",
-        )
-        with contextlib.suppress(Exception):
-            await callback_query.answer()
-    except Exception as exc:
-        logger.error("Error handling create_new_video for user %s: %s", callback_query.from_user.id, exc)
-        await callback_query.answer("Error occurred while creating video.", show_alert=True)
