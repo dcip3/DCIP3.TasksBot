@@ -525,6 +525,86 @@ async def get_worker_report_contents(
     return reports
 
 
+async def get_job_reports(
+    login: str,
+    password: str,
+    job_id: str,
+    *,
+    report_data: str = "error",
+) -> List[Dict[str, Any]]:
+    """Fetch Deadline job reports for a specific job and report type."""
+    normalized_job_id = str(job_id or "").strip()
+    if not normalized_job_id:
+        return []
+    normalized_report_data = str(report_data or "").strip().lower() or "error"
+
+    try:
+        session = await get_aiosession()
+        auth = aiohttp.BasicAuth(login, password)
+        async with session.get(
+            f"{settings.deadline_api_url}/jobreports",
+            params={"Data": normalized_report_data, "JobID": normalized_job_id},
+            auth=auth,
+            ssl=settings.deadline_tls_verify,
+        ) as resp:
+            raw_text = await resp.text()
+            if resp.status != 200:
+                logger.error(
+                    "Failed to fetch job reports (%s) for %s: %s, response: %s",
+                    normalized_report_data,
+                    normalized_job_id,
+                    resp.status,
+                    raw_text,
+                )
+                return []
+            try:
+                payload = json.loads(raw_text)
+            except json.JSONDecodeError as decode_error:
+                logger.error(
+                    "Job reports (%s) returned invalid JSON for %s: %s (error: %s)",
+                    normalized_report_data,
+                    normalized_job_id,
+                    raw_text[:200],
+                    decode_error,
+                )
+                return []
+    except Exception as exc:
+        logger.error(
+            "Error fetching job reports (%s) for %s: %s",
+            normalized_report_data,
+            normalized_job_id,
+            exc,
+        )
+        return []
+
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+
+    if isinstance(payload, dict):
+        for key in ("Reports", "JobReports", "Data", "results", "Items"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        if {"Job", "Title", "Type"} & set(payload.keys()):
+            return [payload]
+
+    return []
+
+
+async def get_job_error_reports(
+    login: str,
+    password: str,
+    job_id: str,
+) -> List[Dict[str, Any]]:
+    """Fetch Deadline job error reports for a specific job."""
+    return await get_job_reports(
+        login,
+        password,
+        job_id,
+        report_data="error",
+    )
+
+
 async def get_job_info(login: str, password: str, job_id: str) -> Optional[Dict[str, Any]]:
     """
     Get detailed information about a specific job.

@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Callable, Literal, Optional
 
 from app.auth import _decrypt_password
-from app.core.bot_core import auto_preview_jobs, notified_jobs
+from app.core.bot_core import auto_preview_jobs, bot, notified_jobs
 from app.core.config import settings
+from app.core.ttl_cache import TTLCache
 from app.storage.database import get_db_connection
 from app.services.preview.runtime import (
     _notify_preview_job_completion,
@@ -26,7 +28,22 @@ logger = logging.getLogger(__name__)
 _AUTO_PREVIEW_SCAN_INTERVAL_SECONDS = 30
 _AUTO_PREVIEW_HISTORY_RETENTION_SECONDS = 14 * 24 * 60 * 60
 _AUTO_PREVIEW_HISTORY_CLEANUP_INTERVAL_SECONDS = 60 * 60
+_ERROR_REPORT_SCAN_INTERVAL_SECONDS = 45
+_ERROR_REPORT_MAX_AGE_SECONDS = 24 * 60 * 60
+_ERROR_ALERT_CACHE_TTL_SECONDS = 14 * 24 * 60 * 60
 _last_auto_preview_history_cleanup_monotonic = 0.0
+_error_alert_cache = TTLCache(
+    ttl_seconds=_ERROR_ALERT_CACHE_TTL_SECONDS,
+    max_size=100000,
+)
+_ERROR_ALERT_RECIPIENT_MODE_JOB_USER = "job_user"
+_ERROR_ALERT_RECIPIENT_MODE_ERROR_WORKER = "error_worker"
+_ERROR_ALERT_RECIPIENT_MODE_BOTH = "both"
+_ErrorAlertRecipientMode = Literal[
+    "job_user",
+    "error_worker",
+    "both",
+]
 
 
 @dataclass(slots=True)
@@ -40,6 +57,29 @@ class _WatcherUser:
     preview_method: Optional[str]
     preview_worker: Optional[str]
     auto_preview_enabled: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _ErrorAlertRule:
+    key: str
+    label: str
+    matcher: Callable[[dict], bool]
+    recipient_mode: _ErrorAlertRecipientMode
+
+
+def _normalize_identity(value: object) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    return raw.split("\\")[-1].split("/")[-1]
+
+
+def _identity_variants(value: object) -> set[str]:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return set()
+    short = raw.split("\\")[-1].split("/")[-1]
+    return {raw, short}
 
 
 def _job_matches_scope(scope_value: str, login_value: str, props: dict, job_entry: dict) -> bool:
@@ -112,6 +152,269 @@ def _is_recently_completed(job: dict, props: dict) -> bool:
 
     now = datetime.now(timezone.utc)
     return (now - date_comp) <= timedelta(minutes=10)
+
+
+def _parse_datetime_utc(raw_value: object) -> Optional[datetime]:
+    if not raw_value:
+        return None
+    raw = str(raw_value).strip()
+    if not raw or raw == "0001-01-01T00:00:00Z":
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _is_job_candidate_for_error_scan(job: dict) -> bool:
+    stat = int(job.get("Stat", 0) or 0)
+    # Scan only jobs that are rendering or waiting to render.
+    return stat in {1, 6}  # Active, Pending
+
+
+def _matches_redshift_activation_error(report: dict) -> bool:
+    title = str(report.get("Title") or "")
+    log_err = str(report.get("LogErr") or "")
+    combined = f"{title}\n{log_err}".lower()
+    return "redshift activation" in combined
+
+
+# Add new report alert types here: key + display label + predicate.
+_ERROR_ALERT_RULES: tuple[_ErrorAlertRule, ...] = (
+    _ErrorAlertRule(
+        key="redshift_activation",
+        label="Redshift activation error",
+        matcher=_matches_redshift_activation_error,
+        recipient_mode=_ERROR_ALERT_RECIPIENT_MODE_ERROR_WORKER,
+    ),
+)
+
+
+def _match_error_alert_rule(report: dict) -> Optional[_ErrorAlertRule]:
+    for rule in _ERROR_ALERT_RULES:
+        try:
+            if rule.matcher(report):
+                return rule
+        except Exception:
+            continue
+    return None
+
+
+def _is_recent_error_report(report: dict) -> bool:
+    reported_at = _parse_datetime_utc(report.get("Date"))
+    if reported_at is None:
+        return True
+    return (
+        datetime.now(timezone.utc) - reported_at
+    ) <= timedelta(seconds=_ERROR_REPORT_MAX_AGE_SECONDS)
+
+
+def _report_dedupe_id(job_id: str, report: dict, rule_key: str) -> str:
+    report_id = str(report.get("_id") or "").strip()
+    if report_id:
+        return f"{rule_key}:{report_id}"
+    fallback = "|".join(
+        [
+            str(rule_key or "").strip(),
+            str(job_id or "").strip(),
+            str(report.get("Task") or "").strip(),
+            str(report.get("Slave") or "").strip(),
+            str(report.get("Date") or "").strip(),
+            str(report.get("Title") or "").strip(),
+        ]
+    )
+    return fallback
+
+
+def _build_error_alert_text(report: dict, rule: _ErrorAlertRule) -> str:
+    worker_name = html.escape(str(report.get("Slave") or "Unknown"))
+    job_name = html.escape(str(report.get("JobName") or report.get("Job") or "Unknown job"))
+    title_raw = str(report.get("Title") or report.get("LogErr") or "Unknown error").strip()
+    if len(title_raw) > 900:
+        title_raw = title_raw[:897].rstrip() + "..."
+    error_text = html.escape(title_raw)
+    rule_label = html.escape(rule.label)
+
+    return "\n".join(
+        [
+            "❗ <b>Error</b>:",
+            f"🖥️ Worker: <code>{worker_name}</code>",
+            f"🏷️ Job: <code>{job_name}</code>",
+            f"⚙️ Type: <code>{rule_label}</code>",
+            f"📝 Message: <code>{error_text}</code>",
+        ]
+    )
+
+
+def _build_notification_users_by_identity(
+    users: list[_WatcherUser],
+) -> dict[str, set[int]]:
+    identity_map: dict[str, set[int]] = {}
+    for user in users:
+        for variant in _identity_variants(user.login):
+            bucket = identity_map.setdefault(variant, set())
+            bucket.add(user.telegram_user_id)
+    return identity_map
+
+
+def _resolve_error_alert_recipient_ids(
+    report: dict,
+    recipient_mode: _ErrorAlertRecipientMode,
+    users_by_identity: dict[str, set[int]],
+) -> set[int]:
+    recipient_ids: set[int] = set()
+
+    if recipient_mode in {
+        _ERROR_ALERT_RECIPIENT_MODE_JOB_USER,
+        _ERROR_ALERT_RECIPIENT_MODE_BOTH,
+    }:
+        job_user = _normalize_identity(report.get("JobUser"))
+        if job_user:
+            recipient_ids.update(users_by_identity.get(job_user, set()))
+
+    if recipient_mode in {
+        _ERROR_ALERT_RECIPIENT_MODE_ERROR_WORKER,
+        _ERROR_ALERT_RECIPIENT_MODE_BOTH,
+    }:
+        error_worker = _normalize_identity(report.get("Slave"))
+        if error_worker:
+            recipient_ids.update(users_by_identity.get(error_worker, set()))
+
+    return recipient_ids
+
+
+async def _scan_error_reports_candidates(users: list[_WatcherUser]) -> int:
+    """Scan Deadline job error reports and notify users by configured alert rules."""
+    from app.services.deadline import get_job_error_reports, get_jobs_by_credentials
+
+    notification_users = [user for user in users if user.notifications_enabled]
+    if not notification_users:
+        return 0
+    users_by_identity = _build_notification_users_by_identity(notification_users)
+
+    max_parallel = min(4, max(1, len(notification_users)))
+    semaphore = asyncio.Semaphore(max_parallel)
+
+    async def _scan_user(user: _WatcherUser) -> int:
+        async with semaphore:
+            try:
+                jobs = await get_jobs_by_credentials(
+                    user.login,
+                    user.password,
+                    use_cache=True,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Watcher: failed loading jobs for notifications user %s: %s",
+                    user.telegram_user_id,
+                    exc,
+                )
+                return 0
+
+            candidate_job_ids: list[str] = []
+            seen_job_ids: set[str] = set()
+            for job in jobs:
+                if not isinstance(job, dict):
+                    continue
+
+                job_id_raw = job.get("_id")
+                job_id = str(job_id_raw).strip() if job_id_raw else ""
+                if not job_id or job_id in seen_job_ids:
+                    continue
+
+                props = job.get("Props") or {}
+                if not isinstance(props, dict):
+                    props = {}
+
+                if _is_preview_job(props):
+                    continue
+                if not _job_matches_scope(user.notification_scope, user.login, props, job):
+                    continue
+                if not _is_job_candidate_for_error_scan(job):
+                    continue
+
+                seen_job_ids.add(job_id)
+                candidate_job_ids.append(job_id)
+                if len(candidate_job_ids) >= 40:
+                    break
+
+            sent_count = 0
+            for job_id in candidate_job_ids:
+                try:
+                    reports = await get_job_error_reports(user.login, user.password, job_id)
+                except Exception as exc:
+                    logger.error(
+                        "Watcher: failed loading error reports for user %s job %s: %s",
+                        user.telegram_user_id,
+                        job_id,
+                        exc,
+                    )
+                    continue
+
+                for report in reports:
+                    if not isinstance(report, dict):
+                        continue
+                    if not _is_recent_error_report(report):
+                        continue
+                    matched_rule = _match_error_alert_rule(report)
+                    if matched_rule is None:
+                        continue
+
+                    dedupe_id = _report_dedupe_id(job_id, report, matched_rule.key)
+                    if not dedupe_id:
+                        continue
+                    recipient_ids = _resolve_error_alert_recipient_ids(
+                        report,
+                        matched_rule.recipient_mode,
+                        users_by_identity,
+                    )
+                    if not recipient_ids:
+                        continue
+
+                    alert_text = _build_error_alert_text(report, matched_rule)
+                    for recipient_user_id in recipient_ids:
+                        dedupe_key = (dedupe_id, recipient_user_id)
+                        if dedupe_key in _error_alert_cache:
+                            continue
+
+                        try:
+                            await bot.send_message(
+                                recipient_user_id,
+                                alert_text,
+                                parse_mode="HTML",
+                            )
+                        except Exception as exc:
+                            logger.error(
+                                "Watcher: failed sending report alert to user %s for job %s: %s",
+                                recipient_user_id,
+                                job_id,
+                                exc,
+                            )
+                            continue
+
+                        _error_alert_cache.add(dedupe_key)
+                        sent_count += 1
+
+            return sent_count
+
+    tasks = [asyncio.create_task(_scan_user(user)) for user in notification_users]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    total_sent = 0
+    for user, result in zip(notification_users, results):
+        if isinstance(result, Exception):
+            logger.error(
+                "Watcher: error report scan failed for user %s: %s",
+                user.telegram_user_id,
+                result,
+            )
+            continue
+        total_sent += int(result)
+
+    return total_sent
 
 
 async def _load_watcher_users() -> list[_WatcherUser]:
@@ -464,6 +767,7 @@ async def job_progress_watcher(bot) -> None:
 
     next_interval = settings.job_watcher_interval_normal
     next_auto_scan_at = 0.0
+    next_error_scan_at = 0.0
     try:
         while True:
             loop_started = time.monotonic()
@@ -498,12 +802,23 @@ async def job_progress_watcher(bot) -> None:
             elif not auto_enabled_users:
                 next_auto_scan_at = 0.0
 
+            notification_users = [user for user in users if user.notifications_enabled]
+            if notification_users and loop_started >= next_error_scan_at:
+                alerts_sent = await _scan_error_reports_candidates(notification_users)
+                next_error_scan_at = loop_started + _ERROR_REPORT_SCAN_INTERVAL_SECONDS
+                if alerts_sent:
+                    logger.info("Watcher: sent %d report alert(s)", alerts_sent)
+            elif not notification_users:
+                next_error_scan_at = 0.0
+
             if active_targets:
                 next_interval = settings.job_watcher_interval_preview
-            elif auto_enabled_users:
-                next_interval = auto_scan_interval
             else:
                 next_interval = settings.job_watcher_interval_normal
+                if auto_enabled_users:
+                    next_interval = min(next_interval, auto_scan_interval)
+                if notification_users:
+                    next_interval = min(next_interval, _ERROR_REPORT_SCAN_INTERVAL_SECONDS)
 
             await asyncio.sleep(next_interval)
     except asyncio.CancelledError:

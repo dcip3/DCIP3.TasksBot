@@ -180,6 +180,5 @@ class Settings(BaseSettings):
             return raw
         return v
 
-
 # Global settings instance
 settings = Settings()  # type: ignore[reportCallIssue]
