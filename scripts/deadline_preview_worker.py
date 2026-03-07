@@ -32,6 +32,7 @@ from typing import Optional, List, Tuple, Set, Union
 
 
 ACTIVE_TEMP_PATHS: Set[Path] = set()
+_FFMPEG_ENCODERS_CACHE: dict[str, str] = {}
 
 
 def configure_logging(verbosity: int) -> None:
@@ -274,6 +275,68 @@ def _expand_sequence(pattern: str) -> Tuple[Path, str, int, List[Path]]:
     return directory, template, digits, files
 
 
+def _list_ffmpeg_encoders(ffmpeg_path: str) -> str:
+    cached = _FFMPEG_ENCODERS_CACHE.get(ffmpeg_path)
+    if cached is not None:
+        return cached
+
+    try:
+        result = subprocess.run(
+            [ffmpeg_path, "-hide_banner", "-encoders"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        output = f"{result.stdout}\n{result.stderr}".lower()
+    except Exception as exc:
+        logging.warning("Could not inspect ffmpeg encoders via %s: %s", ffmpeg_path, exc)
+        output = ""
+
+    _FFMPEG_ENCODERS_CACHE[ffmpeg_path] = output
+    return output
+
+
+def _resolve_video_encoder(ffmpeg_path: str, requested_encoder: str) -> str:
+    normalized = str(requested_encoder or "auto").strip().lower()
+    if normalized and normalized != "auto":
+        return normalized
+
+    encoders_text = _list_ffmpeg_encoders(ffmpeg_path)
+    if " h264_nvenc " in encoders_text:
+        return "h264_nvenc"
+    return "libx264"
+
+
+def _build_encoder_args(
+    *,
+    video_encoder: str,
+    preset: str,
+    quality: int,
+) -> list[str]:
+    if video_encoder == "h264_nvenc":
+        return [
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            preset,
+            "-rc:v",
+            "vbr",
+            "-cq:v",
+            str(quality),
+            "-b:v",
+            "0",
+        ]
+
+    return [
+        "-c:v",
+        "libx264",
+        "-preset",
+        preset,
+        "-crf",
+        str(quality),
+    ]
+
+
 def convert_sequence_cpu(
     *,
     input_pattern: str,
@@ -343,9 +406,11 @@ def build_ffmpeg_command(
     input_pattern: str,
     output_path: str,
     lut_path: Optional[Path],
+    video_encoder: str,
     preset: str,
     crf: int,
-) -> list[str]:
+) -> tuple[list[str], str]:
+    selected_encoder = _resolve_video_encoder(ffmpeg_path, video_encoder)
     command: list[str] = [
         ffmpeg_path,
         "-y",
@@ -366,19 +431,23 @@ def build_ffmpeg_command(
         command.extend(["-vf", lut_arg])
 
     command.extend(
+        _build_encoder_args(
+            video_encoder=selected_encoder,
+            preset=preset,
+            quality=crf,
+        )
+    )
+    command.extend(
         [
-            "-c:v",
-            "libx264",
-            "-preset",
-            preset,
-            "-crf",
-            str(crf),
             "-pix_fmt",
             "yuv420p",
+            "-movflags",
+            "+faststart",
+            "-an",
             output_path,
         ]
     )
-    return command
+    return command, selected_encoder
 
 
 
@@ -418,11 +487,16 @@ def _compress_if_needed(
     video_path: Path,
     ffmpeg_path: str,
     max_size_mb: float,
+    *,
+    preferred_encoder: str,
+    preset: str,
+    quality: int,
 ) -> None:
     current_size = _get_file_size_mb(video_path)
     if current_size <= max_size_mb:
         return
 
+    selected_encoder = _resolve_video_encoder(ffmpeg_path, preferred_encoder)
     ffprobe_path = _resolve_ffprobe_path(ffmpeg_path)
     duration = _get_video_duration_seconds(video_path, ffprobe_path)
     target_bitrate = None
@@ -435,37 +509,65 @@ def _compress_if_needed(
         base_cmd = [
             ffmpeg_path, "-y",
             "-i", str(video_path),
-            "-c:v", "libx264",
-            "-b:v", f"{bitrate_k}k",
-            "-maxrate", f"{int(bitrate_k * 1.2)}k",
-            "-bufsize", f"{int(bitrate_k * 2)}k",
-            "-preset", "medium",
-            "-pix_fmt", "yuv420p",
-            "-an",
         ]
+        if selected_encoder == "h264_nvenc":
+            base_cmd.extend(
+                [
+                    "-c:v", "h264_nvenc",
+                    "-preset", preset,
+                    "-rc:v", "vbr",
+                    "-cq:v", str(max(quality, 24)),
+                    "-b:v", "0",
+                    "-maxrate", f"{int(bitrate_k * 1.2)}k",
+                    "-bufsize", f"{int(bitrate_k * 2)}k",
+                ]
+            )
+        else:
+            base_cmd.extend(
+                [
+                    "-c:v", "libx264",
+                    "-b:v", f"{bitrate_k}k",
+                    "-maxrate", f"{int(bitrate_k * 1.2)}k",
+                    "-bufsize", f"{int(bitrate_k * 2)}k",
+                    "-preset", preset,
+                ]
+            )
+        base_cmd.extend(
+            [
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            "-an",
+            ]
+        )
         passlog_arg = str(passlogfile)
         cmd_pass1 = base_cmd + ["-pass", "1", "-passlogfile", passlog_arg, "-f", "mp4", os.devnull]
         cmd_pass2 = base_cmd + ["-pass", "2", "-passlogfile", passlog_arg, str(output_path)]
         run_ffmpeg(cmd_pass1)
         run_ffmpeg(cmd_pass2)
 
-    def run_crf(output_path: Path, crf: int) -> None:
-        cmd = [
-            ffmpeg_path, "-y",
-            "-i", str(video_path),
-            "-c:v", "libx264",
-            "-crf", str(crf),
-            "-preset", "slow",
-            "-pix_fmt", "yuv420p",
-            "-an",
-            str(output_path),
-        ]
+    def run_quality(output_path: Path, quality_value: int) -> None:
+        cmd = [ffmpeg_path, "-y", "-i", str(video_path)]
+        cmd.extend(
+            _build_encoder_args(
+                video_encoder=selected_encoder,
+                preset=preset,
+                quality=quality_value,
+            )
+        )
+        cmd.extend(
+            [
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                "-an",
+                str(output_path),
+            ]
+        )
         run_ffmpeg(cmd)
 
     attempts = [1.0, 0.85, 0.7, 0.55]
     best_path: Optional[Path] = None
     try:
-        if target_bitrate is not None:
+        if target_bitrate is not None and selected_encoder == "libx264":
             for idx, factor in enumerate(attempts, start=1):
                 bitrate_k = max(int(target_bitrate * factor), min_bitrate)
                 output_path = video_path.with_name(f"{video_path.stem}_compressed_{idx}.mp4")
@@ -483,9 +585,11 @@ def _compress_if_needed(
                     break
 
         if best_path is None or _get_file_size_mb(best_path) > max_size_mb:
-            for crf in (24, 26, 28, 30, 32, 34):
-                output_path = video_path.with_name(f"{video_path.stem}_compressed_crf{crf}.mp4")
-                run_crf(output_path, crf)
+            for quality_value in (max(quality, 24), 26, 28, 30, 32, 34):
+                output_path = video_path.with_name(
+                    f"{video_path.stem}_compressed_q{quality_value}.mp4"
+                )
+                run_quality(output_path, quality_value)
                 best_path = output_path
                 if _get_file_size_mb(best_path) <= max_size_mb:
                     break
@@ -522,13 +626,18 @@ def resolve_config_path(args: argparse.Namespace) -> Optional[Path]:
 
 def parse_arguments(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Deadline preview conversion helper.")
-    parser.add_argument("--input-pattern", required=True, help="Sequence pattern, e.g. path/to/shot.%04d.exr")
+    parser.add_argument("--input-pattern", required=True, help="Sequence pattern, e.g. path/to/shot.%%04d.exr")
     parser.add_argument("--output-path", required=True, help="Destination MP4 path")
     parser.add_argument("--start-number", type=int, default=0, help="First frame number in the sequence")
     parser.add_argument("--frame-rate", type=float, default=25.0, help="Playback frame rate")
     parser.add_argument("--ffmpeg-path", default="ffmpeg", help="ffmpeg executable available on the worker")
-    parser.add_argument("--preset", default="medium", help="ffmpeg libx264 preset")
-    parser.add_argument("--crf", type=int, default=20, help="ffmpeg CRF value")
+    parser.add_argument(
+        "--video-encoder",
+        default="auto",
+        help="Video encoder to use: auto (GPU-first), libx264, h264_nvenc",
+    )
+    parser.add_argument("--preset", default="fast", help="ffmpeg encoder preset")
+    parser.add_argument("--crf", type=int, default=24, help="Preview quality value (CRF/CQ)")
     parser.add_argument("--max-size-mb", type=float, default=45.0, help="Max MP4 size in MB for delivery")
     parser.add_argument(
         "--temp-dir",
@@ -708,18 +817,48 @@ def main(argv: Optional[list[str]] = None) -> int:
                 destination=lut_path,
             )
 
-        command = build_ffmpeg_command(
+        command, selected_encoder = build_ffmpeg_command(
             ffmpeg_path=args.ffmpeg_path,
             start_number=start_number,
             frame_rate=args.frame_rate,
             input_pattern=ffmpeg_input_pattern,
             output_path=args.output_path,
             lut_path=lut_path if apply_color and color_mode == "lut" else None,
+            video_encoder=args.video_encoder,
             preset=args.preset,
             crf=args.crf,
         )
-        run_ffmpeg(command)
-        _compress_if_needed(Path(args.output_path), args.ffmpeg_path, args.max_size_mb)
+        logging.info("Using preview video encoder: %s", selected_encoder)
+        try:
+            run_ffmpeg(command)
+        except Exception:
+            if selected_encoder != "libx264":
+                logging.warning(
+                    "Hardware encode with %s failed, retrying preview encode with libx264",
+                    selected_encoder,
+                )
+                command, selected_encoder = build_ffmpeg_command(
+                    ffmpeg_path=args.ffmpeg_path,
+                    start_number=start_number,
+                    frame_rate=args.frame_rate,
+                    input_pattern=ffmpeg_input_pattern,
+                    output_path=args.output_path,
+                    lut_path=lut_path if apply_color and color_mode == "lut" else None,
+                    video_encoder="libx264",
+                    preset=args.preset,
+                    crf=args.crf,
+                )
+                run_ffmpeg(command)
+            else:
+                raise
+        _compress_if_needed(
+            Path(args.output_path),
+            args.ffmpeg_path,
+            args.max_size_mb,
+            preferred_encoder=selected_encoder,
+            preset=args.preset,
+            quality=args.crf,
+        )
         logging.info("Preview video successfully written to %s", args.output_path)
         _maybe_upload_preview(Path(args.output_path))
 
