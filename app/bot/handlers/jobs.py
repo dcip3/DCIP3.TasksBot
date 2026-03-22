@@ -47,12 +47,98 @@ _ETA_MIN_PREDICTED_RATE = 1e-6
 _ETA_MAX_SMOOTHING_GAP_SECONDS = 20 * 60
 _ETA_HISTORY: dict[str, deque[tuple[datetime, float, float, int]]] = {}
 _ETA_SMOOTHED_SECONDS: dict[str, tuple[datetime, float, int]] = {}
+_JOBS_OVERVIEW_CACHE_REFRESH_SECONDS = 15.0
+_JOBS_OVERVIEW_CACHE_MAX_STALE_SECONDS = 3 * 60.0
+_JOBS_OVERVIEW_CACHE_MAX_ENTRIES = 128
+_JOBS_OVERVIEW_CACHE: dict[int, tuple[float, float, list[dict]]] = {}
+_JOBS_OVERVIEW_REFRESH_TASKS: dict[int, asyncio.Task] = {}
 _WORKERS_PAGE_SIZE = 8
 _WORKER_NAME_COLUMN_WIDTH = BATCH_COLUMN_WIDTH - 2
 
 
 def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
+
+
+def _prune_jobs_overview_cache(now: float | None = None) -> None:
+    current = time.monotonic() if now is None else now
+    expired_user_ids = [
+        user_id
+        for user_id, (_, stale_until, _) in _JOBS_OVERVIEW_CACHE.items()
+        if stale_until <= current
+    ]
+    for user_id in expired_user_ids:
+        _JOBS_OVERVIEW_CACHE.pop(user_id, None)
+        refresh_task = _JOBS_OVERVIEW_REFRESH_TASKS.get(user_id)
+        if refresh_task is not None and refresh_task.done():
+            _JOBS_OVERVIEW_REFRESH_TASKS.pop(user_id, None)
+
+    if len(_JOBS_OVERVIEW_CACHE) <= _JOBS_OVERVIEW_CACHE_MAX_ENTRIES:
+        return
+
+    survivors = sorted(
+        _JOBS_OVERVIEW_CACHE.items(),
+        key=lambda item: item[1][1],
+        reverse=True,
+    )[:_JOBS_OVERVIEW_CACHE_MAX_ENTRIES]
+    _JOBS_OVERVIEW_CACHE.clear()
+    _JOBS_OVERVIEW_CACHE.update(survivors)
+
+
+def _get_cached_jobs_overview(user_id: int) -> tuple[list[dict], bool] | None:
+    now = time.monotonic()
+    _prune_jobs_overview_cache(now)
+    cached = _JOBS_OVERVIEW_CACHE.get(user_id)
+    if cached is None:
+        return None
+    refresh_at, stale_until, combined_jobs = cached
+    if stale_until <= now:
+        _JOBS_OVERVIEW_CACHE.pop(user_id, None)
+        return None
+    return combined_jobs, refresh_at <= now
+
+
+def _store_jobs_overview(user_id: int, combined_jobs: list[dict]) -> None:
+    now = time.monotonic()
+    refresh_at = now + _JOBS_OVERVIEW_CACHE_REFRESH_SECONDS
+    stale_until = now + _JOBS_OVERVIEW_CACHE_MAX_STALE_SECONDS
+    _JOBS_OVERVIEW_CACHE[user_id] = (refresh_at, stale_until, combined_jobs)
+    _prune_jobs_overview_cache()
+
+
+async def _refresh_jobs_overview_cache(user_id: int) -> None:
+    started_at = time.monotonic()
+    try:
+        jobs = await get_jobs_list(user_id)
+        if not jobs:
+            logger.info(
+                "Jobs overview background refresh for user %s returned no jobs in %sms",
+                user_id,
+                int((time.monotonic() - started_at) * 1000),
+            )
+            return
+
+        combined_jobs = await group_and_sort_jobs(jobs)
+        _store_jobs_overview(user_id, combined_jobs)
+        logger.info(
+            "Jobs overview background refresh completed for user %s in %sms (jobs=%s)",
+            user_id,
+            int((time.monotonic() - started_at) * 1000),
+            len(combined_jobs),
+        )
+    except Exception:
+        logger.exception("Jobs overview background refresh failed for user %s", user_id)
+    finally:
+        _JOBS_OVERVIEW_REFRESH_TASKS.pop(user_id, None)
+
+
+def _ensure_jobs_overview_refresh(user_id: int) -> None:
+    refresh_task = _JOBS_OVERVIEW_REFRESH_TASKS.get(user_id)
+    if refresh_task is not None and not refresh_task.done():
+        return
+
+    task = asyncio.create_task(_refresh_jobs_overview_cache(user_id))
+    _JOBS_OVERVIEW_REFRESH_TASKS[user_id] = task
 
 
 def _prune_eta_state(now_utc: datetime) -> None:
@@ -940,30 +1026,47 @@ async def _render_jobs_overview_message(
     message: Message,
     user_id: int,
     page: int,
+    *,
+    force_refresh: bool = False,
 ) -> bool:
     flow_started_at = time.monotonic()
-    fetch_started_at = time.monotonic()
-    jobs = await get_jobs_list(user_id)
-    fetch_ms = int((time.monotonic() - fetch_started_at) * 1000)
-    if not jobs:
-        telegram_started_at = time.monotonic()
-        action = await _edit_or_send_message(message, "No jobs found.", parse_mode=None)
-        telegram_ms = int((time.monotonic() - telegram_started_at) * 1000)
-        total_ms = int((time.monotonic() - flow_started_at) * 1000)
-        logger.info(
-            "Jobs overview timings for user %s page %s: fetch=%sms telegram=%sms total=%sms action=%s empty=1",
-            user_id,
-            page,
-            fetch_ms,
-            telegram_ms,
-            total_ms,
-            action,
-        )
-        return False
+    cache_state = "miss"
+    fetch_ms = 0
+    sort_ms = 0
 
-    sort_started_at = time.monotonic()
-    combined_jobs = await group_and_sort_jobs(jobs)
-    sort_ms = int((time.monotonic() - sort_started_at) * 1000)
+    cached_entry = None if force_refresh else _get_cached_jobs_overview(user_id)
+    if cached_entry is not None:
+        combined_jobs, needs_refresh = cached_entry
+        cache_state = "stale_hit" if needs_refresh else "hit"
+        if needs_refresh:
+            _ensure_jobs_overview_refresh(user_id)
+    else:
+        fetch_started_at = time.monotonic()
+        jobs = await get_jobs_list(user_id)
+        fetch_ms = int((time.monotonic() - fetch_started_at) * 1000)
+        if not jobs:
+            telegram_started_at = time.monotonic()
+            action = await _edit_or_send_message(message, "No jobs found.", parse_mode=None)
+            telegram_ms = int((time.monotonic() - telegram_started_at) * 1000)
+            total_ms = int((time.monotonic() - flow_started_at) * 1000)
+            logger.info(
+                "Jobs overview timings for user %s page %s: cache=%s fetch=%sms telegram=%sms total=%sms action=%s empty=1",
+                user_id,
+                page,
+                "force_refresh" if force_refresh else cache_state,
+                fetch_ms,
+                telegram_ms,
+                total_ms,
+                action,
+            )
+            return False
+
+        sort_started_at = time.monotonic()
+        combined_jobs = await group_and_sort_jobs(jobs)
+        sort_ms = int((time.monotonic() - sort_started_at) * 1000)
+        _store_jobs_overview(user_id, combined_jobs)
+        cache_state = "force_refresh" if force_refresh else "miss"
+
     build_started_at = time.monotonic()
     text, keyboard = _build_jobs_overview(combined_jobs, page)
     build_ms = int((time.monotonic() - build_started_at) * 1000)
@@ -977,9 +1080,10 @@ async def _render_jobs_overview_message(
     telegram_ms = int((time.monotonic() - telegram_started_at) * 1000)
     total_ms = int((time.monotonic() - flow_started_at) * 1000)
     logger.info(
-        "Jobs overview timings for user %s page %s: fetch=%sms sort=%sms build=%sms telegram=%sms total=%sms action=%s jobs=%s",
+        "Jobs overview timings for user %s page %s: cache=%s fetch=%sms sort=%sms build=%sms telegram=%sms total=%sms action=%s jobs=%s",
         user_id,
         page,
+        cache_state,
         fetch_ms,
         sort_ms,
         build_ms,
@@ -1033,6 +1137,7 @@ async def handle_jobs(message: Message, page: int = 0) -> None:
             return
 
         combined_jobs = await group_and_sort_jobs(jobs)
+        _store_jobs_overview(message.from_user.id, combined_jobs)
         text, keyboard = _build_jobs_overview(combined_jobs, page)
         await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
 
@@ -1131,6 +1236,7 @@ async def jobs_update_callback(callback_query: CallbackQuery) -> None:
             callback_query.message,
             callback_query.from_user.id,
             page,
+            force_refresh=True,
         )
         await callback_query.answer("Updated")
     except Exception:
