@@ -44,8 +44,8 @@ _ETA_MAX_TREND_BOOST = 1.30
 _ETA_MIN_TREND_BOOST = 0.78
 _ETA_MIN_PREDICTED_RATE = 1e-6
 _ETA_MAX_SMOOTHING_GAP_SECONDS = 20 * 60
-_ETA_HISTORY: dict[str, deque[tuple[datetime, float, float]]] = {}
-_ETA_SMOOTHED_SECONDS: dict[str, tuple[datetime, float]] = {}
+_ETA_HISTORY: dict[str, deque[tuple[datetime, float, float, int]]] = {}
+_ETA_SMOOTHED_SECONDS: dict[str, tuple[datetime, float, int]] = {}
 _WORKERS_PAGE_SIZE = 8
 _WORKER_NAME_COLUMN_WIDTH = BATCH_COLUMN_WIDTH - 2
 
@@ -72,25 +72,26 @@ def _track_eta_history(
     now_utc: datetime,
     completed_frames: float,
     total_frames: float,
-) -> deque[tuple[datetime, float, float]]:
+    active_renderers: int,
+) -> deque[tuple[datetime, float, float, int]]:
     history = _ETA_HISTORY.setdefault(job_id, deque())
     if history:
-        _, prev_completed, prev_total = history[-1]
+        _, prev_completed, prev_total, _ = history[-1]
         total_changed = abs(prev_total - total_frames) > 0.01
         progress_reset = completed_frames + 0.5 < prev_completed
         if total_changed or progress_reset:
             history.clear()
             _ETA_SMOOTHED_SECONDS.pop(job_id, None)
 
-    history.append((now_utc, completed_frames, total_frames))
+    history.append((now_utc, completed_frames, total_frames, max(active_renderers, 0)))
     cutoff = now_utc - timedelta(seconds=_ETA_HISTORY_TTL_SECONDS)
     while history and history[0][0] < cutoff:
         history.popleft()
     return history
 
 
-def _estimate_rate_over_window(
-    history: deque[tuple[datetime, float, float]],
+def _estimate_efficiency_over_window(
+    history: deque[tuple[datetime, float, float, int]],
     now_utc: datetime,
     window_seconds: int,
     min_duration_seconds: int,
@@ -99,36 +100,62 @@ def _estimate_rate_over_window(
     if len(history) < 2:
         return None
 
-    latest_time, latest_completed, _ = history[-1]
+    samples = list(history)
+    latest_time, latest_completed, _, _ = samples[-1]
     cutoff = now_utc - timedelta(seconds=window_seconds)
-    baseline = history[0]
-    for sample in reversed(history):
+    baseline_idx = 0
+    for idx in range(len(samples) - 1, -1, -1):
+        sample = samples[idx]
         if sample[0] <= cutoff:
-            baseline = sample
+            baseline_idx = idx
             break
 
-    base_time, base_completed, _ = baseline
+    relevant_samples = samples[baseline_idx:]
+    if len(relevant_samples) < 2:
+        return None
+
+    base_time, base_completed, _, _ = relevant_samples[0]
     elapsed = (latest_time - base_time).total_seconds()
     frame_delta = latest_completed - base_completed
     if elapsed < min_duration_seconds or frame_delta < min_frame_delta:
         return None
-    return frame_delta / elapsed
+    worker_seconds = 0.0
+    for prev_sample, next_sample in zip(relevant_samples, relevant_samples[1:]):
+        prev_time, _, _, prev_active = prev_sample
+        next_time, _, _, next_active = next_sample
+        gap = (next_time - prev_time).total_seconds()
+        if gap <= 0:
+            continue
+        average_active = (max(prev_active, 0) + max(next_active, 0)) / 2.0
+        worker_seconds += gap * average_active
+    if worker_seconds <= 0:
+        return None
+    return frame_delta / worker_seconds
 
 
-def _smooth_eta_seconds(job_id: str, now_utc: datetime, eta_seconds: float) -> float:
+def _smooth_eta_seconds(
+    job_id: str,
+    now_utc: datetime,
+    eta_seconds: float,
+    active_renderers: int,
+) -> float:
     prev = _ETA_SMOOTHED_SECONDS.get(job_id)
     if prev is None:
-        _ETA_SMOOTHED_SECONDS[job_id] = (now_utc, eta_seconds)
+        _ETA_SMOOTHED_SECONDS[job_id] = (now_utc, eta_seconds, active_renderers)
         return eta_seconds
 
-    prev_time, prev_eta = prev
+    prev_time, prev_eta, prev_active = prev
     gap_seconds = (now_utc - prev_time).total_seconds()
-    if gap_seconds < 0 or gap_seconds > _ETA_MAX_SMOOTHING_GAP_SECONDS:
-        _ETA_SMOOTHED_SECONDS[job_id] = (now_utc, eta_seconds)
+    if (
+        gap_seconds < 0
+        or gap_seconds > _ETA_MAX_SMOOTHING_GAP_SECONDS
+        or prev_active != active_renderers
+    ):
+        _ETA_SMOOTHED_SECONDS[job_id] = (now_utc, eta_seconds, active_renderers)
         return eta_seconds
 
     smoothed = (_ETA_EMA_ALPHA * eta_seconds) + ((1.0 - _ETA_EMA_ALPHA) * prev_eta)
-    _ETA_SMOOTHED_SECONDS[job_id] = (now_utc, smoothed)
+    _ETA_SMOOTHED_SECONDS[job_id] = (now_utc, smoothed, active_renderers)
     return smoothed
 
 def _escape_pre(value: object) -> str:
@@ -193,6 +220,32 @@ def _parse_task_datetime(value: object) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _task_worker_key(task: dict, fallback_index: int) -> str:
+    for key in ("Slave", "Worker", "Machine", "WorkerName"):
+        raw_value = task.get(key)
+        if raw_value is None:
+            continue
+        value = str(raw_value).strip()
+        if value:
+            return value.casefold()
+
+    task_id = task.get("TaskId") or task.get("TaskID") or task.get("_id")
+    if task_id is not None:
+        return f"task:{task_id}"
+    return f"anonymous:{fallback_index}"
+
+
+def _count_active_renderers(tasks: list[dict]) -> int:
+    active_workers: set[str] = set()
+    for idx, task in enumerate(tasks):
+        if not isinstance(task, dict):
+            continue
+        if task.get("Stat", 1) != 4:
+            continue
+        active_workers.add(_task_worker_key(task, idx))
+    return len(active_workers)
 
 def _get_frame_progress_metrics(tasks: list[dict]) -> tuple[float, float] | None:
     if not tasks:
@@ -593,6 +646,7 @@ def _calculate_eta(
         if not tasks:
             return eta_str
 
+        active_renderers = _count_active_renderers(tasks)
         metrics = _get_frame_progress_metrics(tasks)
         if metrics is not None:
             total_frames, completed_frames = metrics
@@ -600,14 +654,18 @@ def _calculate_eta(
             if remaining_frames <= 0:
                 return "0:00:00"
 
-            history: deque[tuple[datetime, float, float]] | None = None
+            history: deque[tuple[datetime, float, float, int]] | None = None
             if job_id:
                 history = _track_eta_history(
                     job_id=job_id,
                     now_utc=now_utc,
                     completed_frames=completed_frames,
                     total_frames=total_frames,
+                    active_renderers=active_renderers,
                 )
+
+            if active_renderers <= 0:
+                return eta_str
 
             finished_seconds = 0.0
             finished_frames = 0.0
@@ -645,41 +703,45 @@ def _calculate_eta(
                     running_seconds += elapsed
                     running_frames += rendered_frames
 
-            bootstrap_rate: float | None = None
+            bootstrap_efficiency: float | None = None
             if finished_frames > 0 and finished_seconds > 0:
-                bootstrap_rate = finished_frames / finished_seconds
+                bootstrap_efficiency = finished_frames / finished_seconds
             elif running_frames > 0 and running_seconds > 0:
-                bootstrap_rate = running_frames / running_seconds
+                bootstrap_efficiency = running_frames / running_seconds
 
-            predicted_rate: float | None = bootstrap_rate
+            predicted_rate: float | None = (
+                bootstrap_efficiency * active_renderers
+                if bootstrap_efficiency is not None
+                else None
+            )
             if history is not None:
-                short_rate = _estimate_rate_over_window(
+                short_efficiency = _estimate_efficiency_over_window(
                     history=history,
                     now_utc=now_utc,
                     window_seconds=_ETA_SHORT_WINDOW_SECONDS,
                     min_duration_seconds=90,
                     min_frame_delta=0.75,
                 )
-                long_rate = _estimate_rate_over_window(
+                long_efficiency = _estimate_efficiency_over_window(
                     history=history,
                     now_utc=now_utc,
                     window_seconds=_ETA_LONG_WINDOW_SECONDS,
                     min_duration_seconds=5 * 60,
                     min_frame_delta=2.5,
                 )
-                if short_rate is not None and long_rate is not None:
-                    blended_rate = (0.70 * short_rate) + (0.30 * long_rate)
-                    trend_ratio = short_rate / max(long_rate, _ETA_MIN_PREDICTED_RATE)
+                if short_efficiency is not None and long_efficiency is not None:
+                    blended_efficiency = (0.70 * short_efficiency) + (0.30 * long_efficiency)
+                    trend_ratio = short_efficiency / max(long_efficiency, _ETA_MIN_PREDICTED_RATE)
                     trend_boost = _clamp(
                         trend_ratio ** 0.35,
                         _ETA_MIN_TREND_BOOST,
                         _ETA_MAX_TREND_BOOST,
                     )
-                    predicted_rate = blended_rate * trend_boost
-                elif short_rate is not None:
-                    predicted_rate = short_rate
-                elif long_rate is not None:
-                    predicted_rate = long_rate
+                    predicted_rate = blended_efficiency * trend_boost * active_renderers
+                elif short_efficiency is not None:
+                    predicted_rate = short_efficiency * active_renderers
+                elif long_efficiency is not None:
+                    predicted_rate = long_efficiency * active_renderers
 
             if predicted_rate is not None and predicted_rate > _ETA_MIN_PREDICTED_RATE:
                 total_eta_seconds = remaining_frames / predicted_rate
@@ -689,6 +751,7 @@ def _calculate_eta(
                             job_id=job_id,
                             now_utc=now_utc,
                             eta_seconds=total_eta_seconds,
+                            active_renderers=active_renderers,
                         )
                     eta_td = timedelta(seconds=int(total_eta_seconds))
                     eta_str = str(eta_td)
@@ -705,10 +768,23 @@ def _calculate_eta(
                 duration_val = (comp_time - start_time).total_seconds()
                 durations.append(duration_val)
 
-        if durations:
+        if durations and active_renderers > 0:
             avg_duration = sum(durations) / len(durations)
-            remaining = total_tasks - completed_chunks
-            total_eta_seconds = avg_duration * remaining
+            remaining_task_equivalents = 0.0
+            for task in tasks:
+                stat = task.get("Stat", 1)
+                if stat == 5:
+                    continue
+                if stat == 4:
+                    prog_ratio = _parse_progress_ratio(task.get("Prog"))
+                    remaining_task_equivalents += max(1.0 - (prog_ratio or 0.0), 0.0)
+                    continue
+                remaining_task_equivalents += 1.0
+
+            if remaining_task_equivalents <= 0:
+                remaining_task_equivalents = max(total_tasks - completed_chunks, 0)
+
+            total_eta_seconds = (avg_duration * remaining_task_equivalents) / active_renderers
             if total_eta_seconds > 0:
                 eta_td = timedelta(seconds=int(total_eta_seconds))
                 eta_str = str(eta_td)

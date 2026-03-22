@@ -653,7 +653,16 @@ async def preview_submit_callback(callback_query: CallbackQuery) -> None:
         progress_msg = callback_query.message
 
     try:
-        if worker_choice == "any":
+        if worker_choice == "auto":
+            await create_new_video_process(
+                callback_query,
+                job_id,
+                use_any_machine=False,
+                skip_worker_validation=True,
+                progress_message=progress_msg,
+                specific_worker=None,
+            )
+        elif worker_choice == "any":
             await create_new_video_process(
                 callback_query,
                 job_id,
@@ -741,7 +750,14 @@ async def preview_select_worker_callback(callback_query: CallbackQuery) -> None:
             await callback_query.answer("No active workers available.", show_alert=True)
             return
 
-        keyboard_rows = []
+        keyboard_rows = [
+            [
+                InlineKeyboardButton(
+                    text="✅ Auto",
+                    callback_data=f"preview_submit:{job_id}:auto",
+                )
+            ]
+        ]
         for i in range(0, len(available_workers), 2):
             row = []
             for j in range(i, min(i + 2, len(available_workers))):
@@ -908,7 +924,18 @@ async def show_worker_selection_for_preview(callback_query: CallbackQuery, job_i
 
     text = "\n".join(text_lines)
 
-    keyboard_rows = []
+    keyboard_rows = [
+        [
+            InlineKeyboardButton(
+                text=(
+                    "✅ Auto"
+                    if default_worker == PREVIEW_DEFAULT_WORKER_AUTO
+                    else "Auto"
+                ),
+                callback_data=f"preview_submit:{job_id}:auto",
+            )
+        ]
+    ]
 
     if workers:
         for i in range(0, len(workers), 2):
