@@ -126,16 +126,25 @@ async def _fetch_jobs_by_credentials(
     use_cache: bool,
     force_refresh: bool = False,
 ) -> List[Dict[str, Any]]:
+    started_at = time.monotonic()
     cache_key = _jobs_cache_key(login)
     now = time.monotonic()
 
     if use_cache and not force_refresh:
         cached = _jobs_cache.get(cache_key)
         if cached and cached[0] > now:
+            logger.info(
+                "Jobs cache hit for login %s in %sms",
+                login,
+                int((time.monotonic() - started_at) * 1000),
+            )
             return cached[1]
+
+    logger.info("Jobs cache miss for login %s", login)
 
     session = await get_aiosession()
     auth = aiohttp.BasicAuth(login, password)
+    request_started_at = time.monotonic()
     async with session.get(
         f"{settings.deadline_api_url}/jobs",
         auth=auth,
@@ -146,6 +155,15 @@ async def _fetch_jobs_by_credentials(
             logger.error("Failed to get jobs: %s, response: %s", resp.status, response_text)
             return []
         data = await resp.json()
+        request_ms = int((time.monotonic() - request_started_at) * 1000)
+        total_ms = int((time.monotonic() - started_at) * 1000)
+        logger.info(
+            "Fetched jobs from Deadline for login %s in %sms (total=%sms, count=%s)",
+            login,
+            request_ms,
+            total_ms,
+            len(data) if isinstance(data, list) else "non-list",
+        )
         if not isinstance(data, list):
             return []
 

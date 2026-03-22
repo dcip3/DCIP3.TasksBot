@@ -2,6 +2,7 @@ import asyncio
 import html
 import logging
 import re
+import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 
@@ -904,20 +905,21 @@ async def _edit_or_send_message(
     reply_markup: InlineKeyboardMarkup | None = None,
     *,
     parse_mode: str | None = "HTML",
-) -> None:
+) -> str:
     try:
         await message.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+        return "edited"
     except TelegramBadRequest as exc:
         error_text = str(exc).lower()
         if "message is not modified" in error_text:
-            return
+            return "not_modified"
         if (
             "message can't be edited" in error_text
             or "message to edit not found" in error_text
             or "message is too old" in error_text
         ):
             await message.answer(text, parse_mode=parse_mode, reply_markup=reply_markup)
-            return
+            return "sent_new"
         raise
 
 
@@ -939,18 +941,52 @@ async def _render_jobs_overview_message(
     user_id: int,
     page: int,
 ) -> bool:
+    flow_started_at = time.monotonic()
+    fetch_started_at = time.monotonic()
     jobs = await get_jobs_list(user_id)
+    fetch_ms = int((time.monotonic() - fetch_started_at) * 1000)
     if not jobs:
-        await _edit_or_send_message(message, "No jobs found.", parse_mode=None)
+        telegram_started_at = time.monotonic()
+        action = await _edit_or_send_message(message, "No jobs found.", parse_mode=None)
+        telegram_ms = int((time.monotonic() - telegram_started_at) * 1000)
+        total_ms = int((time.monotonic() - flow_started_at) * 1000)
+        logger.info(
+            "Jobs overview timings for user %s page %s: fetch=%sms telegram=%sms total=%sms action=%s empty=1",
+            user_id,
+            page,
+            fetch_ms,
+            telegram_ms,
+            total_ms,
+            action,
+        )
         return False
 
+    sort_started_at = time.monotonic()
     combined_jobs = await group_and_sort_jobs(jobs)
+    sort_ms = int((time.monotonic() - sort_started_at) * 1000)
+    build_started_at = time.monotonic()
     text, keyboard = _build_jobs_overview(combined_jobs, page)
-    await _edit_or_send_message(
+    build_ms = int((time.monotonic() - build_started_at) * 1000)
+    telegram_started_at = time.monotonic()
+    action = await _edit_or_send_message(
         message,
         text,
         keyboard,
         parse_mode="HTML",
+    )
+    telegram_ms = int((time.monotonic() - telegram_started_at) * 1000)
+    total_ms = int((time.monotonic() - flow_started_at) * 1000)
+    logger.info(
+        "Jobs overview timings for user %s page %s: fetch=%sms sort=%sms build=%sms telegram=%sms total=%sms action=%s jobs=%s",
+        user_id,
+        page,
+        fetch_ms,
+        sort_ms,
+        build_ms,
+        telegram_ms,
+        total_ms,
+        action,
+        len(combined_jobs),
     )
     return True
 

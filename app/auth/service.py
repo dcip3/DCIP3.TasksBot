@@ -1,6 +1,7 @@
 """Deadline credential authentication and session management for TasksBot."""
 
 import logging
+import time
 from typing import Optional, Tuple
 from cryptography.fernet import Fernet
 from app.core.config import settings
@@ -206,6 +207,7 @@ async def get_deadline_credentials(telegram_user_id: int) -> Optional[Tuple[str,
         Tuple of (login, decrypted_password) or None if not found
     """
     logger.info(f"Getting Deadline credentials for user {telegram_user_id}")
+    started_at = time.monotonic()
 
     conn = get_db_connection()
     if conn is None:
@@ -219,10 +221,24 @@ async def get_deadline_credentials(telegram_user_id: int) -> Optional[Tuple[str,
         ) as cursor:
             row = await cursor.fetchone()
             if row:
-                logger.info(f"Found credentials for user {telegram_user_id}")
+                db_ms = int((time.monotonic() - started_at) * 1000)
+                logger.info(
+                    "Found credentials for user %s (db=%sms)",
+                    telegram_user_id,
+                    db_ms,
+                )
                 # Decrypt password before returning
                 try:
+                    decrypt_started_at = time.monotonic()
                     decrypted_password = _decrypt_password(row[1])
+                    decrypt_ms = int((time.monotonic() - decrypt_started_at) * 1000)
+                    total_ms = int((time.monotonic() - started_at) * 1000)
+                    logger.info(
+                        "Resolved Deadline credentials for user %s (decrypt=%sms total=%sms)",
+                        telegram_user_id,
+                        decrypt_ms,
+                        total_ms,
+                    )
                     return (row[0], decrypted_password)
                 except Exception as decrypt_error:
                     logger.error(f"Failed to decrypt password for user {telegram_user_id}: {decrypt_error}")
