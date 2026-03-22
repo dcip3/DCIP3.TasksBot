@@ -358,6 +358,13 @@ def _build_jobs_overview(
         nav_buttons = []
         if page > 0:
             nav_buttons.append(back_inline_button(callback_data=f"jobs_page:{page-1}"))
+        nav_buttons.append(
+            inline_button(
+                text="🔄 Update",
+                callback_data=f"jobs_update:{page}",
+                style="primary",
+            )
+        )
         if (page + 1) < total_pages:
             nav_buttons.append(
                 back_inline_button(
@@ -478,6 +485,16 @@ def _build_workers_overview(
         )
     if nav_buttons:
         inline_keyboard.append(nav_buttons)
+
+    inline_keyboard.append(
+        [
+            inline_button(
+                text="🔄 Update",
+                callback_data=f"workers_update:{page}",
+                style="primary",
+            )
+        ]
+    )
 
     header = f"{'':2}{'Name':<{_WORKER_NAME_COLUMN_WIDTH}}   Status"
     header += f"\n{'-'*40}"
@@ -881,13 +898,15 @@ def _build_job_info_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
 
 
-async def _edit_or_send_job_info(
+async def _edit_or_send_message(
     message: Message,
     text: str,
-    reply_markup: InlineKeyboardMarkup,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    *,
+    parse_mode: str | None = "HTML",
 ) -> None:
     try:
-        await message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+        await message.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
     except TelegramBadRequest as exc:
         error_text = str(exc).lower()
         if "message is not modified" in error_text:
@@ -897,9 +916,63 @@ async def _edit_or_send_job_info(
             or "message to edit not found" in error_text
             or "message is too old" in error_text
         ):
-            await message.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+            await message.answer(text, parse_mode=parse_mode, reply_markup=reply_markup)
             return
         raise
+
+
+async def _edit_or_send_job_info(
+    message: Message,
+    text: str,
+    reply_markup: InlineKeyboardMarkup,
+) -> None:
+    await _edit_or_send_message(
+        message,
+        text,
+        reply_markup,
+        parse_mode="HTML",
+    )
+
+
+async def _render_jobs_overview_message(
+    message: Message,
+    user_id: int,
+    page: int,
+) -> bool:
+    jobs = await get_jobs_list(user_id)
+    if not jobs:
+        await _edit_or_send_message(message, "No jobs found.", parse_mode=None)
+        return False
+
+    combined_jobs = await group_and_sort_jobs(jobs)
+    text, keyboard = _build_jobs_overview(combined_jobs, page)
+    await _edit_or_send_message(
+        message,
+        text,
+        keyboard,
+        parse_mode="HTML",
+    )
+    return True
+
+
+async def _render_workers_overview_message(
+    message: Message,
+    user_id: int,
+    page: int,
+) -> bool:
+    workers = await get_workers_list(user_id)
+    if not workers:
+        await _edit_or_send_message(message, "No workers found.", parse_mode=None)
+        return False
+
+    text, keyboard = _build_workers_overview(workers, page=page)
+    await _edit_or_send_message(
+        message,
+        text,
+        keyboard,
+        parse_mode="HTML",
+    )
+    return True
 
 
 @router.message(F.text == "📂 Jobs")
@@ -957,27 +1030,21 @@ async def jobs_page_callback(callback_query: CallbackQuery) -> None:
         return
 
     try:
-        jobs = await get_jobs_list(callback_query.from_user.id)
-        if not jobs:
-            await callback_query.message.edit_text("No jobs found.")
-            return
-
-        combined_jobs = await group_and_sort_jobs(jobs)
-        text, keyboard = _build_jobs_overview(combined_jobs, page)
-        if keyboard:
-            await callback_query.message.edit_text(
-                text,
-                parse_mode="HTML",
-                reply_markup=keyboard,
-            )
-        else:
-            await callback_query.message.edit_text(text, parse_mode="HTML")
+        await _render_jobs_overview_message(
+            callback_query.message,
+            callback_query.from_user.id,
+            page,
+        )
 
     except Exception as exc:
         logger.exception(
             "Error handling jobs page for user %s", callback_query.from_user.id
         )
-        await callback_query.message.edit_text("Error occurred while fetching jobs.")
+        await _edit_or_send_message(
+            callback_query.message,
+            "Error occurred while fetching jobs.",
+            parse_mode=None,
+        )
 
 
 @router.callback_query(lambda c: c.data == "jobs_back")
@@ -989,27 +1056,52 @@ async def jobs_back_callback(callback_query: CallbackQuery) -> None:
         return
 
     try:
-        jobs = await get_jobs_list(callback_query.from_user.id)
-        if not jobs:
-            await callback_query.message.edit_text("No jobs found.")
-            return
-
-        combined_jobs = await group_and_sort_jobs(jobs)
-        text, keyboard = _build_jobs_overview(combined_jobs, 0)
-        if keyboard:
-            await callback_query.message.edit_text(
-                text,
-                parse_mode="HTML",
-                reply_markup=keyboard,
-            )
-        else:
-            await callback_query.message.edit_text(text, parse_mode="HTML")
+        await _render_jobs_overview_message(
+            callback_query.message,
+            callback_query.from_user.id,
+            0,
+        )
 
     except Exception as exc:
         logger.exception(
             "Error handling jobs back for user %s", callback_query.from_user.id
         )
-        await callback_query.message.edit_text("Error occurred while fetching jobs.")
+        await _edit_or_send_message(
+            callback_query.message,
+            "Error occurred while fetching jobs.",
+            parse_mode=None,
+        )
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("jobs_update:"))
+async def jobs_update_callback(callback_query: CallbackQuery) -> None:
+    """Refresh jobs list on the current page."""
+    if callback_query.from_user is None or callback_query.message is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    page_str = callback_query.data.split(":", 1)[1]
+    try:
+        page = int(page_str)
+    except ValueError:
+        await callback_query.answer("Invalid page number.", show_alert=True)
+        return
+
+    try:
+        await _render_jobs_overview_message(
+            callback_query.message,
+            callback_query.from_user.id,
+            page,
+        )
+        await callback_query.answer("Updated")
+    except Exception:
+        logger.exception(
+            "Error updating jobs list for user %s", callback_query.from_user.id
+        )
+        await callback_query.answer("Error occurred while updating jobs.", show_alert=True)
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("job_info:"))
@@ -1256,17 +1348,10 @@ async def workers_page_callback(callback_query: CallbackQuery) -> None:
         return
 
     try:
-        workers = await get_workers_list(callback_query.from_user.id)
-        if not workers:
-            await callback_query.message.edit_text("No workers found.")
-            await callback_query.answer()
-            return
-
-        text, keyboard = _build_workers_overview(workers, page=page)
-        await callback_query.message.edit_text(
-            text,
-            parse_mode="HTML",
-            reply_markup=keyboard,
+        await _render_workers_overview_message(
+            callback_query.message,
+            callback_query.from_user.id,
+            page,
         )
         await callback_query.answer()
     except Exception:
@@ -1293,16 +1378,10 @@ async def workers_back_callback(callback_query: CallbackQuery) -> None:
         page = 0
 
     try:
-        workers = await get_workers_list(callback_query.from_user.id)
-        if not workers:
-            await callback_query.message.edit_text("No workers found.")
-            await callback_query.answer()
-            return
-        text, keyboard = _build_workers_overview(workers, page=page)
-        await callback_query.message.edit_text(
-            text,
-            parse_mode="HTML",
-            reply_markup=keyboard,
+        await _render_workers_overview_message(
+            callback_query.message,
+            callback_query.from_user.id,
+            page,
         )
         await callback_query.answer()
     except Exception:
@@ -1310,6 +1389,37 @@ async def workers_back_callback(callback_query: CallbackQuery) -> None:
             "Error handling workers back for user %s", callback_query.from_user.id
         )
         await callback_query.answer("Error occurred while fetching workers.", show_alert=True)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("workers_update:"))
+async def workers_update_callback(callback_query: CallbackQuery) -> None:
+    """Refresh workers list on the current page."""
+    if callback_query.from_user is None or callback_query.message is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+    if callback_query.data is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    page_str = callback_query.data.split(":", 1)[1]
+    try:
+        page = int(page_str)
+    except ValueError:
+        await callback_query.answer("Invalid page number.", show_alert=True)
+        return
+
+    try:
+        await _render_workers_overview_message(
+            callback_query.message,
+            callback_query.from_user.id,
+            page,
+        )
+        await callback_query.answer("Updated")
+    except Exception:
+        logger.exception(
+            "Error updating workers list for user %s", callback_query.from_user.id
+        )
+        await callback_query.answer("Error occurred while updating workers.", show_alert=True)
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("worker_info:"))
