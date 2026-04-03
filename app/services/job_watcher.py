@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -24,6 +25,15 @@ from app.services.preview.runtime import (
 from app.storage.user_settings import VALID_PREVIEW_RENDER_METHODS, _normalize_scope
 
 logger = logging.getLogger(__name__)
+
+_UNABLE_TO_OPEN_FILE_RE = re.compile(
+    r"unable to open file:\s*([a-z]:[^\r\n]+)",
+    re.IGNORECASE,
+)
+_INPUT_FILE_RE = re.compile(
+    r"input file:\s*([a-z]:[^\r\n]+)",
+    re.IGNORECASE,
+)
 
 _AUTO_PREVIEW_SCAN_INTERVAL_SECONDS = 30
 _AUTO_PREVIEW_HISTORY_RETENTION_SECONDS = 14 * 24 * 60 * 60
@@ -182,6 +192,58 @@ def _matches_redshift_activation_error(report: dict) -> bool:
     return "redshift activation" in combined
 
 
+def _report_search_text(report: dict) -> str:
+    chunks: list[str] = []
+
+    def walk(node: object) -> None:
+        if len(chunks) >= 64:
+            return
+        if isinstance(node, dict):
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+        elif isinstance(node, str):
+            text = node.strip()
+            if text:
+                chunks.append(text)
+
+    walk(report)
+    return "\n".join(chunks)
+
+
+def _clean_report_path(raw_path: str) -> str:
+    return raw_path.strip().strip('"').strip("'").rstrip(".")
+
+
+def _extract_report_path(report: dict) -> Optional[str]:
+    search_text = _report_search_text(report)
+    for pattern in (_UNABLE_TO_OPEN_FILE_RE, _INPUT_FILE_RE):
+        match = pattern.search(search_text)
+        if match:
+            candidate = _clean_report_path(match.group(1))
+            if candidate:
+                return candidate
+    return None
+
+
+def _matches_local_c_drive_open_error(report: dict) -> bool:
+    search_text = _report_search_text(report)
+    if not search_text:
+        return False
+
+    normalized = search_text.lower()
+    if "unable to open file:" not in normalized:
+        return False
+
+    path = _extract_report_path(report)
+    if not path or not path.lower().startswith("c:"):
+        return False
+
+    return True
+
+
 # Add new report alert types here: key + display label + predicate.
 _ERROR_ALERT_RULES: tuple[_ErrorAlertRule, ...] = (
     _ErrorAlertRule(
@@ -189,6 +251,12 @@ _ERROR_ALERT_RULES: tuple[_ErrorAlertRule, ...] = (
         label="Redshift activation error",
         matcher=_matches_redshift_activation_error,
         recipient_mode=_ERROR_ALERT_RECIPIENT_MODE_ERROR_WORKER,
+    ),
+    _ErrorAlertRule(
+        key="local_c_drive_open_error",
+        label="Local C: path is not accessible on worker",
+        matcher=_matches_local_c_drive_open_error,
+        recipient_mode=_ERROR_ALERT_RECIPIENT_MODE_JOB_USER,
     ),
 )
 
@@ -238,6 +306,22 @@ def _build_error_alert_text(report: dict, rule: _ErrorAlertRule) -> str:
     error_text = html.escape(title_raw)
     rule_label = html.escape(rule.label)
 
+    if rule.key == "local_c_drive_open_error":
+        local_path = _extract_report_path(report)
+        details = [
+            "❗ <b>Error</b>:",
+            f"🖥️ Worker: <code>{worker_name}</code>",
+            f"🏷️ Job: <code>{job_name}</code>",
+            f"⚙️ Type: <code>{rule_label}</code>",
+        ]
+        if local_path:
+            details.append(f"📁 Path: <code>{html.escape(local_path)}</code>")
+        details.append(
+            "💡 Hint: <code>Worker cannot open a local file from drive C:. "
+            "Submit the job from a shared/network path that every worker can access.</code>"
+        )
+        return "\n".join(details)
+
     return "\n".join(
         [
             "❗ <b>Error</b>:",
@@ -258,6 +342,21 @@ def _build_notification_users_by_identity(
             bucket = identity_map.setdefault(variant, set())
             bucket.add(user.telegram_user_id)
     return identity_map
+
+
+def _report_debug_summary(report: dict) -> str:
+    report_id = str(report.get("_id") or "-").strip()
+    slave = str(report.get("Slave") or "-").strip()
+    job_user = str(report.get("JobUser") or "-").strip()
+    title = str(report.get("Title") or report.get("LogErr") or "").strip().replace("\r", " ").replace("\n", " ")
+    if len(title) > 140:
+        title = title[:137].rstrip() + "..."
+    path = _extract_report_path(report) or "-"
+    has_contents = bool(str(report.get("ErrorContents") or "").strip())
+    return (
+        f"report_id={report_id} slave={slave} job_user={job_user} "
+        f"has_contents={int(has_contents)} path={path} title={title or '-'}"
+    )
 
 
 def _resolve_error_alert_recipient_ids(
@@ -288,7 +387,11 @@ def _resolve_error_alert_recipient_ids(
 
 async def _scan_error_reports_candidates(users: list[_WatcherUser]) -> int:
     """Scan Deadline job error reports and notify users by configured alert rules."""
-    from app.services.deadline import get_job_error_reports, get_jobs_by_credentials
+    from app.services.deadline import (
+        get_job_error_reports,
+        get_job_report_contents,
+        get_jobs_by_credentials,
+    )
 
     notification_users = [user for user in users if user.notifications_enabled]
     if not notification_users:
@@ -313,6 +416,14 @@ async def _scan_error_reports_candidates(users: list[_WatcherUser]) -> int:
                     exc,
                 )
                 return 0
+
+            logger.info(
+                "Watcher: notification scan start user_id=%s login=%s scope=%s jobs=%s",
+                user.telegram_user_id,
+                user.login,
+                user.notification_scope,
+                len(jobs),
+            )
 
             candidate_job_ids: list[str] = []
             seen_job_ids: set[str] = set()
@@ -341,6 +452,14 @@ async def _scan_error_reports_candidates(users: list[_WatcherUser]) -> int:
                 if len(candidate_job_ids) >= 40:
                     break
 
+            logger.info(
+                "Watcher: notification scan candidates user_id=%s login=%s candidate_jobs=%s ids=%s",
+                user.telegram_user_id,
+                user.login,
+                len(candidate_job_ids),
+                candidate_job_ids[:10],
+            )
+
             sent_count = 0
             for job_id in candidate_job_ids:
                 try:
@@ -354,30 +473,125 @@ async def _scan_error_reports_candidates(users: list[_WatcherUser]) -> int:
                     )
                     continue
 
+                logger.info(
+                    "Watcher: loaded error reports user_id=%s login=%s job_id=%s count=%s",
+                    user.telegram_user_id,
+                    user.login,
+                    job_id,
+                    len(reports),
+                )
+
                 for report in reports:
                     if not isinstance(report, dict):
                         continue
                     if not _is_recent_error_report(report):
+                        logger.info(
+                            "Watcher: skipped stale report user_id=%s job_id=%s %s",
+                            user.telegram_user_id,
+                            job_id,
+                            _report_debug_summary(report),
+                        )
                         continue
-                    matched_rule = _match_error_alert_rule(report)
+                    report_payload = report
+                    matched_rule = _match_error_alert_rule(report_payload)
+                    logger.info(
+                        "Watcher: short report evaluation user_id=%s job_id=%s matched_rule=%s %s",
+                        user.telegram_user_id,
+                        job_id,
+                        matched_rule.key if matched_rule else "-",
+                        _report_debug_summary(report_payload),
+                    )
                     if matched_rule is None:
+                        report_id = str(report.get("_id") or "").strip()
+                        if report_id:
+                            try:
+                                report_contents = await get_job_report_contents(
+                                    user.login,
+                                    user.password,
+                                    job_id,
+                                    report_id,
+                                )
+                            except Exception as exc:
+                                logger.error(
+                                    "Watcher: failed loading error contents for user %s job %s report %s: %s",
+                                    user.telegram_user_id,
+                                    job_id,
+                                    report_id,
+                                    exc,
+                                )
+                                report_contents = None
+
+                            if report_contents:
+                                logger.info(
+                                    "Watcher: loaded error contents user_id=%s job_id=%s report_id=%s chars=%s",
+                                    user.telegram_user_id,
+                                    job_id,
+                                    report_id,
+                                    len(report_contents),
+                                )
+                                report_payload = dict(report)
+                                report_payload["ErrorContents"] = report_contents
+                                matched_rule = _match_error_alert_rule(report_payload)
+                                logger.info(
+                                    "Watcher: full report evaluation user_id=%s job_id=%s matched_rule=%s %s",
+                                    user.telegram_user_id,
+                                    job_id,
+                                    matched_rule.key if matched_rule else "-",
+                                    _report_debug_summary(report_payload),
+                                )
+                            else:
+                                logger.info(
+                                    "Watcher: no error contents user_id=%s job_id=%s report_id=%s",
+                                    user.telegram_user_id,
+                                    job_id,
+                                    report_id,
+                                )
+
+                    if matched_rule is None:
+                        logger.info(
+                            "Watcher: no alert rule matched user_id=%s job_id=%s %s",
+                            user.telegram_user_id,
+                            job_id,
+                            _report_debug_summary(report_payload),
+                        )
                         continue
 
                     dedupe_id = _report_dedupe_id(job_id, report, matched_rule.key)
                     if not dedupe_id:
+                        logger.info(
+                            "Watcher: empty dedupe id user_id=%s job_id=%s rule=%s",
+                            user.telegram_user_id,
+                            job_id,
+                            matched_rule.key,
+                        )
                         continue
                     recipient_ids = _resolve_error_alert_recipient_ids(
-                        report,
+                        report_payload,
                         matched_rule.recipient_mode,
                         users_by_identity,
+                    )
+                    logger.info(
+                        "Watcher: recipient resolution user_id=%s job_id=%s rule=%s mode=%s recipients=%s",
+                        user.telegram_user_id,
+                        job_id,
+                        matched_rule.key,
+                        matched_rule.recipient_mode,
+                        sorted(recipient_ids),
                     )
                     if not recipient_ids:
                         continue
 
-                    alert_text = _build_error_alert_text(report, matched_rule)
+                    alert_text = _build_error_alert_text(report_payload, matched_rule)
                     for recipient_user_id in recipient_ids:
                         dedupe_key = (dedupe_id, recipient_user_id)
                         if dedupe_key in _error_alert_cache:
+                            logger.info(
+                                "Watcher: skipped duplicate alert user_id=%s job_id=%s recipient=%s dedupe_id=%s",
+                                user.telegram_user_id,
+                                job_id,
+                                recipient_user_id,
+                                dedupe_id,
+                            )
                             continue
 
                         try:
@@ -397,6 +611,14 @@ async def _scan_error_reports_candidates(users: list[_WatcherUser]) -> int:
 
                         _error_alert_cache.add(dedupe_key)
                         sent_count += 1
+                        logger.info(
+                            "Watcher: alert sent user_id=%s job_id=%s recipient=%s rule=%s dedupe_id=%s",
+                            user.telegram_user_id,
+                            job_id,
+                            recipient_user_id,
+                            matched_rule.key,
+                            dedupe_id,
+                        )
 
             return sent_count
 

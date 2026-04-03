@@ -623,6 +623,66 @@ async def get_job_error_reports(
     )
 
 
+async def get_job_report_contents(
+    login: str,
+    password: str,
+    job_id: str,
+    report_id: str,
+) -> Optional[str]:
+    """Fetch the full contents of a single Deadline job error report."""
+    normalized_job_id = str(job_id or "").strip()
+    normalized_report_id = str(report_id or "").strip()
+    if not normalized_job_id or not normalized_report_id:
+        return None
+
+    try:
+        session = await get_aiosession()
+        auth = aiohttp.BasicAuth(login, password)
+        async with session.get(
+            f"{settings.deadline_api_url}/jobreports",
+            params={
+                "Data": "errorcontents",
+                "JobID": normalized_job_id,
+                "ReportID": normalized_report_id,
+            },
+            auth=auth,
+            ssl=settings.deadline_tls_verify,
+        ) as resp:
+            raw_text = await resp.text()
+            if resp.status != 200:
+                logger.error(
+                    "Failed to fetch job report contents for %s/%s: %s, response: %s",
+                    normalized_job_id,
+                    normalized_report_id,
+                    resp.status,
+                    raw_text[:400],
+                )
+                return None
+    except Exception as exc:
+        logger.error(
+            "Error fetching job report contents for %s/%s: %s",
+            normalized_job_id,
+            normalized_report_id,
+            exc,
+        )
+        return None
+
+    try:
+        payload = json.loads(raw_text)
+    except json.JSONDecodeError:
+        payload = raw_text
+
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("Contents", "ReportContents", "Content", "Text", "Log"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+
+    return raw_text or None
+
+
 async def get_job_info(login: str, password: str, job_id: str) -> Optional[Dict[str, Any]]:
     """
     Get detailed information about a specific job.
