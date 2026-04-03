@@ -49,10 +49,18 @@ _error_alert_cache = TTLCache(
 _ERROR_ALERT_RECIPIENT_MODE_JOB_USER = "job_user"
 _ERROR_ALERT_RECIPIENT_MODE_ERROR_WORKER = "error_worker"
 _ERROR_ALERT_RECIPIENT_MODE_BOTH = "both"
+_ERROR_ALERT_SEVERITY_CRITICAL = "critical"
+_ERROR_ALERT_SEVERITY_WARNING = "warning"
+_ERROR_ALERT_SEVERITY_INFO = "info"
 _ErrorAlertRecipientMode = Literal[
     "job_user",
     "error_worker",
     "both",
+]
+_ErrorAlertSeverity = Literal[
+    "critical",
+    "warning",
+    "info",
 ]
 
 
@@ -75,6 +83,7 @@ class _ErrorAlertRule:
     label: str
     matcher: Callable[[dict], bool]
     recipient_mode: _ErrorAlertRecipientMode
+    severity: _ErrorAlertSeverity
 
 
 def _normalize_identity(value: object) -> str:
@@ -251,12 +260,14 @@ _ERROR_ALERT_RULES: tuple[_ErrorAlertRule, ...] = (
         label="Redshift activation error",
         matcher=_matches_redshift_activation_error,
         recipient_mode=_ERROR_ALERT_RECIPIENT_MODE_ERROR_WORKER,
+        severity=_ERROR_ALERT_SEVERITY_CRITICAL,
     ),
     _ErrorAlertRule(
         key="local_c_drive_open_error",
         label="Local C: path is not accessible on worker",
         matcher=_matches_local_c_drive_open_error,
         recipient_mode=_ERROR_ALERT_RECIPIENT_MODE_JOB_USER,
+        severity=_ERROR_ALERT_SEVERITY_WARNING,
     ),
 )
 
@@ -281,6 +292,9 @@ def _is_recent_error_report(report: dict) -> bool:
 
 
 def _report_dedupe_id(job_id: str, report: dict, rule_key: str) -> str:
+    if rule_key == "local_c_drive_open_error":
+        return f"{rule_key}:{str(job_id or '').strip()}"
+
     report_id = str(report.get("_id") or "").strip()
     if report_id:
         return f"{rule_key}:{report_id}"
@@ -305,32 +319,53 @@ def _build_error_alert_text(report: dict, rule: _ErrorAlertRule) -> str:
         title_raw = title_raw[:897].rstrip() + "..."
     error_text = html.escape(title_raw)
     rule_label = html.escape(rule.label)
+    severity_icon, severity_label = _format_error_alert_severity(rule.severity)
+
+    header_lines = [
+        f"{severity_icon} <b>{severity_label}</b>",
+        "",
+        f"🏷️ <b>Issue</b>: <code>{rule_label}</code>",
+        "",
+        f"🎬 <b>Job</b>: <code>{job_name}</code>",
+        f"🖥️ <b>Worker</b>: <code>{worker_name}</code>",
+    ]
 
     if rule.key == "local_c_drive_open_error":
         local_path = _extract_report_path(report)
-        details = [
-            "❗ <b>Error</b>:",
-            f"🖥️ Worker: <code>{worker_name}</code>",
-            f"🏷️ Job: <code>{job_name}</code>",
-            f"⚙️ Type: <code>{rule_label}</code>",
-        ]
+        details = list(header_lines)
         if local_path:
-            details.append(f"📁 Path: <code>{html.escape(local_path)}</code>")
-        details.append(
-            "💡 Hint: <code>Worker cannot open a local file from drive C:. "
-            "Submit the job from a shared/network path that every worker can access.</code>"
+            details.extend(
+                [
+                    "",
+                    "📁 <b>Path</b>:",
+                    f"<code>{html.escape(local_path)}</code>",
+                ]
+            )
+        details.extend(
+            [
+                "",
+                "💡 <b>What To Do</b>:",
+                "• Submit the scene from a shared or network path.",
+                "• Do not submit from a local <code>C:</code> path that exists only on your workstation.",
+            ]
         )
         return "\n".join(details)
 
     return "\n".join(
-        [
-            "❗ <b>Error</b>:",
-            f"🖥️ Worker: <code>{worker_name}</code>",
-            f"🏷️ Job: <code>{job_name}</code>",
-            f"⚙️ Type: <code>{rule_label}</code>",
-            f"📝 Message: <code>{error_text}</code>",
+        header_lines
+        + [
+            "",
+            f"📝 <b>Message</b>: <code>{error_text}</code>",
         ]
     )
+
+
+def _format_error_alert_severity(severity: _ErrorAlertSeverity) -> tuple[str, str]:
+    if severity == _ERROR_ALERT_SEVERITY_CRITICAL:
+        return "🔴", "Critical"
+    if severity == _ERROR_ALERT_SEVERITY_WARNING:
+        return "🟡", "Warning"
+    return "🟢", "Info"
 
 
 def _build_notification_users_by_identity(
