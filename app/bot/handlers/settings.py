@@ -198,9 +198,8 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
         default_worker = await get_preview_default_worker(user_id)
         workers = await get_workers_list(user_id)
 
-        text_lines = ["Preview Worker Settings", ""]
         text_lines = [
-            "🖥️ Preview Worker",
+            "🖥️ Default Worker",
             "",
         ]
         if default_worker == PREVIEW_DEFAULT_WORKER_AUTO:
@@ -215,7 +214,7 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
                 "• Applies to: Deadline previews only",
                 "• Server method ignores this setting",
                 "",
-                "Pick where previews should be rendered:",
+                "Choose where Deadline previews should run:",
                 "• ✅ Auto — inherit the source job machine list (whitelist/blacklist)",
                 "• 🖥️ Specific worker — always use that machine",
                 "• ❓ Always ask — always show the worker picker",
@@ -280,7 +279,7 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
         }
 
         text_lines = [
-            "🎛 Preview Method",
+            "🎬 Default Method",
             "",
             f"• Default: {method_display.get(default_method, 'Always ask')}",
             "• Applies to: how previews are rendered",
@@ -344,7 +343,7 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
             ],
             [
                 inline_button(
-                    text="🎛 Default Method",
+                    text="🎬 Default Method",
                     callback_data="settings:preview:method",
                 ),
             ],
@@ -486,13 +485,13 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
                     method_value = parts[4]
                     if method_value == "none":
                         await set_preview_default_method(user_id, None)
-                        await callback_query.answer("Preview method set to: Always ask")
+                        await callback_query.answer("Default method set to: Always ask")
                     elif method_value in {"server", "deadline"}:
                         await set_preview_default_method(user_id, method_value)
                         await callback_query.answer(
-                            "Preview method set to: Server"
+                            "Default method set to: Server"
                             if method_value == "server"
-                            else "Preview method set to: Deadline"
+                            else "Default method set to: Deadline"
                         )
                     else:
                         await callback_query.answer("Unsupported option.", show_alert=True)
