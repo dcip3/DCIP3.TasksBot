@@ -55,6 +55,47 @@ docker compose up --build
 docker compose logs -f tasksbot
 ```
 
+## Automatic Deploy
+
+The repository includes a minimal GitHub Actions deploy workflow at `.github/workflows/deploy.yml`.
+
+### One-time VDS setup
+1. Create a dedicated deploy user if needed.
+2. Clone the repository to `/opt/docker/tasksbot`.
+3. Copy `.env.example` to `.env` and fill in real secrets.
+4. Make sure the deploy user can run Docker commands.
+5. Generate an SSH key that GitHub Actions will use to connect to the server.
+
+Example setup on the VDS:
+
+```bash
+ssh-keygen -t ed25519 -C "deploy" -f ~/.ssh/deploy_key
+cat ~/.ssh/deploy_key.pub >> ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys
+```
+
+### GitHub Actions secrets
+Add these repository secrets:
+- `VDS_HOST`
+- `VDS_USER`
+- `VDS_SSH_KEY`
+
+`VDS_SSH_KEY` must contain the private key from `~/.ssh/deploy_key`.
+
+If the repository is private, make sure the clone in `/opt/docker/tasksbot` is already configured so `git pull origin main` works on the server.
+
+### Deploy flow
+After setup, every `git push origin main` will:
+1. trigger GitHub Actions,
+2. SSH into the VDS,
+3. run:
+
+```bash
+cd /opt/docker/tasksbot
+git pull origin main
+docker compose up -d --build --remove-orphans
+```
+
 ### 3. Run locally
 ```bash
 python -m venv .venv
