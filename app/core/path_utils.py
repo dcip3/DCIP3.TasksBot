@@ -39,6 +39,14 @@ def normalize_display_path(path: Optional[str]) -> Optional[str]:
     return str(normalized)
 
 
+def normalize_preview_path(path: Optional[str]) -> Optional[str]:
+    """Normalize preview paths for user-facing captions without a Windows drive letter."""
+    normalized = normalize_dropbox_path(path)
+    if normalized:
+        return normalized
+    return normalize_display_path(path)
+
+
 def normalize_dropbox_path(path: Optional[str]) -> Optional[str]:
     if not path:
         return None

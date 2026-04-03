@@ -233,10 +233,7 @@ async def render_preview_via_server_pipeline(callback_query: CallbackQuery, job_
             except Exception:
                 pass
 
-            caption_lines = [f"🖼️ {project_name}"]
-            if dropbox_path:
-                caption_lines.append(f"<code>{dropbox_path}</code>")
-            caption = "\n".join(caption_lines)
+            caption = build_preview_caption(project_name, dropbox_path, icon="🖼️")
 
             if callback_query.message:
                 await callback_query.message.answer_photo(

@@ -20,7 +20,7 @@ from aiogram.types import FSInputFile
 
 from app.core.bot_core import bot, notified_jobs
 from app.core.config import settings
-from app.core.path_utils import normalize_display_path
+from app.core.path_utils import normalize_preview_path
 from app.integrations.video_helpers import prepare_video_for_delivery
 
 logger = logging.getLogger(__name__)
@@ -528,8 +528,8 @@ async def _deliver_preview(payload: PreviewUploadPayload, temp_path: Path) -> No
     else:
         await bot.send_message(target_chat_id, ready_text)
 
-    path_hint = payload.expected_local_path or payload.expected_dropbox_path
-    display_path = normalize_display_path(path_hint)
+    path_hint = payload.expected_dropbox_path or payload.expected_local_path
+    display_path = normalize_preview_path(path_hint)
     preparation = await prepare_video_for_delivery(
         temp_path,
         dropbox_path=display_path,

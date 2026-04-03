@@ -248,9 +248,12 @@ async def _notify_preview_job_completion(
                     ]
                 )
 
+            from app.core.path_utils import normalize_preview_path
+
+            display_local_path = normalize_preview_path(str(local_path)) or str(local_path)
             message_text = (
                 f"⚠️ Preview for {job_name} finished, but the file is still not available at:\n"
-                f"{local_path}\n\n"
+                f"{display_local_path}\n\n"
                 "Possible reasons: the preview upload token expired or the path is not accessible "
                 "from the bot host. The preview job will be removed."
             )
@@ -304,12 +307,12 @@ async def _notify_preview_job_completion(
         final_path = local_path
         dropbox_path = dropbox_path or dropbox_path_hint
 
-    from app.core.path_utils import normalize_display_path
+    from app.core.path_utils import normalize_preview_path
 
     max_video_size_mb = 45.0
     size_mb = get_file_size_mb(final_path)
     path_hint = dropbox_path if dropbox_path else str(final_path)
-    display_path = normalize_display_path(path_hint) or str(final_path)
+    display_path = normalize_preview_path(path_hint) or str(final_path)
     fallback_message = None
     if size_mb > max_video_size_mb:
         location_hint = f"<code>{display_path}</code>"

@@ -2,7 +2,7 @@
 
 from typing import Optional
 
-from app.core.path_utils import normalize_display_path
+from app.core.path_utils import normalize_preview_path
 
 
 def _normalize_title(title: Optional[str]) -> str:
@@ -22,5 +22,5 @@ def build_preview_caption(
     header = f"{icon} {_normalize_title(title)}"
     if not path:
         return header
-    display_path = normalize_display_path(path) or str(path)
-    return f"{header}\n<code>{display_path}</code>"
+    display_path = normalize_preview_path(path) or str(path)
+    return f"{header}\n\n<code>{display_path}</code>"
