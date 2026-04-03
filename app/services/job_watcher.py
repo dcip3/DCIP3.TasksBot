@@ -259,7 +259,7 @@ _ERROR_ALERT_RULES: tuple[_ErrorAlertRule, ...] = (
         key="redshift_activation",
         label="Redshift activation error",
         matcher=_matches_redshift_activation_error,
-        recipient_mode=_ERROR_ALERT_RECIPIENT_MODE_ERROR_WORKER,
+        recipient_mode=_ERROR_ALERT_RECIPIENT_MODE_BOTH,
         severity=_ERROR_ALERT_SEVERITY_CRITICAL,
     ),
     _ErrorAlertRule(
