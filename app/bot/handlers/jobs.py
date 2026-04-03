@@ -248,6 +248,14 @@ def _smooth_eta_seconds(
 def _escape_pre(value: object) -> str:
     return html.escape(str(value))
 
+
+def _extract_job_errors(job: dict) -> int:
+    try:
+        return max(0, int(job.get("Errs", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _parse_progress_ratio(value: object) -> float | None:
     if value is None:
         return None
@@ -1319,6 +1327,7 @@ async def job_info_callback(callback_query: CallbackQuery) -> None:
             stat = job.get("Stat", 0)
             stat_name = settings.job_status_map.get(stat, "Unknown")
             current_job_id = job.get("_id")
+            errors_count = _extract_job_errors(job)
 
             eta_str = "N/A"
             if stat in {1, 6}:
@@ -1336,6 +1345,7 @@ async def job_info_callback(callback_query: CallbackQuery) -> None:
                 f"{indent}🏷️ Name: <code>{html.escape(str(name))}</code>",
                 f"{indent}⚙️ Status: <code>{html.escape(str(stat_name))}</code>",
                 f"{indent}⏳ Progress: <code>{html.escape(str(progress_str))}</code>",
+                f"{indent}❌ Errors: <code>{errors_count}</code>",
             ]
             if stat in {1, 6}:
                 info_lines.append(f"{indent}⏱️ ETA: <code>{html.escape(str(eta_str))}</code>")
@@ -1401,6 +1411,7 @@ async def job_update_callback(callback_query: CallbackQuery) -> None:
         name = full_name.split("/")[-1] if "/" in full_name else full_name
         stat = selected_job.get("Stat", 0)
         stat_name = settings.job_status_map.get(stat, "Unknown")
+        errors_count = _extract_job_errors(selected_job)
 
         eta_str = "N/A"
         if stat in {1, 6}:
@@ -1417,6 +1428,7 @@ async def job_update_callback(callback_query: CallbackQuery) -> None:
             f"🏷️ Name: <code>{html.escape(str(name))}</code>",
             f"⚙️ Status: <code>{html.escape(str(stat_name))}</code>",
             f"⏳ Progress: <code>{html.escape(str(progress_str))}</code>",
+            f"❌ Errors: <code>{errors_count}</code>",
         ]
         if stat in {1, 6}:
             info_lines.append(f"⏱️ ETA: <code>{html.escape(str(eta_str))}</code>")
