@@ -216,7 +216,7 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
                 "• Server method ignores this setting",
                 "",
                 "Pick where previews should be rendered:",
-                "• ✅ Auto — prefer the job creator or workers that rendered the job",
+                "• ✅ Auto — inherit the source job machine list (whitelist/blacklist)",
                 "• 🖥️ Specific worker — always use that machine",
                 "• ❓ Always ask — always show the worker picker",
             ]
@@ -471,7 +471,7 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
                         )
                     elif worker_name == "auto":
                         await set_preview_default_worker(user_id, PREVIEW_DEFAULT_WORKER_AUTO)
-                        await callback_query.answer("Default worker set to: Auto (render worker)")
+                        await callback_query.answer("Default worker set to: Auto (job machine list)")
                     else:
                         await set_preview_default_worker(user_id, worker_name)
                         await callback_query.answer(f"Default worker set to: {worker_name}")

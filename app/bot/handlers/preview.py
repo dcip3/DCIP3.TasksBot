@@ -315,7 +315,7 @@ async def _start_deadline_preview(callback_query: CallbackQuery, job_id: str) ->
             return
         except Exception as exc:
             logger.error(
-                "Error auto-submitting preview with render worker preference: %s",
+                "Error auto-submitting preview with inherited job machine list: %s",
                 exc,
             )
             try:
@@ -918,7 +918,7 @@ async def show_worker_selection_for_preview(callback_query: CallbackQuery, job_i
 
     text_lines = ["🎬 Select worker for preview rendering:"]
     if default_worker == PREVIEW_DEFAULT_WORKER_AUTO:
-        text_lines.append("\nDefault: Auto (render worker)")
+        text_lines.append("\nDefault: Auto (job machine list)")
     elif default_worker:
         text_lines.append(f"\nDefault: {default_worker}")
 

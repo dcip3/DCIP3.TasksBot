@@ -4,7 +4,6 @@ Preview creation and delivery service functions.
 
 from typing import Optional, List, Dict, Any, Tuple, Union
 from pathlib import Path, PurePosixPath
-from collections import Counter
 import base64
 import json
 import logging
@@ -29,7 +28,6 @@ from app.services.deadline import (
     DeadlineSubmissionError,
     WorkerStatusError,
     get_job_info,
-    get_job_tasks,
     get_workers_by_credentials,
     submit_deadline_job,
 )
@@ -88,6 +86,50 @@ def _load_preview_helper_script_b64(script_path: Path) -> str:
 def _sanitize_windows_filename(name: str) -> str:
     """Replace characters that are invalid in Windows file names."""
     return re.sub(r'[\\/:*?"<>|]', "_", name)
+
+
+def _normalize_listed_workers(raw_value: Any) -> List[str]:
+    """Normalize Deadline machine restriction values into a unique worker list."""
+    if raw_value is None:
+        return []
+
+    if isinstance(raw_value, (list, tuple)):
+        values = list(raw_value)
+    else:
+        raw_text = str(raw_value).strip()
+        if not raw_text:
+            return []
+        values = raw_text.split(",")
+
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        worker_name = str(value or "").strip()
+        if not worker_name:
+            continue
+        worker_key = worker_name.lower()
+        if worker_key in seen:
+            continue
+        seen.add(worker_key)
+        normalized.append(worker_name)
+    return normalized
+
+
+def _resolve_machine_restrictions(job_props: Dict[str, Any]) -> tuple[List[str], Optional[bool]]:
+    """Extract whitelist/blacklist settings from the source job."""
+    listed_workers = _normalize_listed_workers(job_props.get("ListedSlaves"))
+    if not listed_workers:
+        return [], None
+
+    whitelist_flag_raw = job_props.get("White")
+    if isinstance(whitelist_flag_raw, str):
+        whitelist_flag = whitelist_flag_raw.strip().lower() not in {"false", "0", "no"}
+    elif whitelist_flag_raw is None:
+        whitelist_flag = True
+    else:
+        whitelist_flag = bool(whitelist_flag_raw)
+
+    return listed_workers, whitelist_flag
 
 
 
@@ -335,35 +377,17 @@ async def create_video_from_job(
     if not is_windows_path:
         python_args_str = " ".join(shlex.quote(arg) for arg in python_args)
 
-    slave_counter: Counter[str] = Counter()
-    if not specific_worker and not use_any_machine:
-        tasks = await get_job_tasks(login, password, job_id)
-        slave_counter = Counter(
-            task.get("Slave") for task in tasks if isinstance(task, dict) and task.get("Slave")
-        )
-
-    # Prefer the worker that created/submitted the job
-    job_creator_machine = props.get("Mach")
-    preferred_slaves = []
-
-    if job_creator_machine:
-        # Put creator's machine first
-        preferred_slaves.append(job_creator_machine)
-        # Add other workers that rendered this job
-        for slave, _ in slave_counter.most_common():
-            if slave != job_creator_machine and slave not in preferred_slaves:
-                preferred_slaves.append(slave)
-    else:
-        # Fallback to workers that rendered tasks
-        preferred_slaves = [slave for slave, _ in slave_counter.most_common()]
+    preferred_slaves, whitelist_flag = _resolve_machine_restrictions(props)
 
     # Override with specific worker if requested
     if specific_worker:
         preferred_slaves = [specific_worker]
+        whitelist_flag = True
     elif use_any_machine:
         preferred_slaves = []
+        whitelist_flag = None
 
-    if preferred_slaves and not skip_worker_validation:
+    if preferred_slaves and whitelist_flag is not False and not skip_worker_validation:
         workers = await get_workers_by_credentials(login, password)
         worker_map = {}
         for worker in workers:
@@ -422,6 +446,7 @@ async def create_video_from_job(
         preview_job_info["Group"] = props["Grp"]
     if preferred_slaves:
         preview_job_info["Whitelist"] = ",".join(preferred_slaves)
+        preview_job_info["WhitelistFlag"] = "True" if whitelist_flag is not False else "False"
 
     environment_pairs: Dict[str, str] = {
         "PREVIEW_SCRIPT_B64": script_b64,
