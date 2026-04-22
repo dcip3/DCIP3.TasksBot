@@ -82,7 +82,7 @@ Add these repository secrets:
 
 `VDS_SSH_KEY` must contain the private key from `~/.ssh/deploy_key`.
 
-If the repository is private, make sure the clone in `/opt/docker/tasksbot` is already configured so `git pull origin main` works on the server.
+If the repository is private, make sure the clone in `/opt/docker/tasksbot` is already configured so `git fetch origin main` works on the server.
 
 ### Deploy flow
 After setup, every `git push origin main` will:
@@ -92,8 +92,11 @@ After setup, every `git push origin main` will:
 
 ```bash
 cd /opt/docker/tasksbot
-git pull origin main
-docker compose up -d --build --remove-orphans
+git fetch origin main
+git reset --hard origin/main
+docker compose build
+docker compose down --remove-orphans
+docker compose up -d --remove-orphans
 ```
 
 ### 3. Run locally
