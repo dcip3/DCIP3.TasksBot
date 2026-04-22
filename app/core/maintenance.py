@@ -23,11 +23,13 @@ def has_enough_space(path: str, min_free_bytes: int | None = None) -> bool:
     return free >= min_free_bytes
 
 
-def clear_folder(folder_path: str | Path) -> None:
+def clear_folder(folder_path: str | Path, preserve_prefixes: tuple[str, ...] = ()) -> None:
     """Clear folder contents without deleting the folder itself."""
     folder = Path(folder_path)
     if folder.exists():
         for item in folder.iterdir():
+            if preserve_prefixes and item.name.startswith(preserve_prefixes):
+                continue
             try:
                 if item.is_dir():
                     shutil.rmtree(item, ignore_errors=True)
@@ -77,7 +79,8 @@ def _cleanup_preview_temp_dir() -> None:
 
 def cleanup_temp_and_conv() -> None:
     """Clear temp/conv directories and optional preview temp directory."""
-    clear_folder(Path(settings.temp_dir))
+    preserve_prefixes = ("upload_",) if settings.preview_upload_enabled else ()
+    clear_folder(Path(settings.temp_dir), preserve_prefixes=preserve_prefixes)
     clear_folder(Path(settings.conv_dir))
     _cleanup_preview_temp_dir()
     logger.info("Cleaned up temp, conv, and preview directories (where accessible)")
@@ -85,7 +88,8 @@ def cleanup_temp_and_conv() -> None:
 
 def force_cleanup_temp_and_conv() -> None:
     """Force cleanup for error recovery; keeps directories in place."""
-    clear_folder(Path(settings.temp_dir))
+    preserve_prefixes = ("upload_",) if settings.preview_upload_enabled else ()
+    clear_folder(Path(settings.temp_dir), preserve_prefixes=preserve_prefixes)
     clear_folder(Path(settings.conv_dir))
     _cleanup_preview_temp_dir()
     logger.info("Force cleaned up temp, conv, and preview directories (where accessible)")

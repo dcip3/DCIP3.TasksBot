@@ -144,11 +144,14 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 | `PREVIEW_UPLOAD_TOKEN_TTL` | `43200` | One-time token TTL (seconds) |
 | `PREVIEW_UPLOAD_MAX_MB` | `100` | Max upload size |
 | `PREVIEW_UPLOAD_INSECURE` | `False` | Allow insecure TLS |
+| `PREVIEW_UPLOAD_DELIVERY_WAIT_SECONDS` | `600` | Wait window for worker upload after preview completion |
+| `PREVIEW_UPLOAD_DELIVERY_MAX_ATTEMPTS` | `10` | Bot-side delivery retry limit for received uploads |
+| `PREVIEW_UPLOAD_RECOVERY_INTERVAL_SECONDS` | `120` | Retry/recovery scan interval |
 
 Notes:
 - Expose `PREVIEW_UPLOAD_PORT` from Docker/network to workers.
 - Tokens are short-lived and persisted in SQLite.
-- Upload handling uses async DB + async file I/O.
+- Upload handling saves the worker file first, then delivers it to Telegram in the background with retries.
 
 ## Telegram Usage
 

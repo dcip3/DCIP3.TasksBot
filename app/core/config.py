@@ -119,6 +119,21 @@ class Settings(BaseSettings):
         False,
         description="Allow insecure TLS for worker uploads (self-signed certs)",
     )
+    preview_upload_delivery_wait_seconds: int = Field(
+        600,
+        ge=60,
+        description="How long to wait for worker preview upload delivery after Deadline completion",
+    )
+    preview_upload_delivery_max_attempts: int = Field(
+        10,
+        ge=1,
+        description="Maximum bot-side attempts to deliver a received worker preview upload",
+    )
+    preview_upload_recovery_interval_seconds: int = Field(
+        120,
+        ge=30,
+        description="Interval for retrying received worker preview uploads",
+    )
 
     # Security Settings
     encryption_key: str = Field(..., description="Fernet encryption key for password storage (generate with Fernet.generate_key())")

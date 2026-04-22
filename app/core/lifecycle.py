@@ -9,6 +9,7 @@ from typing import Optional
 from aiogram.types import BotCommand
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from app.core.bot_core import close_aiosession, init_aiosession
 from app.core.config import settings
@@ -39,12 +40,15 @@ async def on_startup(bot) -> None:
     await init_db()
     logger.info("Database initialized")
 
-    from app.core.preview_upload import start_preview_upload_server
+    from app.core.preview_upload import recover_preview_uploads, start_preview_upload_server
 
     await start_preview_upload_server()
 
     ensure_temp_dir()
     cleanup_temp_and_conv()
+    recovered = await recover_preview_uploads()
+    if recovered:
+        logger.info("Scheduled %s pending preview upload recovery task(s)", recovered)
     logger.info("Startup cleanup completed")
 
     await bot.set_my_commands(
@@ -99,6 +103,24 @@ async def on_startup(bot) -> None:
         id="cleanup_preview_tokens",
         replace_existing=True,
     )
+
+    async def recover_preview_upload_tokens() -> None:
+        from app.core.preview_upload import recover_preview_uploads
+
+        recovered_count = await recover_preview_uploads()
+        if recovered_count:
+            logger.info(
+                "Scheduled %s preview upload delivery retry task(s)",
+                recovered_count,
+            )
+
+    if settings.preview_upload_enabled:
+        scheduler.add_job(
+            recover_preview_upload_tokens,
+            IntervalTrigger(seconds=settings.preview_upload_recovery_interval_seconds),
+            id="recover_preview_uploads",
+            replace_existing=True,
+        )
 
     logger.info("Scheduled cleanup tasks added")
 

@@ -25,6 +25,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import time
 import contextlib
 import urllib.parse
 from pathlib import Path
@@ -677,20 +678,36 @@ def _env_flag(name: str) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
-def _maybe_upload_preview(output_path: Path) -> None:
+def _maybe_upload_preview(output_path: Path) -> bool:
     upload_url = os.environ.get("PREVIEW_UPLOAD_URL", "").strip()
     token = os.environ.get("PREVIEW_UPLOAD_TOKEN", "").strip()
     if not upload_url or not token:
-        return
+        return True
 
-    try:
-        ok = _upload_preview_file(output_path, upload_url, token, _env_flag("PREVIEW_UPLOAD_INSECURE"))
+    attempt_delays = (0, 10, 30, 60)
+    for attempt, delay in enumerate(attempt_delays, start=1):
+        if delay:
+            time.sleep(delay)
+        try:
+            ok = _upload_preview_file(
+                output_path,
+                upload_url,
+                token,
+                _env_flag("PREVIEW_UPLOAD_INSECURE"),
+            )
+        except Exception as exc:
+            logging.warning(
+                "Preview upload attempt %s/%s error: %s",
+                attempt,
+                len(attempt_delays),
+                exc,
+            )
+            ok = False
         if ok:
-            logging.info("Preview upload succeeded")
-        else:
-            logging.warning("Preview upload failed")
-    except Exception as exc:
-        logging.warning("Preview upload error: %s", exc)
+            logging.info("Preview upload succeeded on attempt %s/%s", attempt, len(attempt_delays))
+            return True
+        logging.warning("Preview upload attempt %s/%s failed", attempt, len(attempt_delays))
+    return False
 
 
 def _upload_preview_file(
@@ -860,7 +877,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             quality=args.crf,
         )
         logging.info("Preview video successfully written to %s", args.output_path)
-        _maybe_upload_preview(Path(args.output_path))
+        if not _maybe_upload_preview(Path(args.output_path)):
+            raise RuntimeError("Preview upload failed after retries")
 
         if apply_color and color_mode == "lut" and args.keep_lut:
             logging.info("LUT kept at %s", lut_path)

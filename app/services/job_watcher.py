@@ -818,14 +818,16 @@ async def _process_active_preview_job(
     if notified_key in notified_jobs:
         return
 
-    notified_user_id = await _notify_preview_job_completion(
+    completion_result = await _notify_preview_job_completion(
         user.telegram_user_id,
         job,
         name,
         user.login,
         user.password,
     )
-    resolved_user_id = notified_user_id or target_user
+    if completion_result.status == "deferred":
+        return
+    resolved_user_id = completion_result.user_id or target_user
     notified_jobs.add((preview_job_id, resolved_user_id))
 
 
@@ -873,7 +875,7 @@ async def _register_auto_preview_history(telegram_user_id: int, job_id: str) -> 
             if await cursor.fetchone():
                 return False
 
-        await conn.execute(
+        cursor = await conn.execute(
             """
             INSERT OR IGNORE INTO auto_preview_history (telegram_user_id, job_id, created_at)
             VALUES (?, ?, ?)
@@ -881,7 +883,7 @@ async def _register_auto_preview_history(telegram_user_id: int, job_id: str) -> 
             (telegram_user_id, job_id, int(time.time())),
         )
         await conn.commit()
-        return True
+        return (cursor.rowcount or 0) > 0
     except Exception as exc:
         logger.warning(
             "Watcher: failed to access auto_preview_history for user %s job %s: %s",

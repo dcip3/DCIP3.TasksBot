@@ -7,6 +7,8 @@ import contextlib
 import html
 import logging
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -14,6 +16,7 @@ from aiogram.exceptions import TelegramRetryAfter
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 
 from app.core.bot_core import bot
+from app.core.config import settings
 from app.core.ui_helpers import cancel_inline_button
 from app.integrations.video_helpers import get_file_size_mb, prepare_video_for_delivery
 
@@ -26,6 +29,13 @@ _SINGLE_RETRY_ATTEMPT_TIMEOUT_SECONDS = 20.0
 # Track preview submission progress messages (preview_job_id -> (chat_id, message_id))
 preview_message_registry: dict[str, tuple[int, int]] = {}
 preview_animation_tasks: dict[str, asyncio.Task] = {}
+preview_upload_wait_notice_jobs: set[str] = set()
+
+
+@dataclass(frozen=True)
+class PreviewCompletionResult:
+    status: str
+    user_id: Optional[int] = None
 
 
 def register_preview_message(preview_job_id: str, chat_id: int, message_id: int) -> None:
@@ -41,11 +51,24 @@ def register_preview_message(preview_job_id: str, chat_id: int, message_id: int)
 
 def pop_preview_message(preview_job_id: str) -> Optional[tuple[int, int]]:
     """Retrieve and remove stored progress message for a preview job."""
+    preview_upload_wait_notice_jobs.discard(preview_job_id)
     info = preview_message_registry.pop(preview_job_id, None)
     task = preview_animation_tasks.pop(preview_job_id, None)
     if task and not task.done():
         task.cancel()
     return info
+
+
+def peek_preview_message(preview_job_id: str) -> Optional[tuple[int, int]]:
+    """Return stored progress message info without unregistering the preview job."""
+    return preview_message_registry.get(preview_job_id)
+
+
+def stop_preview_animation(preview_job_id: str) -> None:
+    """Stop progress animation while keeping the preview job registered."""
+    task = preview_animation_tasks.pop(preview_job_id, None)
+    if task and not task.done():
+        task.cancel()
 
 
 async def _run_preview_animation(preview_job_id: str, chat_id: int, message_id: int) -> None:
@@ -152,13 +175,72 @@ def _extract_preview_context(
     return local_path_hint, dropbox_path_hint, target_user_id, extra_dict, source_job_id
 
 
+def _parse_deadline_timestamp(raw_value: object) -> Optional[float]:
+    if not raw_value:
+        return None
+    raw = str(raw_value).strip()
+    if not raw or raw == "0001-01-01T00:00:00Z":
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).timestamp()
+
+
+def _preview_upload_wait_expired(job: dict, state_created_at: int) -> bool:
+    completed_at = _parse_deadline_timestamp(job.get("DateComp") or job.get("Props", {}).get("DateComp"))
+    wait_started_at = completed_at or float(state_created_at or 0)
+    if wait_started_at <= 0:
+        wait_started_at = time.time()
+    return (time.time() - wait_started_at) >= settings.preview_upload_delivery_wait_seconds
+
+
+async def _edit_preview_waiting_for_upload(
+    job_id: str,
+    target_user_id: int,
+    job_name: str,
+) -> None:
+    stop_preview_animation(job_id)
+    message_text = (
+        f"⏳ Preview for {job_name} finished. Waiting for worker upload to arrive..."
+    )
+    stored_message = preview_message_registry.get(job_id)
+    if stored_message:
+        chat_id, message_id = stored_message
+        try:
+            await bot.edit_message_text(
+                message_text,
+                chat_id=chat_id,
+                message_id=message_id,
+            )
+            preview_upload_wait_notice_jobs.add(job_id)
+            return
+        except Exception as edit_error:
+            message = str(edit_error).lower()
+            if "message is not modified" in message:
+                preview_upload_wait_notice_jobs.add(job_id)
+                return
+            logger.debug(
+                "Failed to edit preview upload waiting message for job %s: %s",
+                job_id,
+                edit_error,
+            )
+    if job_id in preview_upload_wait_notice_jobs:
+        return
+    await bot.send_message(target_user_id, message_text)
+    preview_upload_wait_notice_jobs.add(job_id)
+
+
 async def _notify_preview_job_completion(
     telegram_user_id: int,
     job: dict,
     job_name: str,
     login: str,
     password: str,
-) -> Optional[int]:
+) -> PreviewCompletionResult:
     """Send ready preview video to the user when the ffmpeg job finishes."""
     props = job.get("Props", {})
     job_id = job.get("_id", "")
@@ -221,7 +303,7 @@ async def _notify_preview_job_completion(
                 f"⚠️ Preview for {job_name} is ready, but the file path is missing.",
             )
             logger.warning("Preview job %s has no recorded paths", job_id)
-            return None
+            return PreviewCompletionResult("notified", target_user_id)
 
         if not local_path.exists():
             deadline = time.monotonic() + _PREVIEW_RESOLVE_TIMEOUT_SECONDS
@@ -235,6 +317,35 @@ async def _notify_preview_job_completion(
                     break
 
         if not local_path.exists():
+            upload_state = None
+            try:
+                from app.core.preview_upload import get_preview_upload_state_for_job
+
+                upload_state = await get_preview_upload_state_for_job(job_id)
+            except Exception as upload_state_error:
+                logger.warning(
+                    "Failed to inspect preview upload token for job %s: %s",
+                    job_id,
+                    upload_state_error,
+                )
+
+            if upload_state is not None:
+                wait_expired = _preview_upload_wait_expired(job, upload_state.created_at)
+                attempts_exhausted = upload_state.attempts_exhausted
+                if not wait_expired and not attempts_exhausted:
+                    await _edit_preview_waiting_for_upload(
+                        job_id,
+                        target_user_id,
+                        job_name,
+                    )
+                    logger.info(
+                        "Preview job %s waiting for upload delivery (status=%s attempts=%s)",
+                        job_id,
+                        upload_state.status,
+                        upload_state.delivery_attempts,
+                    )
+                    return PreviewCompletionResult("deferred", target_user_id)
+
             retry_markup = None
             if source_job_id:
                 retry_markup = InlineKeyboardMarkup(
@@ -251,12 +362,26 @@ async def _notify_preview_job_completion(
             from app.core.path_utils import normalize_preview_path
 
             display_local_path = normalize_preview_path(str(local_path)) or str(local_path)
-            message_text = (
-                f"⚠️ Preview for {job_name} finished, but the file is still not available at:\n"
-                f"{display_local_path}\n\n"
-                "Possible reasons: the preview upload token expired or the path is not accessible "
-                "from the bot host. The preview job will be removed."
-            )
+            if upload_state is not None:
+                details = [
+                    f"Upload status: {upload_state.status}",
+                    f"Delivery attempts: {upload_state.delivery_attempts}/{settings.preview_upload_delivery_max_attempts}",
+                ]
+                if upload_state.last_error:
+                    details.append(f"Last error: {upload_state.last_error}")
+                message_text = (
+                    f"⚠️ Preview for {job_name} finished, but the worker upload could not be delivered.\n"
+                    f"{display_local_path}\n\n"
+                    + "\n".join(details)
+                    + "\n\nThe preview job will be removed."
+                )
+            else:
+                message_text = (
+                    f"⚠️ Preview for {job_name} finished, but the file is still not available at:\n"
+                    f"{display_local_path}\n\n"
+                    "Possible reasons: the preview upload token expired or the path is not accessible "
+                    "from the bot host. The preview job will be removed."
+                )
 
             stored_message = pop_preview_message(job_id)
             if stored_message:
@@ -302,7 +427,7 @@ async def _notify_preview_job_completion(
                 )
 
             logger.warning("Preview file %s not found after job %s", local_path, job_id)
-            return target_user_id
+            return PreviewCompletionResult("notified", target_user_id)
 
         final_path = local_path
         dropbox_path = dropbox_path or dropbox_path_hint
@@ -387,7 +512,7 @@ async def _notify_preview_job_completion(
         )
 
     logger.info("Preview video sent to user %s for job %s", target_user_id, job_id)
-    return target_user_id
+    return PreviewCompletionResult("delivered", target_user_id)
 
 
 async def _notify_preview_job_failure(
