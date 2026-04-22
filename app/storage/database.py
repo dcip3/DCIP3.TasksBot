@@ -145,14 +145,6 @@ async def init_db():
         CREATE INDEX IF NOT EXISTS idx_preview_upload_tokens_expires
         ON preview_upload_tokens(expires_at)
     """)
-    await tasks_db_conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_preview_upload_tokens_preview_job
-        ON preview_upload_tokens(preview_job_id)
-    """)
-    await tasks_db_conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_preview_upload_tokens_retry
-        ON preview_upload_tokens(status, next_retry_at)
-    """)
     await _ensure_column(
         tasks_db_conn,
         "preview_upload_tokens",
@@ -177,6 +169,14 @@ async def init_db():
             column_sql,
         )
     await _backfill_preview_upload_columns(tasks_db_conn)
+    await tasks_db_conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_preview_upload_tokens_preview_job
+        ON preview_upload_tokens(preview_job_id)
+    """)
+    await tasks_db_conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_preview_upload_tokens_retry
+        ON preview_upload_tokens(status, next_retry_at)
+    """)
 
     # Persist auto-preview dedupe history across restarts
     await tasks_db_conn.execute(
