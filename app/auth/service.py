@@ -169,11 +169,15 @@ async def save_deadline_credentials(telegram_user_id: int, deadline_login: str, 
         # Encrypt password before storage
         encrypted_password = _encrypt_password(deadline_password)
 
-        # Insert or update session data
+        # Insert or update credentials without resetting user preferences.
         await conn.execute("""
-            INSERT OR REPLACE INTO user_sessions
+            INSERT INTO user_sessions
             (telegram_user_id, deadline_login, deadline_password, last_login)
             VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(telegram_user_id) DO UPDATE SET
+                deadline_login = excluded.deadline_login,
+                deadline_password = excluded.deadline_password,
+                last_login = CURRENT_TIMESTAMP
         """, (telegram_user_id, deadline_login, encrypted_password))
         await conn.commit()
         logger.info(f"Successfully saved Deadline credentials for user {telegram_user_id}")

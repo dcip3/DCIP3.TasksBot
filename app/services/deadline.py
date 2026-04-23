@@ -753,7 +753,12 @@ async def get_job_tasks(login: str, password: str, job_id: str) -> List[Dict[str
     try:
         session = await get_aiosession()
         headers = aiohttp.BasicAuth(login, password)
-        async with session.get(f"{settings.deadline_api_url}/tasks?JobID={job_id}", auth=headers, ssl=settings.deadline_tls_verify) as resp:
+        async with session.get(
+            f"{settings.deadline_api_url}/tasks",
+            params={"JobID": job_id},
+            auth=headers,
+            ssl=settings.deadline_tls_verify,
+        ) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 # API may return {"Tasks": [...]} or a plain list
@@ -1087,7 +1092,12 @@ async def delete_job(login: str, password: str, job_id: str) -> bool:
     try:
         session = await get_aiosession()
         headers = aiohttp.BasicAuth(login, password)
-        async with session.delete(f"{settings.deadline_api_url}/jobs?JobID={job_id}", auth=headers, ssl=settings.deadline_tls_verify) as resp:
+        async with session.delete(
+            f"{settings.deadline_api_url}/jobs",
+            params={"JobID": job_id},
+            auth=headers,
+            ssl=settings.deadline_tls_verify,
+        ) as resp:
             success = resp.status == 200
             if not success:
                 logger.error(f"Failed to delete job: {resp.status}")

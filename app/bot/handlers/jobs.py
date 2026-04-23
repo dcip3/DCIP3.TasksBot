@@ -1781,7 +1781,44 @@ async def suspend_job_callback(callback_query: CallbackQuery) -> None:
 
 @router.callback_query(lambda c: c.data and c.data.startswith("delete_job:"))
 async def delete_job_callback(callback_query: CallbackQuery) -> None:
-    """Handle delete job button press."""
+    """Ask for confirmation before deleting a job."""
+    if callback_query.from_user is None or callback_query.data is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+
+    if callback_query.message is None:
+        await callback_query.answer("Message not available.", show_alert=True)
+        return
+
+    job_id = callback_query.data.split(":", 1)[1]
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Confirm delete",
+                    callback_data=f"delete_job_confirm:{job_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Cancel",
+                    callback_data=f"delete_job_cancel:{job_id}",
+                )
+            ],
+        ]
+    )
+
+    await callback_query.message.answer(
+        f"Delete this job?\n<code>{html.escape(job_id)}</code>",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+    await callback_query.answer("Please confirm deletion.", show_alert=False)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("delete_job_confirm:"))
+async def delete_job_confirm_callback(callback_query: CallbackQuery) -> None:
+    """Delete a job after explicit confirmation."""
     if callback_query.from_user is None or callback_query.data is None:
         await callback_query.answer("Invalid request.", show_alert=True)
         return
@@ -1801,6 +1838,17 @@ async def delete_job_callback(callback_query: CallbackQuery) -> None:
             "Error deleting job for user %s", callback_query.from_user.id
         )
         await callback_query.answer("Error occurred while deleting job.", show_alert=True)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("delete_job_cancel:"))
+async def delete_job_cancel_callback(callback_query: CallbackQuery) -> None:
+    """Cancel a pending job deletion confirmation."""
+    if callback_query.message:
+        try:
+            await callback_query.message.edit_text("Job deletion cancelled.", reply_markup=None)
+        except Exception:
+            await callback_query.message.answer("Job deletion cancelled.")
+    await callback_query.answer("Deletion cancelled.", show_alert=False)
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("tasks_job:"))

@@ -822,9 +822,6 @@ def _extract_token(request: web.Request) -> Optional[str]:
     auth_header = request.headers.get("Authorization", "")
     if auth_header.lower().startswith("bearer "):
         return auth_header.split(" ", 1)[1].strip()
-    query_token = request.query.get("token")
-    if query_token:
-        return query_token.strip()
     return None
 
 
