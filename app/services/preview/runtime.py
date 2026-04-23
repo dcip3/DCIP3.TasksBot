@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 from aiogram.exceptions import TelegramRetryAfter
@@ -36,6 +37,17 @@ preview_upload_wait_notice_jobs: set[str] = set()
 class PreviewCompletionResult:
     status: str
     user_id: Optional[int] = None
+
+
+class _AutoPreviewCallback:
+    """Minimal callback shape for reusing preview handlers from auto-preview."""
+
+    def __init__(self, user_id: int) -> None:
+        self.from_user = SimpleNamespace(id=user_id)
+        self.message = None
+
+    async def answer(self, *args, **kwargs) -> None:
+        return None
 
 
 def register_preview_message(preview_job_id: str, chat_id: int, message_id: int) -> None:
@@ -850,6 +862,20 @@ async def _run_auto_preview_for_job(
         )
         return
 
+    auto_callback = None
+    try:
+        from app.bot.handlers.preview import _maybe_send_single_frame_preview, render_preview_via_server
+
+        # Single-frame render outputs are often valid locally but fragile in Telegram
+        # when sent as the already-rendered MP4. Match manual regeneration behavior:
+        # send the source frame through the server preview path before considering
+        # an existing Dropbox video.
+        auto_callback = _AutoPreviewCallback(telegram_user_id)
+        if await _maybe_send_single_frame_preview(auto_callback, job_id):
+            return
+    except Exception as exc:
+        logger.warning("Auto preview single-frame check failed for job %s: %s", job_id, exc)
+
     try:
         sent_existing = await _send_dropbox_video_to_user(
             telegram_user_id,
@@ -863,23 +889,11 @@ async def _run_auto_preview_for_job(
         logger.warning("Auto preview Dropbox send failed for job %s: %s", job_id, exc)
 
     try:
-        from types import SimpleNamespace
-
-        from app.bot.handlers.preview import _maybe_send_single_frame_preview, render_preview_via_server
-
-        class _AutoCallback:
-            def __init__(self, user_id: int) -> None:
-                self.from_user = SimpleNamespace(id=user_id)
-                self.message = None
-
-            async def answer(self, *args, **kwargs) -> None:
-                return None
-
-        auto_callback = _AutoCallback(telegram_user_id)
+        if auto_callback is None:
+            from app.bot.handlers.preview import render_preview_via_server
+            auto_callback = _AutoPreviewCallback(telegram_user_id)
 
         if preview_method == "deadline":
-            if await _maybe_send_single_frame_preview(auto_callback, job_id):
-                return
             await _submit_auto_preview_deadline(
                 telegram_user_id,
                 job_id,
