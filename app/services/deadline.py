@@ -936,145 +936,72 @@ async def submit_deadline_job(
     return submission_response
 
 
-async def requeue_job(login: str, password: str, job_id: str) -> bool:
-    """
-    Requeue a job.
+_PUT_JOB_COMMANDS = ("requeue", "resume", "suspend")
 
-    Args:
-        login: User login
-        password: User password
-        job_id: Job ID
 
-    Returns:
-        True if successful, False otherwise
-    """
+async def _put_job_command(login: str, password: str, command: str, job_id: str) -> bool:
+    """Send a PUT /jobs command (requeue/resume/suspend) under given credentials."""
+    if command not in _PUT_JOB_COMMANDS:
+        raise ValueError(f"Unsupported job command: {command}")
     try:
         session = await get_aiosession()
-        headers = aiohttp.BasicAuth(login, password)
-        json_body = {"Command": "requeue", "JobID": job_id}
-        async with session.put(f"{settings.deadline_api_url}/jobs", json=json_body, auth=headers, ssl=settings.deadline_tls_verify) as resp:
-            success = resp.status == 200
-            if not success:
-                logger.error(f"Failed to requeue job: {resp.status}")
-            else:
-                _invalidate_jobs_cache(login)
-            return success
-    except Exception as e:
-        logger.error(f"Error requeuing job: {e}")
+        auth = aiohttp.BasicAuth(login, password)
+        json_body = {"Command": command, "JobID": job_id}
+        async with session.put(
+            f"{settings.deadline_api_url}/jobs",
+            json=json_body,
+            auth=auth,
+            ssl=settings.deadline_tls_verify,
+        ) as resp:
+            if resp.status != 200:
+                logger.error("Failed to %s job: %s", command, resp.status)
+                return False
+            _invalidate_jobs_cache(login)
+            return True
+    except Exception as exc:
+        logger.error("Error during %s job: %s", command, exc)
         return False
+
+
+async def _job_command_by_user_id(
+    telegram_user_id: int, command: str, job_id: str
+) -> bool:
+    return await _with_user_credentials(
+        telegram_user_id,
+        default=False,
+        operation_name=f"{command} job ({job_id})",
+        call=lambda login, password: _put_job_command(login, password, command, job_id),
+    )
+
+
+async def requeue_job(login: str, password: str, job_id: str) -> bool:
+    """Requeue a job."""
+    return await _put_job_command(login, password, "requeue", job_id)
 
 
 async def requeue_job_by_user_id(telegram_user_id: int, job_id: str) -> bool:
-    """
-    Requeue a job using telegram user ID.
-    
-    Args:
-        telegram_user_id: Telegram user ID
-        job_id: Job ID
-        
-    Returns:
-        True if successful, False otherwise
-    """
-    return await _with_user_credentials(
-        telegram_user_id,
-        default=False,
-        operation_name=f"requeue job ({job_id})",
-        call=lambda login, password: requeue_job(login, password, job_id),
-    )
+    """Requeue a job using telegram user ID."""
+    return await _job_command_by_user_id(telegram_user_id, "requeue", job_id)
 
 
 async def resume_job(login: str, password: str, job_id: str) -> bool:
-    """
-    Resume a suspended job.
-
-    Args:
-        login: User login
-        password: User password
-        job_id: Job ID
-
-    Returns:
-        True if successful, False otherwise
-    """
-    try:
-        session = await get_aiosession()
-        headers = aiohttp.BasicAuth(login, password)
-        json_body = {"Command": "resume", "JobID": job_id}
-        async with session.put(f"{settings.deadline_api_url}/jobs", json=json_body, auth=headers, ssl=settings.deadline_tls_verify) as resp:
-            success = resp.status == 200
-            if not success:
-                logger.error(f"Failed to resume job: {resp.status}")
-            else:
-                _invalidate_jobs_cache(login)
-            return success
-    except Exception as e:
-        logger.error(f"Error resuming job: {e}")
-        return False
+    """Resume a suspended job."""
+    return await _put_job_command(login, password, "resume", job_id)
 
 
 async def resume_job_by_user_id(telegram_user_id: int, job_id: str) -> bool:
-    """
-    Resume a suspended job using telegram user ID.
-    
-    Args:
-        telegram_user_id: Telegram user ID
-        job_id: Job ID
-        
-    Returns:
-        True if successful, False otherwise
-    """
-    return await _with_user_credentials(
-        telegram_user_id,
-        default=False,
-        operation_name=f"resume job ({job_id})",
-        call=lambda login, password: resume_job(login, password, job_id),
-    )
+    """Resume a suspended job using telegram user ID."""
+    return await _job_command_by_user_id(telegram_user_id, "resume", job_id)
 
 
 async def suspend_job(login: str, password: str, job_id: str) -> bool:
-    """
-    Suspend a job.
-
-    Args:
-        login: User login
-        password: User password
-        job_id: Job ID
-
-    Returns:
-        True if successful, False otherwise
-    """
-    try:
-        session = await get_aiosession()
-        headers = aiohttp.BasicAuth(login, password)
-        json_body = {"Command": "suspend", "JobID": job_id}
-        async with session.put(f"{settings.deadline_api_url}/jobs", json=json_body, auth=headers, ssl=settings.deadline_tls_verify) as resp:
-            success = resp.status == 200
-            if not success:
-                logger.error(f"Failed to suspend job: {resp.status}")
-            else:
-                _invalidate_jobs_cache(login)
-            return success
-    except Exception as e:
-        logger.error(f"Error suspending job: {e}")
-        return False
+    """Suspend a job."""
+    return await _put_job_command(login, password, "suspend", job_id)
 
 
 async def suspend_job_by_user_id(telegram_user_id: int, job_id: str) -> bool:
-    """
-    Suspend a job using telegram user ID.
-    
-    Args:
-        telegram_user_id: Telegram user ID
-        job_id: Job ID
-        
-    Returns:
-        True if successful, False otherwise
-    """
-    return await _with_user_credentials(
-        telegram_user_id,
-        default=False,
-        operation_name=f"suspend job ({job_id})",
-        call=lambda login, password: suspend_job(login, password, job_id),
-    )
+    """Suspend a job using telegram user ID."""
+    return await _job_command_by_user_id(telegram_user_id, "suspend", job_id)
 
 
 async def delete_job(login: str, password: str, job_id: str) -> bool:

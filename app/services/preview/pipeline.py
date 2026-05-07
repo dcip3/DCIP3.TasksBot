@@ -27,8 +27,8 @@ from app.integrations.video_helpers import (
     get_file_size_mb,
     prepare_video_for_delivery,
 )
+from app.core.bot_core import get_aiosession
 from app.services.deadline import get_job_info_by_user_id
-from app.services.dropbox import get_dropbox_session
 from app.services.preview.interaction import PreviewInteraction
 from app.services.preview.state import preview_state
 
@@ -81,7 +81,7 @@ async def maybe_render_single_frame_preview(
         ),
         "Content-Type": "application/json",
     }
-    session_dbx = await get_dropbox_session()
+    session_dbx = await get_aiosession()
     try:
         total_files = await count_exr_files(
             session_dbx,
@@ -206,7 +206,7 @@ async def render_preview_via_server_pipeline(
             ),
             "Content-Type": "application/json",
         }
-        session_dbx = await get_dropbox_session()
+        session_dbx = await get_aiosession()
 
         list_result = await list_folder_all(session_dbx, dropbox_path, headers_dbx)
         if not list_result:

@@ -499,6 +499,10 @@ async def _notify_preview_job_completion(
         dropbox_path = dropbox_path or dropbox_path_hint
 
     from app.core.path_utils import normalize_preview_path
+    from app.core.preview_text import build_preview_caption
+    from app.integrations.video_helpers import VideoDeliveryPreparation
+    from app.services.deadline import delete_job
+    from app.services.preview.delivery import send_ready_preview_video
 
     max_video_size_mb = 45.0
     size_mb = get_file_size_mb(final_path)
@@ -513,69 +517,32 @@ async def _notify_preview_job_completion(
             f"Please download it manually:\n{location_hint}"
         )
 
-    from app.core.preview_text import build_preview_caption
-
+    preparation = VideoDeliveryPreparation(
+        video_path=final_path,
+        size_mb=size_mb,
+        fallback_message=fallback_message,
+    )
     caption = build_preview_caption(final_path.name, display_path)
 
-    ready_text = f"🎬 Preview for {job_name} is ready."
-    target_chat_id = target_user_id
-    stored_message = pop_preview_message(job_id)
-    if stored_message:
-        chat_id, message_id = stored_message
-        target_chat_id = chat_id
-        try:
-            await bot.edit_message_text(
-                ready_text,
-                chat_id=chat_id,
-                message_id=message_id,
-            )
-        except Exception as edit_error:
-            logger.warning(
-                "Failed to edit preview progress message for job %s: %s",
-                job_id,
-                edit_error,
-            )
-            target_chat_id = target_user_id
-            await bot.send_message(target_chat_id, ready_text)
-    else:
-        await bot.send_message(target_chat_id, ready_text)
-
-    if fallback_message is None:
-        await bot.send_video(
-            target_chat_id,
-            FSInputFile(str(final_path)),
-            caption=caption,
-            parse_mode="HTML",
-        )
-    else:
-        logger.warning(
-            "Preview video %s is %.1f MB; sending fallback message",
-            final_path,
-            size_mb,
-        )
-        await bot.send_message(
-            target_chat_id,
-            fallback_message,
-            parse_mode="HTML",
-        )
-
-    if downloaded_temp:
-        await asyncio.to_thread(final_path.unlink, missing_ok=True)
-
-    try:
-        from app.services.deadline import delete_job
-
+    async def _delete() -> bool:
         deleted = await delete_job(login, password, job_id)
         if deleted:
             logger.info("Preview job %s deleted from Deadline after completion", job_id)
         else:
             logger.warning("Failed to delete preview job %s from Deadline", job_id)
-    except Exception as delete_error:
-        logger.warning(
-            "Error deleting preview job %s from Deadline: %s",
-            job_id,
-            delete_error,
-        )
+        return deleted
+
+    await send_ready_preview_video(
+        target_user_id=target_user_id,
+        preview_job_id=job_id,
+        job_name=job_name,
+        preparation=preparation,
+        caption=caption,
+        delete_job=_delete,
+    )
+
+    if downloaded_temp:
+        await asyncio.to_thread(final_path.unlink, missing_ok=True)
 
     logger.info("Preview video sent to user %s for job %s", target_user_id, job_id)
     return PreviewCompletionResult("delivered", target_user_id)

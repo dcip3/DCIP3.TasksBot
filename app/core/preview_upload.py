@@ -20,7 +20,6 @@ from typing import Optional
 import aiofiles
 import aiosqlite
 from aiohttp import web
-from aiogram.types import FSInputFile
 
 from app.core.bot_core import bot
 from app.core.config import settings
@@ -940,36 +939,13 @@ async def _notify_delivery_exhausted(state: PreviewUploadState) -> None:
 async def _deliver_preview(payload: PreviewUploadPayload, temp_path: Path) -> None:
     safe_name = html.escape(payload.job_name or "Preview")
 
-    stored_message = None
     if payload.preview_job_id:
         try:
-            from app.services.preview.runtime import (
-                peek_preview_message,
-                pop_preview_message,
-                stop_preview_animation,
-            )
+            from app.services.preview.runtime import stop_preview_animation
 
             stop_preview_animation(payload.preview_job_id)
-            stored_message = peek_preview_message(payload.preview_job_id)
         except Exception as exc:
-            logger.debug("Preview progress message lookup failed: %s", exc)
-
-    ready_text = f"🎬 Preview for {safe_name} is ready."
-    target_chat_id = payload.telegram_user_id
-    if stored_message:
-        chat_id, message_id = stored_message
-        target_chat_id = chat_id
-        try:
-            await bot.edit_message_text(
-                ready_text,
-                chat_id=chat_id,
-                message_id=message_id,
-            )
-        except Exception as edit_error:
-            logger.warning("Failed to edit preview progress message: %s", edit_error)
-            await bot.send_message(target_chat_id, ready_text)
-    else:
-        await bot.send_message(target_chat_id, ready_text)
+            logger.debug("Preview animation stop failed: %s", exc)
 
     path_hint = payload.expected_dropbox_path or payload.expected_local_path
     display_path = normalize_preview_path(path_hint)
@@ -978,42 +954,32 @@ async def _deliver_preview(payload: PreviewUploadPayload, temp_path: Path) -> No
         dropbox_path=display_path,
     )
 
+    if preparation.fallback_message and display_path is None:
+        # Preserve historical "no path hint" simplification of fallback wording.
+        preparation.fallback_message = (
+            "⚠️ Preview video is ready but too large to send via Telegram."
+        )
+
     from app.core.preview_text import build_preview_caption
+    from app.services.deadline import delete_job_by_user_id
+    from app.services.preview.delivery import send_ready_preview_video
 
     display_name = payload.expected_filename or preparation.video_path.name
     caption = build_preview_caption(display_name, display_path)
 
-    if preparation.fallback_message:
-        fallback_message = preparation.fallback_message
-        if display_path is None:
-            fallback_message = (
-                "⚠️ Preview video is ready but too large to send via Telegram."
-            )
-        await bot.send_message(
-            target_chat_id,
-            fallback_message,
-            parse_mode="HTML",
-        )
-    else:
-        await bot.send_video(
-            target_chat_id,
-            FSInputFile(str(preparation.video_path)),
-            caption=caption,
-            parse_mode="HTML",
-        )
+    async def _delete() -> bool:
+        if not payload.preview_job_id:
+            return False
+        return await delete_job_by_user_id(payload.telegram_user_id, payload.preview_job_id)
 
-    if payload.preview_job_id:
-        with contextlib.suppress(Exception):
-            pop_preview_message(payload.preview_job_id)
-        notified_jobs.add((payload.preview_job_id, payload.telegram_user_id))
-
-    try:
-        from app.services.deadline import delete_job_by_user_id
-
-        if payload.preview_job_id:
-            await delete_job_by_user_id(payload.telegram_user_id, payload.preview_job_id)
-    except Exception as exc:
-        logger.warning("Failed to delete preview job %s: %s", payload.preview_job_id, exc)
+    await send_ready_preview_video(
+        target_user_id=payload.telegram_user_id,
+        preview_job_id=payload.preview_job_id,
+        job_name=safe_name,
+        preparation=preparation,
+        caption=caption,
+        delete_job=_delete,
+    )
 
     for path in {temp_path, preparation.video_path}:
         try:

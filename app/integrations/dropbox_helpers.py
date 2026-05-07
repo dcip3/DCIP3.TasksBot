@@ -4,18 +4,16 @@ import json
 import logging
 import random
 import contextlib
-import os
-import sys
 from typing import Optional, List, Dict, Any
 from pathlib import Path, PurePosixPath
 import asyncio
 import aiofiles
 import aiohttp
-import gc
 import threading
 
 from app.core.config import settings
 from app.core.bot_core import get_aiosession
+from app.core.memory_utils import maybe_collect_gc
 
 logger = logging.getLogger(__name__)
 PREVIEW_FRAME_EXTS = {".exr", ".jpg", ".jpeg", ".png"}
@@ -75,8 +73,9 @@ async def get_fresh_access_token() -> str:
         _dropbox_access_token_expires_at = now + int(expires_in)
         return _dropbox_access_token
 
-# Simple in-memory cache with TTL support
-class TTLCache:
+# Simple in-memory key/value cache with TTL — distinct from app.core.ttl_cache.TTLCache
+# (which is a set-of-keys cache). Kept private to this module.
+class _TTLValueCache:
     def __init__(self, ttl_seconds=180):
         self.ttl = ttl_seconds
         self._cache = {}
@@ -98,8 +97,8 @@ class TTLCache:
         with self._lock:
             self._cache.clear()
 
-list_folder_cache = TTLCache(ttl_seconds=180)
-metadata_cache = TTLCache(ttl_seconds=180)
+list_folder_cache = _TTLValueCache(ttl_seconds=180)
+metadata_cache = _TTLValueCache(ttl_seconds=180)
 
 PROGRESS_EDIT_MIN_INTERVAL = 1.5
 PROGRESS_MIN_PERCENT_STEP = 1
@@ -108,39 +107,14 @@ RETRY_ATTEMPTS = 3
 RETRY_BASE_DELAY = 0.5
 RETRY_MAX_DELAY = 8.0
 DOWNLOAD_CHUNK_SIZE_BYTES = 512 * 1024
-GC_RSS_THRESHOLD_MB = 1024
 GC_CHECK_EVERY_BATCHES = 6
-_gc_batch_counter = 0
-
-
-def _get_process_rss_mb() -> Optional[float]:
-    if not sys.platform.startswith("linux"):
-        return None
-    try:
-        with open("/proc/self/statm", "r", encoding="utf-8") as fh:
-            parts = fh.read().split()
-        if len(parts) < 2:
-            return None
-        rss_pages = int(parts[1])
-        page_size = int(os.sysconf("SC_PAGE_SIZE"))
-        return (rss_pages * page_size) / (1024 * 1024)
-    except Exception:
-        return None
 
 
 def _maybe_collect_gc_for_memory_pressure() -> None:
-    global _gc_batch_counter
-    _gc_batch_counter += 1
-    if _gc_batch_counter < GC_CHECK_EVERY_BATCHES:
-        return
-    _gc_batch_counter = 0
-
-    rss_mb = _get_process_rss_mb()
-    if rss_mb is None:
-        return
-    if rss_mb >= GC_RSS_THRESHOLD_MB:
-        logger.debug("High RSS %.1fMB detected, triggering gc.collect()", rss_mb)
-        gc.collect()
+    maybe_collect_gc(
+        every_n=GC_CHECK_EVERY_BATCHES,
+        counter_key="dropbox_helpers",
+    )
 
 def _parse_retry_after(value: Optional[str]) -> Optional[float]:
     if not value:

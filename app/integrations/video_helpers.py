@@ -5,10 +5,8 @@ import Imath
 from pathlib import Path
 import subprocess
 import os
-import sys
 import logging
 import contextlib
-import gc
 from typing import Optional
 from PIL import Image
 import asyncio
@@ -17,33 +15,16 @@ from functools import lru_cache
 from dataclasses import dataclass
 
 from app.core.config import settings
+from app.core.memory_utils import maybe_collect_gc
 
 logger = logging.getLogger(__name__)
-GC_RSS_THRESHOLD_MB = 1024
-
-
-def _get_process_rss_mb() -> Optional[float]:
-    if not sys.platform.startswith("linux"):
-        return None
-    try:
-        with open("/proc/self/statm", "r", encoding="utf-8") as fh:
-            parts = fh.read().split()
-        if len(parts) < 2:
-            return None
-        rss_pages = int(parts[1])
-        page_size = int(os.sysconf("SC_PAGE_SIZE"))
-        return (rss_pages * page_size) / (1024 * 1024)
-    except Exception:
-        return None
 
 
 def _maybe_collect_gc_for_memory_pressure() -> None:
-    rss_mb = _get_process_rss_mb()
-    if rss_mb is None:
-        return
-    if rss_mb >= GC_RSS_THRESHOLD_MB:
-        logger.debug("High RSS %.1fMB detected after EXR conversion, triggering gc.collect()", rss_mb)
-        gc.collect()
+    maybe_collect_gc(
+        counter_key="video_helpers",
+        log_context="after EXR conversion",
+    )
 
 @lru_cache(maxsize=1)
 def _get_default_cpu_processor() -> ocio.CPUProcessor:

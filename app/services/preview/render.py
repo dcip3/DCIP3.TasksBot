@@ -22,7 +22,7 @@ from app.integrations.dropbox_helpers import (
     get_fresh_access_token,
     fetch_dropbox_metadata,
 )
-from app.services.dropbox import get_dropbox_session
+from app.core.bot_core import get_aiosession
 from app.services.deadline import (
     ALLOWED_WORKER_STATUSES,
     DeadlineSubmissionError,
@@ -603,7 +603,7 @@ async def check_video_exists_in_dropbox(
         from app.integrations.dropbox_helpers import get_fresh_access_token, fetch_dropbox_metadata
         from app.core.config import settings
         
-        session_dbx = await get_dropbox_session()
+        session_dbx = await get_aiosession()
         headers_dbx = {
             "Authorization": f"Bearer {await get_fresh_access_token()}",
             "Dropbox-API-Select-User": settings.dropbox_team_member_id,
@@ -737,7 +737,7 @@ async def download_video_from_dropbox(
             "Dropbox-API-Arg": json.dumps({"path": video_info["dropbox_path"]})
         }
         
-        session_dbx = await get_dropbox_session()
+        session_dbx = await get_aiosession()
         retry_statuses = {401, 408, 429, 500, 502, 503, 504}
 
         def _compute_delay(attempt: int, retry_after: Optional[str]) -> float:
