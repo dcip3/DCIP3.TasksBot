@@ -16,7 +16,6 @@ import threading
 
 from app.core.config import settings
 from app.core.bot_core import get_aiosession
-from app.core.maintenance import make_progress_bar
 
 logger = logging.getLogger(__name__)
 PREVIEW_FRAME_EXTS = {".exr", ".jpg", ".jpeg", ".png"}
@@ -588,15 +587,10 @@ async def download_exr_folder(
             percent = int((downloaded_count / total_files) * 100) if total_files else 0
             percent = max(0, min(percent, 100))
             
-            progress_msg = state.get("progress_msg")
+            progress_callback = state.get("progress_callback")
             try:
-                if progress_msg and _should_update_progress(state, percent):
-                    stop_kb = state.get("stop_kb")
-                    bar = make_progress_bar(percent)
-                    await progress_msg.edit_text(
-                        f"Step 1: Downloading and converting {percent}% ({downloaded_count}/{total_files})\n{bar}",
-                        reply_markup=stop_kb
-                    )
+                if progress_callback and _should_update_progress(state, percent):
+                    await progress_callback(percent, downloaded_count, total_files)
             except Exception:
                 pass
         

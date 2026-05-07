@@ -80,7 +80,7 @@ async def on_startup(bot) -> None:
     )
 
     def log_cache_stats() -> None:
-        from app.core.bot_core import notified_jobs
+        from app.services.job_state import notified_jobs
 
         stats = notified_jobs.get_stats()
         logger.info("TTL Cache stats: %s", stats)

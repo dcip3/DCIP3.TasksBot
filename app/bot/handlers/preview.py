@@ -1,5 +1,4 @@
 import contextlib
-import json
 import logging
 import time
 from pathlib import Path
@@ -15,17 +14,12 @@ from app.storage.user_settings import (
     get_preview_default_method,
     get_preview_default_worker,
 )
-from app.core.bot_core import bot, download_states, stop_downloads
-from app.core.config import settings
-from app.core.path_utils import extract_dropbox_path
+from app.core.bot_core import bot
 from app.core.preview_text import build_preview_caption
 from app.core.ui_helpers import cancel_inline_button
 from app.core.maintenance import cleanup_old_files
-from app.integrations.dropbox_helpers import (
-    count_exr_files,
-    get_fresh_access_token,
-)
 from app.integrations.video_helpers import cleanup_job_files
+from app.bot.preview_interaction import TelegramPreviewInteraction
 from app.services.deadline import (
     ALLOWED_WORKER_STATUSES,
     delete_job_by_user_id,
@@ -33,8 +27,11 @@ from app.services.deadline import (
     get_workers_list,
     WorkerStatusError,
 )
-from app.services.dropbox import get_dropbox_session
-from app.services.preview.pipeline import render_preview_via_server_pipeline
+from app.services.preview.pipeline import (
+    maybe_render_single_frame_preview,
+    render_preview_via_server_pipeline,
+)
+from app.services.preview.state import preview_state
 from app.services.preview.render import (
     PreviewSubmissionError,
     check_video_exists_in_dropbox,
@@ -219,44 +216,11 @@ async def _maybe_send_single_frame_preview(
 ) -> bool:
     if callback_query.from_user is None:
         return False
-
-    job_info = await get_job_info_by_user_id(callback_query.from_user.id, job_id)
-    if not job_info:
-        return False
-
-    outdirs = job_info.get("OutDir", [])
-    dropbox_path = extract_dropbox_path(
-        outdirs[0] if outdirs else None,
-        settings.dropbox_root_marker,
+    return await maybe_render_single_frame_preview(
+        callback_query.from_user.id,
+        job_id,
+        TelegramPreviewInteraction(callback_query),
     )
-    if not dropbox_path:
-        return False
-
-    headers_dbx = {
-        "Authorization": f"Bearer {await get_fresh_access_token()}",
-        "Dropbox-API-Select-User": settings.dropbox_team_member_id,
-        "Dropbox-API-Path-Root": json.dumps(
-            {".tag": "root", "root": settings.dropbox_root_namespace_id}
-        ),
-        "Content-Type": "application/json",
-    }
-    session_dbx = await get_dropbox_session()
-    try:
-        total_files = await count_exr_files(
-            session_dbx,
-            dropbox_path,
-            headers_dbx,
-            stop_after=2,
-        )
-    except Exception as exc:
-        logger.warning("Single-frame check failed for job %s: %s", job_id, exc)
-        return False
-
-    if total_files != 1:
-        return False
-
-    await render_preview_via_server(callback_query, job_id)
-    return True
 
 
 def _build_render_method_keyboard(job_id: str) -> InlineKeyboardMarkup:
@@ -842,8 +806,8 @@ async def preview_server_cancel_callback(callback_query: CallbackQuery) -> None:
         return
 
     job_id = callback_query.data.split(":", 1)[1]
-    stop_event = stop_downloads.get(job_id)
-    state = download_states.get(job_id)
+    stop_event = preview_state.stop_downloads.get(job_id)
+    state = preview_state.download_states.get(job_id)
 
     if stop_event is None or state is None:
         await callback_query.answer("Nothing to cancel.", show_alert=False)
@@ -853,12 +817,15 @@ async def preview_server_cancel_callback(callback_query: CallbackQuery) -> None:
         stop_event.set()
 
     state["cancel_requested"] = True
-    state["stop_kb"] = None
-    progress_msg = state.get("progress_msg")
+    progress_handle = state.get("progress_handle")
+    interaction = state.get("interaction")
 
-    if progress_msg:
+    if progress_handle and interaction:
         with contextlib.suppress(Exception):
-            await progress_msg.edit_text("⏹️ Cancelling preview generation...", reply_markup=None)
+            await interaction.update_progress(
+                progress_handle,
+                "⏹️ Cancelling preview generation...",
+            )
 
     await callback_query.answer("Cancelling preview...", show_alert=False)
 
@@ -899,7 +866,14 @@ async def preview_job_cancel_callback(callback_query: CallbackQuery) -> None:
 
 async def render_preview_via_server(callback_query: CallbackQuery, job_id: str) -> None:
     """Thin handler wrapper delegating heavy server pipeline to service layer."""
-    await render_preview_via_server_pipeline(callback_query, job_id)
+    if callback_query.from_user is None:
+        await callback_query.answer("Error: user not found.", show_alert=True)
+        return
+    await render_preview_via_server_pipeline(
+        callback_query.from_user.id,
+        job_id,
+        TelegramPreviewInteraction(callback_query),
+    )
 
 
 async def show_worker_selection_for_preview(callback_query: CallbackQuery, job_id: str) -> None:

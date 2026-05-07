@@ -2,16 +2,12 @@
 """
 Bot instance, dispatcher, and shared state initialization.
 
-This module provides the bot and dispatcher instances along with shared
-variables that can be imported by other modules without causing circular imports.
+This module provides the bot, dispatcher, and shared aiohttp session.
 """
 
-import asyncio
-from typing import Dict, Any
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 from app.core.config import settings
-from app.core.ttl_cache import TTLCache
 import aiohttp
 import logging
 
@@ -19,19 +15,6 @@ import logging
 bot = Bot(token=settings.telegram_bot_token)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
-
-# Global state variables
-download_states: Dict[str, Dict[str, Any]] = {}
-stop_downloads: Dict[str, asyncio.Event] = {}
-
-# Use TTL cache for notified jobs to prevent memory leak
-# Stores (job_id, user_id) pairs with 1 hour TTL
-# After 1 hour, notifications for the same job can be sent again
-notified_jobs = TTLCache(ttl_seconds=3600, max_size=10000)
-auto_preview_jobs = TTLCache(ttl_seconds=3600, max_size=10000)
-
-current_downloads: int = 0
-conversion_semaphore = asyncio.Semaphore(1)
 
 # Global aiohttp session shared across Dropbox and other APIs
 aiosession: aiohttp.ClientSession | None = None

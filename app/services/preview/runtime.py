@@ -10,7 +10,6 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 from aiogram.exceptions import TelegramRetryAfter
@@ -20,6 +19,7 @@ from app.core.bot_core import bot
 from app.core.config import settings
 from app.core.ui_helpers import cancel_inline_button
 from app.integrations.video_helpers import get_file_size_mb, prepare_video_for_delivery
+from app.services.preview.state import preview_state
 
 logger = logging.getLogger(__name__)
 _PREVIEW_RESOLVE_TIMEOUT_SECONDS = 60.0
@@ -27,10 +27,10 @@ _DROPBOX_RETRY_DELAYS = (0, 1, 2, 4, 8, 12, 16)
 _LOCAL_FILE_RETRY_DELAYS = (0, 1, 2, 4, 8, 12)
 _SINGLE_RETRY_ATTEMPT_TIMEOUT_SECONDS = 20.0
 
-# Track preview submission progress messages (preview_job_id -> (chat_id, message_id))
-preview_message_registry: dict[str, tuple[int, int]] = {}
-preview_animation_tasks: dict[str, asyncio.Task] = {}
-preview_upload_wait_notice_jobs: set[str] = set()
+# Track preview submission progress messages (preview_job_id -> (chat_id, message_id)).
+preview_message_registry = preview_state.message_registry
+preview_animation_tasks = preview_state.animation_tasks
+preview_upload_wait_notice_jobs = preview_state.upload_wait_notice_jobs
 
 
 @dataclass(frozen=True)
@@ -39,14 +39,68 @@ class PreviewCompletionResult:
     user_id: Optional[int] = None
 
 
-class _AutoPreviewCallback:
-    """Minimal callback shape for reusing preview handlers from auto-preview."""
+class _BotPreviewInteraction:
+    """Direct Telegram interaction for background preview workflows."""
 
     def __init__(self, user_id: int) -> None:
-        self.from_user = SimpleNamespace(id=user_id)
-        self.message = None
+        self.user_id = user_id
 
-    async def answer(self, *args, **kwargs) -> None:
+    async def create_progress(
+        self,
+        text: str,
+        *,
+        cancel_callback_data: str | None = None,
+    ) -> Any:
+        del cancel_callback_data
+        return await bot.send_message(self.user_id, text)
+
+    async def update_progress(
+        self,
+        handle: Any,
+        text: str,
+        *,
+        cancel_callback_data: str | None = None,
+    ) -> None:
+        del cancel_callback_data
+        await handle.edit_text(text)
+
+    async def delete_progress(self, handle: Any) -> None:
+        with contextlib.suppress(Exception):
+            await handle.delete()
+
+    async def send_text(self, text: str, *, parse_mode: str | None = None) -> None:
+        await bot.send_message(self.user_id, text, parse_mode=parse_mode)
+
+    async def send_photo(
+        self,
+        path: Path,
+        *,
+        caption: str | None = None,
+        parse_mode: str | None = None,
+    ) -> None:
+        await bot.send_photo(
+            self.user_id,
+            FSInputFile(str(path)),
+            caption=caption,
+            parse_mode=parse_mode,
+        )
+
+    async def send_video(
+        self,
+        path: Path,
+        *,
+        caption: str | None = None,
+        parse_mode: str | None = None,
+    ) -> None:
+        await bot.send_video(
+            self.user_id,
+            FSInputFile(str(path)),
+            caption=caption,
+            parse_mode=parse_mode,
+        )
+
+    async def answer(self, text: str | None = None, *, show_alert: bool = False) -> None:
+        del text, show_alert
         return None
 
 
@@ -862,16 +916,15 @@ async def _run_auto_preview_for_job(
         )
         return
 
-    auto_callback = None
+    interaction = _BotPreviewInteraction(telegram_user_id)
     try:
-        from app.bot.handlers.preview import _maybe_send_single_frame_preview, render_preview_via_server
+        from app.services.preview.pipeline import maybe_render_single_frame_preview
 
         # Single-frame render outputs are often valid locally but fragile in Telegram
         # when sent as the already-rendered MP4. Match manual regeneration behavior:
         # send the source frame through the server preview path before considering
         # an existing Dropbox video.
-        auto_callback = _AutoPreviewCallback(telegram_user_id)
-        if await _maybe_send_single_frame_preview(auto_callback, job_id):
+        if await maybe_render_single_frame_preview(telegram_user_id, job_id, interaction):
             return
     except Exception as exc:
         logger.warning("Auto preview single-frame check failed for job %s: %s", job_id, exc)
@@ -889,10 +942,6 @@ async def _run_auto_preview_for_job(
         logger.warning("Auto preview Dropbox send failed for job %s: %s", job_id, exc)
 
     try:
-        if auto_callback is None:
-            from app.bot.handlers.preview import render_preview_via_server
-            auto_callback = _AutoPreviewCallback(telegram_user_id)
-
         if preview_method == "deadline":
             await _submit_auto_preview_deadline(
                 telegram_user_id,
@@ -902,6 +951,8 @@ async def _run_auto_preview_for_job(
             )
             return
 
-        await render_preview_via_server(auto_callback, job_id)
+        from app.services.preview.pipeline import render_preview_via_server_pipeline
+
+        await render_preview_via_server_pipeline(telegram_user_id, job_id, interaction)
     except Exception as exc:
         logger.error("Auto preview workflow failed for job %s: %s", job_id, exc)

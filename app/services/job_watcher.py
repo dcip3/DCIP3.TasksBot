@@ -12,10 +12,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Literal, Optional
 
 from app.auth import _decrypt_password
-from app.core.bot_core import auto_preview_jobs, bot, notified_jobs
+from app.core.bot_core import bot
 from app.core.config import settings
 from app.core.ttl_cache import TTLCache
 from app.storage.database import get_db_connection
+from app.services.job_state import auto_preview_jobs, notified_jobs
 from app.services.preview.runtime import (
     _notify_preview_job_completion,
     _notify_preview_job_failure,

@@ -7,16 +7,14 @@ import contextlib
 import json
 import logging
 from pathlib import Path, PurePosixPath
-from typing import Optional
+from typing import Any, Optional
 
-from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
-
-from app.core.bot_core import bot, download_states, stop_downloads
 from app.core.config import settings
+from app.core.maintenance import make_progress_bar
 from app.core.path_utils import extract_dropbox_path
 from app.core.preview_text import build_preview_caption
-from app.core.ui_helpers import cancel_inline_button
 from app.integrations.dropbox_helpers import (
+    count_exr_files,
     download_exr_folder,
     fetch_dropbox_metadata,
     get_fresh_access_token,
@@ -31,18 +29,10 @@ from app.integrations.video_helpers import (
 )
 from app.services.deadline import get_job_info_by_user_id
 from app.services.dropbox import get_dropbox_session
+from app.services.preview.interaction import PreviewInteraction
+from app.services.preview.state import preview_state
 
 logger = logging.getLogger(__name__)
-
-
-def _build_server_cancel_keyboard(job_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                cancel_inline_button(callback_data=f"preview_server_cancel:{job_id}")
-            ]
-        ]
-    )
 
 
 async def _upload_video_to_dropbox_and_cleanup(
@@ -66,42 +56,87 @@ async def _upload_video_to_dropbox_and_cleanup(
             logger.error("Error cleaning up job files after background upload: %s", cleanup_error)
 
 
-async def render_preview_via_server_pipeline(callback_query: CallbackQuery, job_id: str) -> None:
-    """Generate preview on bot host: download frames, convert, assemble, upload, send."""
-    if callback_query.from_user is None:
-        await callback_query.answer("Error: user not found.", show_alert=True)
-        return
+async def maybe_render_single_frame_preview(
+    user_id: int,
+    job_id: str,
+    interaction: PreviewInteraction,
+) -> bool:
+    job_info = await get_job_info_by_user_id(user_id, job_id)
+    if not job_info:
+        return False
 
-    progress_msg: Optional[Message] = None
-    cancel_keyboard: Optional[InlineKeyboardMarkup] = None
+    outdirs = job_info.get("OutDir", [])
+    dropbox_path = extract_dropbox_path(
+        outdirs[0] if outdirs else None,
+        settings.dropbox_root_marker,
+    )
+    if not dropbox_path:
+        return False
+
+    headers_dbx = {
+        "Authorization": f"Bearer {await get_fresh_access_token()}",
+        "Dropbox-API-Select-User": settings.dropbox_team_member_id,
+        "Dropbox-API-Path-Root": json.dumps(
+            {".tag": "root", "root": settings.dropbox_root_namespace_id}
+        ),
+        "Content-Type": "application/json",
+    }
+    session_dbx = await get_dropbox_session()
+    try:
+        total_files = await count_exr_files(
+            session_dbx,
+            dropbox_path,
+            headers_dbx,
+            stop_after=2,
+        )
+    except Exception as exc:
+        logger.warning("Single-frame check failed for job %s: %s", job_id, exc)
+        return False
+
+    if total_files != 1:
+        return False
+
+    await render_preview_via_server_pipeline(user_id, job_id, interaction)
+    return True
+
+
+async def render_preview_via_server_pipeline(
+    user_id: int,
+    job_id: str,
+    interaction: PreviewInteraction,
+) -> None:
+    """Generate preview on bot host: download frames, convert, assemble, upload, send."""
+    progress_handle: Any | None = None
     stop_event: Optional[asyncio.Event] = None
     state: Optional[dict] = None
     defer_cleanup = False
+    cancel_callback_data = f"preview_server_cancel:{job_id}"
     try:
-        base_message = callback_query.message
-        if base_message:
-            progress_msg = await base_message.answer("🔍 Starting preview generation...")
-        else:
-            progress_msg = await bot.send_message(
-                callback_query.from_user.id,
-                "🔍 Starting preview generation...",
+        progress_handle = await interaction.create_progress(
+            "🔍 Starting preview generation..."
+        )
+
+        stop_event = preview_state.get_or_create_stop_event(job_id)
+
+        async def update_download_progress(percent: int, downloaded: int, total: int) -> None:
+            bar_text = f"Step 1: Downloading and converting {percent}% ({downloaded}/{total})"
+
+            await interaction.update_progress(
+                progress_handle,
+                f"{bar_text}\n{make_progress_bar(percent)}",
+                cancel_callback_data=cancel_callback_data,
             )
 
-        cancel_keyboard = _build_server_cancel_keyboard(job_id)
-        stop_event = stop_downloads.get(job_id)
-        if stop_event is None:
-            stop_event = asyncio.Event()
-            stop_downloads[job_id] = stop_event
-
-        download_states[job_id] = {
-            "progress_msg": progress_msg,
+        preview_state.download_states[job_id] = {
+            "progress_handle": progress_handle,
+            "interaction": interaction,
+            "progress_callback": update_download_progress,
             "total_files": 0,
             "downloaded_files": 0,
-            "stop_kb": cancel_keyboard,
             "last_progress_ts": 0.0,
             "last_progress_percent": -1,
         }
-        state = download_states[job_id]
+        state = preview_state.download_states[job_id]
 
         async def finalize_cancellation() -> bool:
             if stop_event is None or state is None:
@@ -110,48 +145,51 @@ async def render_preview_via_server_pipeline(callback_query: CallbackQuery, job_
                 return False
             if not state.get("cancel_finalized"):
                 state["cancel_finalized"] = True
-                state["stop_kb"] = None
-                progress = state.get("progress_msg") or progress_msg
-                if progress:
+                progress = state.get("progress_handle") or progress_handle
+                if progress is not None:
                     with contextlib.suppress(Exception):
-                        await progress.edit_text("⏹️ Preview generation cancelled.", reply_markup=None)
+                        await interaction.update_progress(
+                            progress,
+                            "⏹️ Preview generation cancelled.",
+                        )
                 try:
                     cleanup_job_files(job_id)
                 except Exception as cleanup_error:
                     logger.error("Error cleaning up after cancellation: %s", cleanup_error)
                 with contextlib.suppress(Exception):
-                    await callback_query.answer("Preview generation cancelled.", show_alert=False)
+                    await interaction.answer("Preview generation cancelled.", show_alert=False)
             return True
 
-        await progress_msg.edit_text(
+        await interaction.update_progress(
+            progress_handle,
             "📥 Step 1: Downloading files from Dropbox...",
-            reply_markup=cancel_keyboard,
+            cancel_callback_data=cancel_callback_data,
         )
         if await finalize_cancellation():
             return
 
-        job_info = await get_job_info_by_user_id(callback_query.from_user.id, job_id)
+        job_info = await get_job_info_by_user_id(user_id, job_id)
         if not job_info:
-            await progress_msg.edit_text("❌ Failed to get job info")
-            await callback_query.answer("Failed to get job info.", show_alert=True)
+            await interaction.update_progress(progress_handle, "❌ Failed to get job info")
+            await interaction.answer("Failed to get job info.", show_alert=True)
             return
 
         outdirs = job_info.get("OutDir", [])
         if not outdirs:
-            await progress_msg.edit_text("❌ No output directory found.")
-            await callback_query.answer("Render path is missing.", show_alert=True)
+            await interaction.update_progress(progress_handle, "❌ No output directory found.")
+            await interaction.answer("Render path is missing.", show_alert=True)
             return
 
         fullpath = outdirs[0]
         if fullpath.find(settings.dropbox_root_marker) == -1:
-            await progress_msg.edit_text("❌ Dropbox root marker not found in path.")
-            await callback_query.answer("Could not determine Dropbox path.", show_alert=True)
+            await interaction.update_progress(progress_handle, "❌ Dropbox root marker not found in path.")
+            await interaction.answer("Could not determine Dropbox path.", show_alert=True)
             return
 
         dropbox_path = extract_dropbox_path(fullpath, settings.dropbox_root_marker)
         if not dropbox_path:
-            await progress_msg.edit_text("❌ Could not normalize Dropbox path.")
-            await callback_query.answer("Could not determine Dropbox path.", show_alert=True)
+            await interaction.update_progress(progress_handle, "❌ Could not normalize Dropbox path.")
+            await interaction.answer("Could not determine Dropbox path.", show_alert=True)
             return
 
         temp_dir = Path(settings.temp_dir)
@@ -172,8 +210,8 @@ async def render_preview_via_server_pipeline(callback_query: CallbackQuery, job_
 
         list_result = await list_folder_all(session_dbx, dropbox_path, headers_dbx)
         if not list_result:
-            await progress_msg.edit_text("❌ Failed to list folder.")
-            await callback_query.answer("Could not list files in Dropbox.", show_alert=True)
+            await interaction.update_progress(progress_handle, "❌ Failed to list folder.")
+            await interaction.answer("Could not list files in Dropbox.", show_alert=True)
             return
 
         preview_exts = (".exr", ".jpg", ".jpeg", ".png")
@@ -186,14 +224,16 @@ async def render_preview_via_server_pipeline(callback_query: CallbackQuery, job_
             and "conflicted copy" not in entry["name"].lower()
         )
         if total_files <= 0:
-            await progress_msg.edit_text("⚠️ No usable image files found for conversion.")
-            await callback_query.answer("No frames available for preview build.", show_alert=True)
+            await interaction.update_progress(
+                progress_handle,
+                "⚠️ No usable image files found for conversion.",
+            )
+            await interaction.answer("No frames available for preview build.", show_alert=True)
             return
 
         if state is not None:
             state["total_files"] = total_files
             state["downloaded_files"] = 0
-            state["stop_kb"] = cancel_keyboard
 
         await download_exr_folder(
             session_dbx,
@@ -202,8 +242,8 @@ async def render_preview_via_server_pipeline(callback_query: CallbackQuery, job_
             dropbox_path,
             local_root,
             job_id,
-            download_states,
-            stop_downloads,
+            preview_state.download_states,
+            preview_state.stop_downloads,
             prefetched_result=list_result,
         )
         if await finalize_cancellation():
@@ -215,9 +255,10 @@ async def render_preview_via_server_pipeline(callback_query: CallbackQuery, job_
             image_files.extend(conv_dir.rglob(pattern))
 
         if len(image_files) == 1:
-            await progress_msg.edit_text(
+            await interaction.update_progress(
+                progress_handle,
                 "🖼️ Step 2: Sending single frame...",
-                reply_markup=cancel_keyboard,
+                cancel_callback_data=cancel_callback_data,
             )
             if await finalize_cancellation():
                 return
@@ -235,31 +276,19 @@ async def render_preview_via_server_pipeline(callback_query: CallbackQuery, job_
 
             caption = build_preview_caption(project_name, dropbox_path, icon="🖼️")
 
-            if callback_query.message:
-                await callback_query.message.answer_photo(
-                    photo=FSInputFile(str(image_path)),
-                    caption=caption,
-                    parse_mode="HTML",
-                )
-            else:
-                await bot.send_photo(
-                    callback_query.from_user.id,
-                    FSInputFile(str(image_path)),
-                    caption=caption,
-                    parse_mode="HTML",
-                )
+            await interaction.send_photo(image_path, caption=caption, parse_mode="HTML")
 
-            with contextlib.suppress(Exception):
-                await progress_msg.delete()
+            await interaction.delete_progress(progress_handle)
             try:
-                await callback_query.answer("Frame sent successfully!")
+                await interaction.answer("Frame sent successfully!")
             except Exception as answer_error:
                 logger.warning("Could not answer callback query: %s", answer_error)
             return
 
-        await progress_msg.edit_text(
+        await interaction.update_progress(
+            progress_handle,
             "🎬 Step 2: Processing frames and creating video...",
-            reply_markup=cancel_keyboard,
+            cancel_callback_data=cancel_callback_data,
         )
         if await finalize_cancellation():
             return
@@ -274,17 +303,19 @@ async def render_preview_via_server_pipeline(callback_query: CallbackQuery, job_
         if await finalize_cancellation():
             return
 
-        await progress_msg.edit_text(
+        await interaction.update_progress(
+            progress_handle,
             "📏 Step 3: Checking file size...",
-            reply_markup=cancel_keyboard,
+            cancel_callback_data=cancel_callback_data,
         )
         max_video_size_mb = 45.0
         video_size_mb = get_file_size_mb(video_path_obj)
 
         if video_size_mb > max_video_size_mb:
-            await progress_msg.edit_text(
+            await interaction.update_progress(
+                progress_handle,
                 f"🗜️ Step 3.5: Compressing video ({video_size_mb:.1f} MB → target <{max_video_size_mb:.0f} MB)...",
-                reply_markup=cancel_keyboard,
+                cancel_callback_data=cancel_callback_data,
             )
             if await finalize_cancellation():
                 return
@@ -302,9 +333,10 @@ async def render_preview_via_server_pipeline(callback_query: CallbackQuery, job_
         if await finalize_cancellation():
             return
 
-        await progress_msg.edit_text(
+        await interaction.update_progress(
+            progress_handle,
             f"📤 Step 4: Sending video ({final_size_mb:.1f} MB)...",
-            reply_markup=cancel_keyboard,
+            cancel_callback_data=cancel_callback_data,
         )
         if await finalize_cancellation():
             return
@@ -323,31 +355,9 @@ async def render_preview_via_server_pipeline(callback_query: CallbackQuery, job_
 
         caption = build_preview_caption(project_name, expected_dropbox_video_path or None)
         if fallback_message:
-            if callback_query.message:
-                await callback_query.message.answer(
-                    fallback_message,
-                    parse_mode="HTML",
-                )
-            else:
-                await bot.send_message(
-                    callback_query.from_user.id,
-                    fallback_message,
-                    parse_mode="HTML",
-                )
+            await interaction.send_text(fallback_message, parse_mode="HTML")
         else:
-            if callback_query.message:
-                await callback_query.message.answer_video(
-                    video=FSInputFile(str(final_video_path)),
-                    caption=caption,
-                    parse_mode="HTML",
-                )
-            else:
-                await bot.send_video(
-                    callback_query.from_user.id,
-                    FSInputFile(str(final_video_path)),
-                    caption=caption,
-                    parse_mode="HTML",
-                )
+            await interaction.send_video(final_video_path, caption=caption, parse_mode="HTML")
 
         asyncio.create_task(
             _upload_video_to_dropbox_and_cleanup(
@@ -360,11 +370,10 @@ async def render_preview_via_server_pipeline(callback_query: CallbackQuery, job_
         )
         defer_cleanup = True
 
-        with contextlib.suppress(Exception):
-            await progress_msg.delete()
+        await interaction.delete_progress(progress_handle)
 
         try:
-            await callback_query.answer("Video created successfully!")
+            await interaction.answer("Video created successfully!")
         except Exception as answer_error:
             logger.warning("Could not answer callback query: %s", answer_error)
 
@@ -373,20 +382,19 @@ async def render_preview_via_server_pipeline(callback_query: CallbackQuery, job_
 
         logger.error(
             "Error in server-side preview generation for user %s job %s: %s",
-            callback_query.from_user.id if callback_query.from_user else "unknown",
+            user_id,
             job_id,
             exc,
         )
         user_message = describe_error(exc) or "Error occurred while creating the preview."
-        if progress_msg:
+        if progress_handle is not None:
             with contextlib.suppress(Exception):
-                await progress_msg.edit_text(f"❌ {user_message}")
+                await interaction.update_progress(progress_handle, f"❌ {user_message}")
         try:
-            await callback_query.answer(user_message, show_alert=True)
+            await interaction.answer(user_message, show_alert=True)
         except Exception as answer_error:
             logger.warning("Could not answer callback query after failure: %s", answer_error)
-            if callback_query.message:
-                await callback_query.message.answer(f"❌ {user_message}")
+            await interaction.send_text(f"❌ {user_message}")
         try:
             cleanup_job_files(job_id)
         except Exception as cleanup_error:
@@ -397,5 +405,4 @@ async def render_preview_via_server_pipeline(callback_query: CallbackQuery, job_
                 cleanup_job_files(job_id)
             except Exception as cleanup_error:
                 logger.error("Error cleaning up job files after preview workflow: %s", cleanup_error)
-        download_states.pop(job_id, None)
-        stop_downloads.pop(job_id, None)
+        preview_state.clear_download(job_id)

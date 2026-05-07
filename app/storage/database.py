@@ -6,11 +6,11 @@ and provides basic database operations for the application.
 """
 
 import logging
-import json
 import time
 from pathlib import Path
 import aiosqlite
 from app.core.config import settings
+from app.storage.schema import ensure_column, ensure_preview_upload_schema
 
 logger = logging.getLogger(__name__)
 
@@ -18,65 +18,18 @@ logger = logging.getLogger(__name__)
 tasks_db_conn: aiosqlite.Connection | None = None
 
 
-async def _ensure_column(
-    conn: aiosqlite.Connection,
-    table_name: str,
-    column_name: str,
-    column_sql: str,
-) -> None:
-    try:
-        await conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}")
-        await conn.commit()
-        logger.info("Added %s column to %s table", column_name, table_name)
-    except aiosqlite.OperationalError as column_error:
-        message = str(column_error).lower()
-        if "duplicate column name" in message:
-            logger.debug("%s column already exists on %s table", column_name, table_name)
-        else:
-            logger.error("Failed to ensure %s column on %s: %s", column_name, table_name, column_error)
-            raise
-
-
-async def _backfill_preview_upload_columns(conn: aiosqlite.Connection) -> None:
-    try:
-        async with conn.execute(
-            """
-            SELECT token, payload_json, preview_job_id, source_job_id
-            FROM preview_upload_tokens
-            WHERE (preview_job_id IS NULL OR preview_job_id = '')
-               OR (source_job_id IS NULL OR source_job_id = '')
-            """
-        ) as cursor:
-            rows = await cursor.fetchall()
-    except Exception as exc:
-        logger.warning("Failed to read preview upload tokens for backfill: %s", exc)
-        return
-
-    updated = 0
-    for token, payload_json, preview_job_id, source_job_id in rows:
-        try:
-            payload = json.loads(payload_json or "{}")
-        except Exception:
-            continue
-        if not isinstance(payload, dict):
-            continue
-        next_preview_id = preview_job_id or payload.get("preview_job_id")
-        next_source_id = source_job_id or payload.get("source_job_id")
-        if not next_preview_id and not next_source_id:
-            continue
-        await conn.execute(
-            """
-            UPDATE preview_upload_tokens
-            SET preview_job_id = COALESCE(NULLIF(preview_job_id, ''), ?),
-                source_job_id = COALESCE(NULLIF(source_job_id, ''), ?)
-            WHERE token = ?
-            """,
-            (next_preview_id, next_source_id, token),
-        )
-        updated += 1
-    if updated:
-        await conn.commit()
-        logger.info("Backfilled preview upload metadata for %s token(s)", updated)
+async def _ensure_user_session_column(column_name: str, column_sql: str) -> None:
+    if tasks_db_conn is None:
+        raise RuntimeError("Database connection is not initialized")
+    added = await ensure_column(
+        tasks_db_conn,
+        "user_sessions",
+        column_name,
+        column_sql,
+    )
+    await tasks_db_conn.commit()
+    if added:
+        logger.info("Added %s column to user_sessions table", column_name)
 
 
 async def init_db():
@@ -122,61 +75,8 @@ async def init_db():
         )
     """)
 
-    # Store preview upload tokens to survive bot restarts
-    await tasks_db_conn.execute("""
-        CREATE TABLE IF NOT EXISTS preview_upload_tokens (
-            token TEXT PRIMARY KEY,
-            expires_at INTEGER NOT NULL,
-            created_at INTEGER NOT NULL,
-            claimed_until INTEGER NOT NULL DEFAULT 0,
-            preview_job_id TEXT,
-            source_job_id TEXT,
-            status TEXT NOT NULL DEFAULT 'issued',
-            temp_path TEXT,
-            bytes_written INTEGER NOT NULL DEFAULT 0,
-            received_at INTEGER NOT NULL DEFAULT 0,
-            delivery_attempts INTEGER NOT NULL DEFAULT 0,
-            next_retry_at INTEGER NOT NULL DEFAULT 0,
-            last_error TEXT,
-            payload_json TEXT NOT NULL
-        )
-    """)
-    await tasks_db_conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_preview_upload_tokens_expires
-        ON preview_upload_tokens(expires_at)
-    """)
-    await _ensure_column(
-        tasks_db_conn,
-        "preview_upload_tokens",
-        "claimed_until",
-        "INTEGER NOT NULL DEFAULT 0",
-    )
-    for column_name, column_sql in (
-        ("preview_job_id", "TEXT"),
-        ("source_job_id", "TEXT"),
-        ("status", "TEXT NOT NULL DEFAULT 'issued'"),
-        ("temp_path", "TEXT"),
-        ("bytes_written", "INTEGER NOT NULL DEFAULT 0"),
-        ("received_at", "INTEGER NOT NULL DEFAULT 0"),
-        ("delivery_attempts", "INTEGER NOT NULL DEFAULT 0"),
-        ("next_retry_at", "INTEGER NOT NULL DEFAULT 0"),
-        ("last_error", "TEXT"),
-    ):
-        await _ensure_column(
-            tasks_db_conn,
-            "preview_upload_tokens",
-            column_name,
-            column_sql,
-        )
-    await _backfill_preview_upload_columns(tasks_db_conn)
-    await tasks_db_conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_preview_upload_tokens_preview_job
-        ON preview_upload_tokens(preview_job_id)
-    """)
-    await tasks_db_conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_preview_upload_tokens_retry
-        ON preview_upload_tokens(status, next_retry_at)
-    """)
+    # Store preview upload tokens to survive bot restarts.
+    await ensure_preview_upload_schema(tasks_db_conn)
 
     # Persist auto-preview dedupe history across restarts
     await tasks_db_conn.execute(
@@ -202,79 +102,11 @@ async def init_db():
         ON user_sessions(telegram_user_id)
     """)
 
-    # Ensure notification_scope column exists for legacy databases
-    try:
-        await tasks_db_conn.execute(
-            "ALTER TABLE user_sessions ADD COLUMN notification_scope TEXT DEFAULT 'all'"
-        )
-        await tasks_db_conn.commit()
-        logger.info("Added notification_scope column to user_sessions table")
-    except aiosqlite.OperationalError as column_error:
-        message = str(column_error).lower()
-        if "duplicate column name" in message:
-            logger.debug("notification_scope column already exists on user_sessions table")
-        else:
-            logger.error("Failed to ensure notification_scope column: %s", column_error)
-            raise
-
-    # Ensure preview_default_worker column exists for legacy databases
-    try:
-        await tasks_db_conn.execute(
-            "ALTER TABLE user_sessions ADD COLUMN preview_default_worker TEXT"
-        )
-        await tasks_db_conn.commit()
-        logger.info("Added preview_default_worker column to user_sessions table")
-    except aiosqlite.OperationalError as column_error:
-        message = str(column_error).lower()
-        if "duplicate column name" in message:
-            logger.debug("preview_default_worker column already exists on user_sessions table")
-        else:
-            logger.error("Failed to ensure preview_default_worker column: %s", column_error)
-            raise
-    # Ensure preview_default_method column exists for legacy databases
-    try:
-        await tasks_db_conn.execute(
-            "ALTER TABLE user_sessions ADD COLUMN preview_default_method TEXT"
-        )
-        await tasks_db_conn.commit()
-        logger.info("Added preview_default_method column to user_sessions table")
-    except aiosqlite.OperationalError as column_error:
-        message = str(column_error).lower()
-        if "duplicate column name" in message:
-            logger.debug("preview_default_method column already exists on user_sessions table")
-        else:
-            logger.error("Failed to ensure preview_default_method column: %s", column_error)
-            raise
-
-    # Ensure preview_auto_enabled column exists for legacy databases
-    try:
-        await tasks_db_conn.execute(
-            "ALTER TABLE user_sessions ADD COLUMN preview_auto_enabled INTEGER DEFAULT 0"
-        )
-        await tasks_db_conn.commit()
-        logger.info("Added preview_auto_enabled column to user_sessions table")
-    except aiosqlite.OperationalError as column_error:
-        message = str(column_error).lower()
-        if "duplicate column name" in message:
-            logger.debug("preview_auto_enabled column already exists on user_sessions table")
-        else:
-            logger.error("Failed to ensure preview_auto_enabled column: %s", column_error)
-            raise
-
-    # Ensure preview_auto_scope column exists for legacy databases
-    try:
-        await tasks_db_conn.execute(
-            "ALTER TABLE user_sessions ADD COLUMN preview_auto_scope TEXT"
-        )
-        await tasks_db_conn.commit()
-        logger.info("Added preview_auto_scope column to user_sessions table")
-    except aiosqlite.OperationalError as column_error:
-        message = str(column_error).lower()
-        if "duplicate column name" in message:
-            logger.debug("preview_auto_scope column already exists on user_sessions table")
-        else:
-            logger.error("Failed to ensure preview_auto_scope column: %s", column_error)
-            raise
+    await _ensure_user_session_column("notification_scope", "TEXT DEFAULT 'all'")
+    await _ensure_user_session_column("preview_default_worker", "TEXT")
+    await _ensure_user_session_column("preview_default_method", "TEXT")
+    await _ensure_user_session_column("preview_auto_enabled", "INTEGER DEFAULT 0")
+    await _ensure_user_session_column("preview_auto_scope", "TEXT")
 
     try:
         await tasks_db_conn.execute(
@@ -326,4 +158,4 @@ def get_db_connection() -> aiosqlite.Connection | None:
     Returns:
         The current aiosqlite connection or None if not initialized
     """
-    return tasks_db_conn 
+    return tasks_db_conn

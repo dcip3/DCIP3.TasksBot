@@ -22,10 +22,12 @@ import aiosqlite
 from aiohttp import web
 from aiogram.types import FSInputFile
 
-from app.core.bot_core import bot, notified_jobs
+from app.core.bot_core import bot
 from app.core.config import settings
 from app.core.path_utils import normalize_preview_path
 from app.integrations.video_helpers import prepare_video_for_delivery
+from app.services.job_state import notified_jobs
+from app.storage.schema import ensure_preview_upload_schema
 
 logger = logging.getLogger(__name__)
 
@@ -92,79 +94,13 @@ class PreviewUploadTokenStore:
     def _open_db(self) -> aiosqlite.Connection:
         return aiosqlite.connect(settings.sqlite_db_path)
 
-    async def _ensure_column(
-        self,
-        conn: aiosqlite.Connection,
-        column_name: str,
-        column_sql: str,
-    ) -> None:
-        try:
-            await conn.execute(
-                f"ALTER TABLE preview_upload_tokens ADD COLUMN {column_name} {column_sql}"
-            )
-        except aiosqlite.OperationalError as column_error:
-            message = str(column_error).lower()
-            if "duplicate column name" not in message:
-                raise
-
     async def _ensure_schema(self, conn: aiosqlite.Connection) -> None:
         if self._schema_ready:
             return
         async with self._schema_lock:
             if self._schema_ready:
                 return
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS preview_upload_tokens (
-                    token TEXT PRIMARY KEY,
-                    expires_at INTEGER NOT NULL,
-                    created_at INTEGER NOT NULL,
-                    claimed_until INTEGER NOT NULL DEFAULT 0,
-                    preview_job_id TEXT,
-                    source_job_id TEXT,
-                    status TEXT NOT NULL DEFAULT 'issued',
-                    temp_path TEXT,
-                    bytes_written INTEGER NOT NULL DEFAULT 0,
-                    received_at INTEGER NOT NULL DEFAULT 0,
-                    delivery_attempts INTEGER NOT NULL DEFAULT 0,
-                    next_retry_at INTEGER NOT NULL DEFAULT 0,
-                    last_error TEXT,
-                    payload_json TEXT NOT NULL
-                )
-                """
-            )
-            for column_name, column_sql in (
-                ("claimed_until", "INTEGER NOT NULL DEFAULT 0"),
-                ("preview_job_id", "TEXT"),
-                ("source_job_id", "TEXT"),
-                ("status", "TEXT NOT NULL DEFAULT 'issued'"),
-                ("temp_path", "TEXT"),
-                ("bytes_written", "INTEGER NOT NULL DEFAULT 0"),
-                ("received_at", "INTEGER NOT NULL DEFAULT 0"),
-                ("delivery_attempts", "INTEGER NOT NULL DEFAULT 0"),
-                ("next_retry_at", "INTEGER NOT NULL DEFAULT 0"),
-                ("last_error", "TEXT"),
-            ):
-                await self._ensure_column(conn, column_name, column_sql)
-            await conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_preview_upload_tokens_expires
-                ON preview_upload_tokens(expires_at)
-                """
-            )
-            await conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_preview_upload_tokens_preview_job
-                ON preview_upload_tokens(preview_job_id)
-                """
-            )
-            await conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_preview_upload_tokens_retry
-                ON preview_upload_tokens(status, next_retry_at)
-                """
-            )
-            await self._backfill_metadata(conn)
+            await ensure_preview_upload_schema(conn)
             await conn.commit()
             self._schema_ready = True
 
@@ -240,34 +176,6 @@ class PreviewUploadTokenStore:
             next_retry_at=int(next_retry_at or 0),
             last_error=str(last_error) if last_error else None,
         )
-
-    async def _backfill_metadata(self, conn: aiosqlite.Connection) -> None:
-        async with conn.execute(
-            """
-            SELECT token, payload_json, preview_job_id, source_job_id
-            FROM preview_upload_tokens
-            WHERE (preview_job_id IS NULL OR preview_job_id = '')
-               OR (source_job_id IS NULL OR source_job_id = '')
-            """
-        ) as cur:
-            rows = await cur.fetchall()
-        for token, payload_json, preview_job_id, source_job_id in rows:
-            payload = self._deserialize_payload(payload_json or "")
-            if payload is None:
-                continue
-            next_preview_id = preview_job_id or payload.preview_job_id
-            next_source_id = source_job_id or payload.source_job_id
-            if not next_preview_id and not next_source_id:
-                continue
-            await conn.execute(
-                """
-                UPDATE preview_upload_tokens
-                SET preview_job_id = COALESCE(NULLIF(preview_job_id, ''), ?),
-                    source_job_id = COALESCE(NULLIF(source_job_id, ''), ?)
-                WHERE token = ?
-                """,
-                (next_preview_id, next_source_id, token),
-            )
 
     def _cleanup_upload_artifacts(self, token: str, temp_path: Optional[str]) -> None:
         candidates: list[Path] = []
