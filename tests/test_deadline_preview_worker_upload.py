@@ -39,7 +39,7 @@ class DeadlinePreviewWorkerUploadTests(unittest.TestCase):
             self.assertTrue(deadline_preview_worker._maybe_upload_preview(self.video_path))
 
         self.assertEqual(upload_mock.call_count, 3)
-        self.assertEqual([call.args[0] for call in sleep_mock.call_args_list], [10, 30])
+        self.assertEqual([call.args[0] for call in sleep_mock.call_args_list], [5, 15])
 
     def test_upload_failure_returns_false_after_retries(self) -> None:
         with mock.patch.object(
@@ -52,8 +52,11 @@ class DeadlinePreviewWorkerUploadTests(unittest.TestCase):
         ) as sleep_mock:
             self.assertFalse(deadline_preview_worker._maybe_upload_preview(self.video_path))
 
-        self.assertEqual(upload_mock.call_count, 4)
-        self.assertEqual([call.args[0] for call in sleep_mock.call_args_list], [10, 30, 60])
+        self.assertEqual(upload_mock.call_count, 9)
+        self.assertEqual(
+            [call.args[0] for call in sleep_mock.call_args_list],
+            [5, 15, 30, 60, 120, 240, 480, 480],
+        )
 
     def test_upload_not_configured_is_success(self) -> None:
         with mock.patch.dict(

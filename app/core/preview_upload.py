@@ -38,6 +38,7 @@ STATUS_DELIVERING = "delivering"
 STATUS_FAILED = "failed"
 _DELIVERY_LEASE_SECONDS = 5 * 60
 _UPLOAD_STATUSES_WITH_FILE = {STATUS_RECEIVED, STATUS_DELIVERING, STATUS_FAILED}
+_UPLOAD_PART_SUFFIX = ".part"
 _STATE_COLUMNS = """
     token, expires_at, created_at, claimed_until, payload_json,
     preview_job_id, source_job_id, status, temp_path, bytes_written,
@@ -758,11 +759,15 @@ def _resolve_upload_temp_path(state: PreviewUploadState) -> Optional[Path]:
     if state.payload.expected_filename:
         candidates.append(upload_dir / _sanitize_filename(state.payload.expected_filename))
     if upload_dir.exists():
-        candidates.extend(path for path in upload_dir.iterdir() if path.is_file())
+        candidates.extend(
+            path
+            for path in upload_dir.iterdir()
+            if path.is_file() and not path.name.endswith(_UPLOAD_PART_SUFFIX)
+        )
 
     for candidate in candidates:
         try:
-            if candidate.is_file():
+            if candidate.is_file() and not candidate.name.endswith(_UPLOAD_PART_SUFFIX):
                 return candidate
         except Exception:
             continue
@@ -825,21 +830,44 @@ async def _handle_preview_upload(request: web.Request) -> web.Response:
         upload_dir = temp_dir / f"upload_{token}"
         upload_dir.mkdir(parents=True, exist_ok=True)
         temp_path = upload_dir / filename
+        part_path = upload_dir / f"{filename}{_UPLOAD_PART_SUFFIX}"
         bytes_written = 0
         try:
-            async with aiofiles.open(temp_path, "wb") as handle:
+            part_path.unlink(missing_ok=True)
+            temp_path.unlink(missing_ok=True)
+            async with aiofiles.open(part_path, "wb") as handle:
                 async for chunk in request.content.iter_chunked(1024 * 1024):
                     if not chunk:
                         continue
                     bytes_written += len(chunk)
                     if bytes_written > max_size_bytes:
-                        temp_path.unlink(missing_ok=True)
+                        part_path.unlink(missing_ok=True)
                         return web.Response(status=413, text="Payload too large")
                     await handle.write(chunk)
+                await handle.flush()
         except Exception as exc:
             logger.error("Failed to write preview upload: %s", exc)
-            temp_path.unlink(missing_ok=True)
+            part_path.unlink(missing_ok=True)
             return web.Response(status=500, text="Upload failed")
+
+        expected_length = request.content_length
+        if expected_length is not None and bytes_written != expected_length:
+            logger.warning(
+                "Incomplete preview upload for token %s: wrote %s of %s bytes",
+                token,
+                bytes_written,
+                expected_length,
+            )
+            part_path.unlink(missing_ok=True)
+            return web.Response(status=400, text="Incomplete upload")
+
+        try:
+            part_path.replace(temp_path)
+        except Exception as exc:
+            logger.error("Failed to finalize preview upload: %s", exc)
+            part_path.unlink(missing_ok=True)
+            temp_path.unlink(missing_ok=True)
+            return web.Response(status=500, text="Upload finalize failed")
 
         await _token_store.mark_received(token, temp_path, bytes_written)
         should_release_claim = False

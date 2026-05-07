@@ -167,6 +167,52 @@ class PreviewUploadTokenTests(unittest.TestCase):
 
         self.assertIsNone(preview_upload._extract_token(request))
 
+    def test_resolve_upload_temp_path_ignores_partial_files(self) -> None:
+        preview_upload = _import_preview_upload_module()
+
+        original_temp_dir = preview_upload.settings.temp_dir
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                preview_upload.settings.temp_dir = temp_dir
+                upload_dir = Path(temp_dir) / "upload_token-1"
+                upload_dir.mkdir()
+                partial_path = upload_dir / "preview.mp4.part"
+                partial_path.write_bytes(b"partial")
+
+                payload = preview_upload.PreviewUploadPayload(
+                    telegram_user_id=101,
+                    job_name="Preview",
+                    expected_dropbox_path=None,
+                    expected_filename="preview.mp4",
+                    expected_local_path=None,
+                    preview_job_id="preview-job",
+                    source_job_id="source-job",
+                )
+                state = preview_upload.PreviewUploadState(
+                    token="token-1",
+                    expires_at=9999999999,
+                    created_at=1,
+                    claimed_until=0,
+                    payload=payload,
+                    preview_job_id="preview-job",
+                    source_job_id="source-job",
+                    status=preview_upload.STATUS_CLAIMED,
+                    temp_path=None,
+                    bytes_written=0,
+                    received_at=0,
+                    delivery_attempts=0,
+                    next_retry_at=0,
+                    last_error=None,
+                )
+
+                self.assertIsNone(preview_upload._resolve_upload_temp_path(state))
+
+                final_path = upload_dir / "preview.mp4"
+                final_path.write_bytes(b"complete")
+                self.assertEqual(preview_upload._resolve_upload_temp_path(state), final_path)
+        finally:
+            preview_upload.settings.temp_dir = original_temp_dir
+
 
 class _FakeResponse:
     def __init__(self, *, status: int = 200, payload=None) -> None:
