@@ -88,6 +88,29 @@ def _sanitize_windows_filename(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]', "_", name)
 
 
+def _count_expected_frames(frames_str: str) -> int:
+    """Count rendered frames from a Deadline Frames spec like "1-100,150-160x2"."""
+    if not frames_str:
+        return 0
+    total = 0
+    for chunk in str(frames_str).split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        range_match = re.match(r"^(-?\d+)\s*-\s*(-?\d+)(?:\s*[xX:]\s*(\d+))?$", chunk)
+        if range_match:
+            start = int(range_match.group(1))
+            end = int(range_match.group(2))
+            step_raw = range_match.group(3)
+            step = int(step_raw) if step_raw and int(step_raw) > 0 else 1
+            lo, hi = (start, end) if start <= end else (end, start)
+            total += (hi - lo) // step + 1
+            continue
+        if re.match(r"^-?\d+$", chunk):
+            total += 1
+    return total
+
+
 def _normalize_listed_workers(raw_value: Any) -> List[str]:
     """Normalize Deadline machine restriction values into a unique worker list."""
     if raw_value is None:
@@ -261,6 +284,7 @@ async def create_video_from_job(
     frames_str = props.get("Frames", "")
     start_match = re.search(r"-?\d+", frames_str)
     start_frame = int(start_match.group()) if start_match else 0
+    expected_frames = _count_expected_frames(frames_str)
 
     fps_value = props.get("PlugInfo", {}).get("FPS")
     try:
@@ -339,6 +363,9 @@ async def create_video_from_job(
         "45",
     ]
     script_args.extend(["--color-mode", color_mode])
+
+    if expected_frames > 0:
+        script_args.extend(["--expected-frames", str(expected_frames)])
 
     if settings.preview_temp_dir:
         script_args.extend(["--temp-dir", settings.preview_temp_dir])

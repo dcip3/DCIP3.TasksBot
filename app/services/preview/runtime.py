@@ -256,12 +256,27 @@ def _parse_deadline_timestamp(raw_value: object) -> Optional[float]:
     return parsed.astimezone(timezone.utc).timestamp()
 
 
-def _preview_upload_wait_expired(job: dict, state_created_at: int) -> bool:
+def _preview_upload_wait_expired(
+    job: dict,
+    state_created_at: int,
+    state_expires_at: int = 0,
+) -> bool:
+    """Decide whether to stop waiting for the worker upload.
+
+    While the preview-upload token is still valid we keep deferring — the
+    Deadline preview job may have queued for hours behind unrelated tasks, so
+    the historical 600-seconds-after-DateComp window was firing while the
+    worker was still legitimately retrying its HTTP push.
+    """
+    now = time.time()
+    if state_expires_at and now < float(state_expires_at):
+        return False
+
     completed_at = _parse_deadline_timestamp(job.get("DateComp") or job.get("Props", {}).get("DateComp"))
     wait_started_at = completed_at or float(state_created_at or 0)
     if wait_started_at <= 0:
-        wait_started_at = time.time()
-    return (time.time() - wait_started_at) >= settings.preview_upload_delivery_wait_seconds
+        wait_started_at = now
+    return (now - wait_started_at) >= settings.preview_upload_delivery_wait_seconds
 
 
 async def _edit_preview_waiting_for_upload(
@@ -396,7 +411,11 @@ async def _notify_preview_job_completion(
                 )
 
             if upload_state is not None:
-                wait_expired = _preview_upload_wait_expired(job, upload_state.created_at)
+                wait_expired = _preview_upload_wait_expired(
+                    job,
+                    upload_state.created_at,
+                    upload_state.expires_at,
+                )
                 attempts_exhausted = upload_state.attempts_exhausted
                 if not wait_expired and not attempts_exhausted:
                     await _edit_preview_waiting_for_upload(
@@ -797,13 +816,15 @@ async def _submit_auto_preview_deadline(
 
     result = None
     fallback_used = False
+    auto_mode = default_worker == PREVIEW_DEFAULT_WORKER_AUTO
     try:
-        if default_worker == PREVIEW_DEFAULT_WORKER_AUTO:
+        if auto_mode:
             default_worker = None
         result = await create_video_from_job(
             telegram_user_id,
             job_id,
             specific_worker=default_worker,
+            skip_worker_validation=True,
         )
     except PreviewSubmissionError as exc:
         await bot.send_message(
@@ -817,8 +838,7 @@ async def _submit_auto_preview_deadline(
             job_id,
             worker_error,
         )
-        if default_worker:
-            fallback_used = True
+        fallback_used = True
         try:
             result = await create_video_from_job(
                 telegram_user_id,

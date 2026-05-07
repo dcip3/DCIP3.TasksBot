@@ -252,6 +252,118 @@ def _convert_exr_to_png_cpu(
         gc.collect()
 
 
+def _scan_sequence_count(pattern: str) -> int:
+    """Count files on disk matching a %0Nd-style sequence pattern."""
+    pattern_path = Path(pattern)
+    directory = pattern_path.parent
+    template = pattern_path.name
+    match = re.search(r"%0(\d+)d", template)
+    if not match:
+        return 0
+    digits = int(match.group(1))
+    glob_pattern = re.sub(r"%0\d+d", "?" * digits, template)
+    try:
+        return sum(1 for _ in directory.glob(glob_pattern))
+    except OSError as exc:
+        logging.warning("Failed to scan sequence directory %s: %s", directory, exc)
+        return 0
+
+
+def _wait_for_input_frames(
+    pattern: str,
+    expected_frames: int,
+    timeout_seconds: float,
+    poll_interval: float = 3.0,
+) -> int:
+    """Poll the input directory until the expected frame count appears or the timeout expires."""
+    if expected_frames <= 0:
+        return _scan_sequence_count(pattern)
+
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    last_count = -1
+    while True:
+        found = _scan_sequence_count(pattern)
+        if found != last_count:
+            logging.info(
+                "Input sequence scan: found %s/%s frames",
+                found,
+                expected_frames,
+            )
+            last_count = found
+        if found >= expected_frames:
+            return found
+        if time.monotonic() >= deadline:
+            return found
+        time.sleep(poll_interval)
+
+
+def _validate_preview_output(
+    output_path: Path,
+    ffmpeg_path: str,
+    expected_frames: int,
+) -> Tuple[bool, str]:
+    """Verify that the encoded preview is decodable and approximately matches the input length."""
+    if not output_path.exists():
+        return False, "output file is missing"
+
+    size_bytes = output_path.stat().st_size
+    if size_bytes < 1024:
+        return False, f"output too small ({size_bytes} bytes)"
+
+    ffprobe_path = _resolve_ffprobe_path(ffmpeg_path)
+    try:
+        probe = subprocess.run(
+            [
+                ffprobe_path,
+                "-v",
+                "error",
+                "-count_frames",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=nb_read_frames",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(output_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except Exception as exc:
+        logging.warning("ffprobe validation could not run: %s", exc)
+        return True, "ffprobe unavailable; skipping validation"
+
+    raw = (probe.stdout or "").strip().splitlines()
+    nb_read = 0
+    for line in raw:
+        token = line.strip()
+        if not token or token.upper() in {"N/A", "NA"}:
+            continue
+        try:
+            nb_read = int(token)
+            break
+        except ValueError:
+            continue
+
+    if probe.returncode != 0 or not raw or nb_read == 0:
+        stderr = (probe.stderr or "").strip().splitlines()
+        snippet = stderr[-1] if stderr else "unreadable stream"
+        return False, f"ffprobe could not decode output: {snippet}"
+
+    if expected_frames > 0:
+        # Allow a small slack: some Deadline jobs render with frame steps the
+        # parser cannot infer, so we only fail when the gap is clearly wrong.
+        minimum_acceptable = max(1, int(expected_frames * 0.5))
+        if nb_read < minimum_acceptable:
+            return False, (
+                f"decoded {nb_read} frames, expected ~{expected_frames}"
+            )
+
+    return True, f"validated ({nb_read} frames, {size_bytes} bytes)"
+
+
 def _expand_sequence(pattern: str) -> Tuple[Path, str, int, List[Path]]:
     pattern_path = Path(pattern)
     directory = pattern_path.parent
@@ -646,6 +758,19 @@ def parse_arguments(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Optional directory for temporary files (uses system temp if omitted)",
     )
     parser.add_argument(
+        "--expected-frames",
+        type=int,
+        default=0,
+        help="Number of frames the source render is expected to produce. Used to wait for "
+             "incomplete sequence sync and to validate the encoded preview.",
+    )
+    parser.add_argument(
+        "--input-wait-seconds",
+        type=int,
+        default=120,
+        help="How long to wait for the full input frame set to appear before encoding.",
+    )
+    parser.add_argument(
         "--color-mode",
         choices=["lut", "cpu"],
         default="lut",
@@ -684,7 +809,9 @@ def _maybe_upload_preview(output_path: Path) -> bool:
     if not upload_url or not token:
         return True
 
-    attempt_delays = (0, 10, 30, 60)
+    # Up to ~22 minutes of cumulative retry, covering bot restarts and network blips.
+    attempt_delays = (0, 5, 15, 30, 60, 120, 240, 480, 480)
+    total_attempts = len(attempt_delays)
     for attempt, delay in enumerate(attempt_delays, start=1):
         if delay:
             time.sleep(delay)
@@ -699,14 +826,14 @@ def _maybe_upload_preview(output_path: Path) -> bool:
             logging.warning(
                 "Preview upload attempt %s/%s error: %s",
                 attempt,
-                len(attempt_delays),
+                total_attempts,
                 exc,
             )
             ok = False
         if ok:
-            logging.info("Preview upload succeeded on attempt %s/%s", attempt, len(attempt_delays))
+            logging.info("Preview upload succeeded on attempt %s/%s", attempt, total_attempts)
             return True
-        logging.warning("Preview upload attempt %s/%s failed", attempt, len(attempt_delays))
+        logging.warning("Preview upload attempt %s/%s failed", attempt, total_attempts)
     return False
 
 
@@ -800,6 +927,21 @@ def main(argv: Optional[list[str]] = None) -> int:
         start_number = args.start_number
         lut_path: Optional[Path] = None
 
+        expected_frames = max(0, int(args.expected_frames or 0))
+        if expected_frames > 0:
+            wait_seconds = max(0, int(args.input_wait_seconds or 0))
+            found = _wait_for_input_frames(
+                args.input_pattern,
+                expected_frames,
+                wait_seconds,
+            )
+            if found < expected_frames:
+                raise RuntimeError(
+                    f"Found {found} input frames, expected {expected_frames} "
+                    f"after waiting {wait_seconds}s. Render output may still be "
+                    "syncing to this worker — please retry the preview."
+                )
+
         if apply_color and color_mode == "cpu":
             if config_path is None:
                 raise RuntimeError("OCIO config required for CPU color mode")
@@ -846,28 +988,69 @@ def main(argv: Optional[list[str]] = None) -> int:
             crf=args.crf,
         )
         logging.info("Using preview video encoder: %s", selected_encoder)
+
+        def _run_with_encoder(encoder_name: str) -> str:
+            cmd, resolved_encoder = build_ffmpeg_command(
+                ffmpeg_path=args.ffmpeg_path,
+                start_number=start_number,
+                frame_rate=args.frame_rate,
+                input_pattern=ffmpeg_input_pattern,
+                output_path=args.output_path,
+                lut_path=lut_path if apply_color and color_mode == "lut" else None,
+                video_encoder=encoder_name,
+                preset=args.preset,
+                crf=args.crf,
+            )
+            run_ffmpeg(cmd)
+            return resolved_encoder
+
+        encode_error: Optional[Exception] = None
         try:
             run_ffmpeg(command)
-        except Exception:
-            if selected_encoder != "libx264":
+        except Exception as exc:
+            encode_error = exc
+
+        if encode_error is None:
+            valid, validation_reason = _validate_preview_output(
+                Path(args.output_path),
+                args.ffmpeg_path,
+                expected_frames,
+            )
+            logging.info("Preview validation: %s", validation_reason)
+            if not valid:
                 logging.warning(
-                    "Hardware encode with %s failed, retrying preview encode with libx264",
+                    "Preview output failed validation with encoder %s: %s",
                     selected_encoder,
+                    validation_reason,
                 )
-                command, selected_encoder = build_ffmpeg_command(
-                    ffmpeg_path=args.ffmpeg_path,
-                    start_number=start_number,
-                    frame_rate=args.frame_rate,
-                    input_pattern=ffmpeg_input_pattern,
-                    output_path=args.output_path,
-                    lut_path=lut_path if apply_color and color_mode == "lut" else None,
-                    video_encoder="libx264",
-                    preset=args.preset,
-                    crf=args.crf,
+                encode_error = RuntimeError(validation_reason)
+
+        if encode_error is not None and selected_encoder != "libx264":
+            logging.warning(
+                "Retrying preview encode with libx264 after %s failure: %s",
+                selected_encoder,
+                encode_error,
+            )
+            with contextlib.suppress(Exception):
+                Path(args.output_path).unlink()
+            try:
+                selected_encoder = _run_with_encoder("libx264")
+                encode_error = None
+            except Exception as retry_exc:
+                encode_error = retry_exc
+            if encode_error is None:
+                valid, validation_reason = _validate_preview_output(
+                    Path(args.output_path),
+                    args.ffmpeg_path,
+                    expected_frames,
                 )
-                run_ffmpeg(command)
-            else:
-                raise
+                logging.info("Preview validation after libx264 retry: %s", validation_reason)
+                if not valid:
+                    encode_error = RuntimeError(validation_reason)
+
+        if encode_error is not None:
+            raise encode_error
+
         _compress_if_needed(
             Path(args.output_path),
             args.ffmpeg_path,
@@ -876,6 +1059,17 @@ def main(argv: Optional[list[str]] = None) -> int:
             preset=args.preset,
             quality=args.crf,
         )
+        final_valid, final_reason = _validate_preview_output(
+            Path(args.output_path),
+            args.ffmpeg_path,
+            expected_frames,
+        )
+        logging.info("Final preview validation: %s", final_reason)
+        if not final_valid:
+            raise RuntimeError(
+                f"Preview output failed final validation: {final_reason}"
+            )
+
         logging.info("Preview video successfully written to %s", args.output_path)
         if not _maybe_upload_preview(Path(args.output_path)):
             raise RuntimeError("Preview upload failed after retries")

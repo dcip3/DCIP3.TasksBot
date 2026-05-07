@@ -106,7 +106,7 @@ class Settings(BaseSettings):
         description="Public URL that workers should POST previews to",
     )
     preview_upload_token_ttl: int = Field(
-        43200,
+        7 * 24 * 60 * 60,
         ge=60,
         description="One-time preview upload token TTL in seconds",
     )
