@@ -41,7 +41,7 @@ jobs:
           script_stop: true
           script: |
             set -eu
-            cd /opt/docker/tasksbot
+            cd /opt/tasksbot
             git fetch origin main
             git reset --hard origin/main
             docker compose build
