@@ -521,14 +521,14 @@ async def _notify_preview_job_completion(
     from app.core.preview_text import build_preview_caption
     from app.integrations.video_helpers import VideoDeliveryPreparation
     from app.services.deadline import delete_job
-    from app.services.preview.delivery import send_ready_preview_video
+    from app.services.preview.delivery import is_preview_image_path, send_ready_preview_video
 
     max_video_size_mb = 45.0
     size_mb = get_file_size_mb(final_path)
     path_hint = dropbox_path if dropbox_path else str(final_path)
     display_path = normalize_preview_path(path_hint) or str(final_path)
     fallback_message = None
-    if size_mb > max_video_size_mb:
+    if not is_preview_image_path(final_path) and size_mb > max_video_size_mb:
         location_hint = f"<code>{display_path}</code>"
         fallback_message = (
             "⚠️ Preview video is ready but too large to send via Telegram "

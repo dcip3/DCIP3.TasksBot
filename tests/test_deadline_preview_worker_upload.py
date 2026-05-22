@@ -69,3 +69,44 @@ class DeadlinePreviewWorkerUploadTests(unittest.TestCase):
             self.assertTrue(deadline_preview_worker._maybe_upload_preview(self.video_path))
 
         upload_mock.assert_not_called()
+
+    def test_single_frame_preview_writes_png_without_video_encode(self) -> None:
+        source_frame = self.video_path.with_name("preview.0001.jpg")
+        source_frame.write_bytes(b"jpg")
+        output_path = self.video_path.with_suffix(".png")
+
+        def write_png(**kwargs) -> None:
+            kwargs["output_path"].write_bytes(b"png")
+
+        with mock.patch.object(
+            deadline_preview_worker,
+            "_convert_single_frame_to_png",
+            side_effect=write_png,
+        ) as convert_mock, mock.patch.object(
+            deadline_preview_worker,
+            "_maybe_upload_preview",
+            return_value=True,
+        ) as upload_mock, mock.patch.object(
+            deadline_preview_worker,
+            "run_ffmpeg",
+        ) as ffmpeg_mock:
+            result = deadline_preview_worker.main(
+                [
+                    "--input-pattern",
+                    str(source_frame.with_name("preview.%04d.jpg")),
+                    "--output-path",
+                    str(output_path),
+                    "--start-number",
+                    "1",
+                    "--expected-frames",
+                    "1",
+                    "--disable-color",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        convert_mock.assert_called_once()
+        self.assertEqual(convert_mock.call_args.kwargs["input_path"], source_frame)
+        self.assertEqual(convert_mock.call_args.kwargs["output_path"], output_path)
+        upload_mock.assert_called_once_with(output_path)
+        ffmpeg_mock.assert_not_called()

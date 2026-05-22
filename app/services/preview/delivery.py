@@ -10,6 +10,7 @@ extracts that common tail so both call sites share one implementation.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
 from aiogram.types import FSInputFile, InlineKeyboardMarkup
@@ -20,6 +21,11 @@ from app.services.job_state import notified_jobs
 from app.services.preview.state import preview_state
 
 logger = logging.getLogger(__name__)
+PREVIEW_IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
+
+
+def is_preview_image_path(path: str | Path) -> bool:
+    return Path(path).suffix.lower() in PREVIEW_IMAGE_EXTS
 
 
 def _peek_message(preview_job_id: Optional[str]) -> Optional[tuple[int, int]]:
@@ -85,6 +91,7 @@ async def send_ready_preview_video(
 
     ready_text = f"🎬 Preview for {job_name} is ready."
     ready_message_id = await _edit_or_send(chat_id, ready_text, message_id=message_id)
+    is_image = is_preview_image_path(preparation.video_path)
 
     if preparation.fallback_message:
         if preparation.size_mb:
@@ -96,6 +103,13 @@ async def send_ready_preview_video(
         await bot.send_message(
             chat_id,
             preparation.fallback_message,
+            parse_mode="HTML",
+        )
+    elif is_image:
+        await bot.send_photo(
+            chat_id,
+            FSInputFile(str(preparation.video_path)),
+            caption=caption,
             parse_mode="HTML",
         )
     else:

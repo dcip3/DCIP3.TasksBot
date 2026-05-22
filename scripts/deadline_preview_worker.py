@@ -259,7 +259,7 @@ def _scan_sequence_count(pattern: str) -> int:
     template = pattern_path.name
     match = re.search(r"%0(\d+)d", template)
     if not match:
-        return 0
+        return 1 if pattern_path.exists() else 0
     digits = int(match.group(1))
     glob_pattern = re.sub(r"%0\d+d", "?" * digits, template)
     try:
@@ -386,6 +386,76 @@ def _expand_sequence(pattern: str) -> Tuple[Path, str, int, List[Path]]:
     if not files:
         raise RuntimeError(f"No frames found matching pattern {pattern}")
     return directory, template, digits, files
+
+
+def _resolve_single_frame_path(pattern: str, start_number: int) -> Path:
+    pattern_path = Path(pattern)
+    directory = pattern_path.parent
+    template = pattern_path.name
+    match = re.search(r"%0(\d+)d", template)
+    if not match and pattern_path.exists():
+        return pattern_path
+    if match:
+        digits = int(match.group(1))
+        filename = re.sub(
+            r"%0\d+d",
+            f"{start_number:0{digits}d}",
+            template,
+            count=1,
+        )
+        candidate = directory / filename
+        if candidate.exists():
+            return candidate
+
+    _, _, _, files = _expand_sequence(pattern)
+    return files[0]
+
+
+def _convert_single_frame_to_png(
+    *,
+    input_path: Path,
+    output_path: Path,
+    apply_color: bool,
+    config_path: Optional[Path],
+    input_space: str,
+    display: str,
+    view: str,
+    ffmpeg_path: str,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    input_ext = input_path.suffix.lower()
+
+    if input_ext == ".exr" and apply_color:
+        if config_path is None:
+            raise RuntimeError("OCIO config required for single-frame EXR conversion")
+        cpu_processor = _load_cpu_processor(config_path, input_space, display, view)
+        _convert_exr_to_png_cpu(input_path, output_path, cpu_processor)
+        return
+
+    if input_ext in {".jpg", ".jpeg", ".png"}:
+        try:
+            from PIL import Image
+
+            with Image.open(input_path) as img:
+                img.convert("RGB").save(output_path, "PNG")
+            return
+        except ImportError:
+            if input_ext == ".png":
+                shutil.copy2(input_path, output_path)
+                return
+            raise
+
+    command = [
+        ffmpeg_path,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(input_path),
+        str(output_path),
+    ]
+    run_ffmpeg(command)
 
 
 def _list_ffmpeg_encoders(ffmpeg_path: str) -> str:
@@ -740,7 +810,7 @@ def resolve_config_path(args: argparse.Namespace) -> Optional[Path]:
 def parse_arguments(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Deadline preview conversion helper.")
     parser.add_argument("--input-pattern", required=True, help="Sequence pattern, e.g. path/to/shot.%%04d.exr")
-    parser.add_argument("--output-path", required=True, help="Destination MP4 path")
+    parser.add_argument("--output-path", required=True, help="Destination preview output path")
     parser.add_argument("--start-number", type=int, default=0, help="First frame number in the sequence")
     parser.add_argument("--frame-rate", type=float, default=25.0, help="Playback frame rate")
     parser.add_argument("--ffmpeg-path", default="ffmpeg", help="ffmpeg executable available on the worker")
@@ -941,6 +1011,26 @@ def main(argv: Optional[list[str]] = None) -> int:
                     f"after waiting {wait_seconds}s. Render output may still be "
                     "syncing to this worker — please retry the preview."
                 )
+
+        if expected_frames == 1:
+            input_frame = _resolve_single_frame_path(args.input_pattern, args.start_number)
+            _convert_single_frame_to_png(
+                input_path=input_frame,
+                output_path=Path(args.output_path),
+                apply_color=apply_color,
+                config_path=config_path,
+                input_space=args.input_space,
+                display=args.display,
+                view=args.view,
+                ffmpeg_path=args.ffmpeg_path,
+            )
+            output_path = Path(args.output_path)
+            if not output_path.exists() or output_path.stat().st_size <= 0:
+                raise RuntimeError(f"Single-frame PNG was not written: {output_path}")
+            logging.info("Preview still successfully written to %s", output_path)
+            if not _maybe_upload_preview(output_path):
+                raise RuntimeError("Preview upload failed after retries")
+            return 0
 
         if apply_color and color_mode == "cpu":
             if config_path is None:

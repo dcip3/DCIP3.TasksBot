@@ -57,6 +57,10 @@ class _FakeBot:
             raise self.send_video_error
         return SimpleNamespace(message_id=2000)
 
+    async def send_photo(self, chat_id, photo, **kwargs):
+        self.events.append(("photo", chat_id, kwargs.get("caption")))
+        return SimpleNamespace(message_id=2000)
+
     async def delete_message(self, chat_id, message_id):
         self.events.append(("delete", chat_id, message_id))
         return True
@@ -149,6 +153,34 @@ class PreviewDeliveryTests(unittest.IsolatedAsyncioTestCase):
             [
                 ("message", 101, 1001, "🎬 Preview for Example is ready."),
                 ("message", 101, 1002, "Too large."),
+                ("delete", 101, 1001),
+            ],
+        )
+
+    async def test_png_preview_is_sent_as_photo(self) -> None:
+        fake_bot = _FakeBot()
+        self.delivery.bot = fake_bot
+        png_path = Path(self.temp_dir.name) / "preview.png"
+        png_path.write_bytes(b"png")
+
+        await self.delivery.send_ready_preview_video(
+            target_user_id=101,
+            preview_job_id=None,
+            job_name="Example",
+            preparation=SimpleNamespace(
+                video_path=png_path,
+                size_mb=1.0,
+                fallback_message=None,
+            ),
+            caption="caption",
+            delete_job=unittest.mock.AsyncMock(return_value=True),
+        )
+
+        self.assertEqual(
+            fake_bot.events,
+            [
+                ("message", 101, 1001, "🎬 Preview for Example is ready."),
+                ("photo", 101, "caption"),
                 ("delete", 101, 1001),
             ],
         )

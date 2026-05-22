@@ -226,6 +226,10 @@ async def create_video_from_job(
     output_path_clean = output_path.rstrip("\\/") or output_path
     is_windows_path = "\\" in output_path_clean or ":" in output_path_clean
 
+    frames_str = props.get("Frames", "")
+    expected_frames = _count_expected_frames(frames_str)
+    preview_is_still = expected_frames == 1
+
     video_base = Path(template_name).stem if template_name else props.get("Name") or props.get("Batch") or job_id
     video_base = re.sub(r'#+', '', video_base)
     video_base = re.sub(r'%0\d+d', '', video_base)
@@ -236,7 +240,7 @@ async def create_video_from_job(
         else:
             video_base = posixpath.basename(output_path_clean)
     video_base = _sanitize_windows_filename(video_base or job_id)
-    video_filename = f"{video_base}.mp4"
+    video_filename = f"{video_base}{'.png' if preview_is_still else '.mp4'}"
 
     if is_windows_path:
         render_output_dir = ntpath.dirname(output_path_clean) or output_path_clean
@@ -281,10 +285,8 @@ async def create_video_from_job(
             )
             upload_token = await issue_preview_upload_token(payload)
 
-    frames_str = props.get("Frames", "")
     start_match = re.search(r"-?\d+", frames_str)
     start_frame = int(start_match.group()) if start_match else 0
-    expected_frames = _count_expected_frames(frames_str)
 
     fps_value = props.get("PlugInfo", {}).get("FPS")
     try:

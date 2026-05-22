@@ -977,10 +977,21 @@ async def _deliver_preview(payload: PreviewUploadPayload, temp_path: Path) -> No
 
     path_hint = payload.expected_dropbox_path or payload.expected_local_path
     display_path = normalize_preview_path(path_hint)
-    preparation = await prepare_video_for_delivery(
-        temp_path,
-        dropbox_path=display_path,
-    )
+    from app.services.preview.delivery import is_preview_image_path
+
+    if is_preview_image_path(temp_path):
+        from app.integrations.video_helpers import VideoDeliveryPreparation
+
+        preparation = VideoDeliveryPreparation(
+            video_path=temp_path,
+            size_mb=temp_path.stat().st_size / (1024 * 1024),
+            fallback_message=None,
+        )
+    else:
+        preparation = await prepare_video_for_delivery(
+            temp_path,
+            dropbox_path=display_path,
+        )
 
     if preparation.fallback_message and display_path is None:
         # Preserve historical "no path hint" simplification of fallback wording.
