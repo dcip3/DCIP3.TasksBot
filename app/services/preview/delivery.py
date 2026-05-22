@@ -40,7 +40,7 @@ async def _edit_or_send(
     *,
     message_id: Optional[int],
     reply_markup: Optional[InlineKeyboardMarkup] = None,
-) -> None:
+) -> Optional[int]:
     """Edit a stored progress message in-place; fall back to a fresh message on failure."""
     if message_id is not None:
         try:
@@ -50,10 +50,20 @@ async def _edit_or_send(
                 message_id=message_id,
                 reply_markup=reply_markup,
             )
-            return
+            return message_id
         except Exception as edit_error:
             logger.warning("Failed to edit preview progress message: %s", edit_error)
-    await bot.send_message(chat_id, text, reply_markup=reply_markup)
+    sent_message = await bot.send_message(chat_id, text, reply_markup=reply_markup)
+    return getattr(sent_message, "message_id", None)
+
+
+async def _delete_message(chat_id: int, message_id: Optional[int]) -> None:
+    if message_id is None:
+        return
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except Exception as exc:
+        logger.warning("Failed to delete preview ready message %s: %s", message_id, exc)
 
 
 async def send_ready_preview_video(
@@ -74,7 +84,7 @@ async def send_ready_preview_video(
     chat_id, message_id = stored if stored else (target_user_id, None)
 
     ready_text = f"🎬 Preview for {job_name} is ready."
-    await _edit_or_send(chat_id, ready_text, message_id=message_id)
+    ready_message_id = await _edit_or_send(chat_id, ready_text, message_id=message_id)
 
     if preparation.fallback_message:
         if preparation.size_mb:
@@ -95,6 +105,8 @@ async def send_ready_preview_video(
             caption=caption,
             parse_mode="HTML",
         )
+
+    await _delete_message(chat_id, ready_message_id)
 
     if preview_job_id:
         _pop_message(preview_job_id)
