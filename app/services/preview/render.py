@@ -254,6 +254,7 @@ async def create_video_from_job(
     expected_local_path = video_output_path
 
     dropbox_folder_normalized = normalize_dropbox_path(dropbox_folder)
+    expected_render_path = dropbox_folder_normalized if dropbox_marker_found else output_path_clean
     if dropbox_folder_normalized:
         dropbox_parent = PurePosixPath(dropbox_folder_normalized).parent
         if str(dropbox_parent) in {"", "."}:
@@ -281,6 +282,7 @@ async def create_video_from_job(
                 expected_dropbox_path=dropbox_hint,
                 expected_filename=video_filename,
                 expected_local_path=expected_local_path,
+                expected_render_path=expected_render_path,
                 source_job_id=job_id,
             )
             upload_token = await issue_preview_upload_token(payload)
@@ -466,6 +468,7 @@ async def create_video_from_job(
         "ExtraInfoKeyValue2": "PreviewJob=1",
         "ExtraInfoKeyValue3": f"PreviewTelegram={telegram_user_id}",
         "ExtraInfoKeyValue4": f"PreviewSource={job_id}",
+        "ExtraInfoKeyValue5": f"PreviewRenderPath={expected_render_path}",
     }
     if props.get("Pool"):
         preview_job_info["Pool"] = props["Pool"]
@@ -602,6 +605,7 @@ async def create_video_from_job(
         "preview_job_id": preview_job_id,
         "expected_dropbox_path": expected_dropbox_video,
         "expected_local_path": expected_local_path,
+        "expected_render_path": expected_render_path,
         "command_line": command_line,
         "preferred_slaves": preferred_slaves,
         "submission": submission_response,

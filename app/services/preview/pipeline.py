@@ -322,7 +322,7 @@ async def render_preview_via_server_pipeline(
 
         preparation = await prepare_video_for_delivery(
             video_path_obj,
-            expected_dropbox_video_path,
+            dropbox_path,
             max_size_mb=max_video_size_mb,
             initial_size_mb=video_size_mb,
         )
@@ -353,7 +353,7 @@ async def render_preview_via_server_pipeline(
         except Exception:
             pass
 
-        caption = build_preview_caption(project_name, expected_dropbox_video_path or None)
+        caption = build_preview_caption(project_name, dropbox_path or None)
         if fallback_message:
             await interaction.send_text(fallback_message, parse_mode="HTML")
         else:

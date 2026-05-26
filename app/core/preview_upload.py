@@ -55,6 +55,7 @@ class PreviewUploadPayload:
     expected_local_path: Optional[str]
     preview_job_id: Optional[str] = None
     source_job_id: Optional[str] = None
+    expected_render_path: Optional[str] = None
 
 
 @dataclass
@@ -113,6 +114,7 @@ class PreviewUploadTokenStore:
             "expected_local_path": payload.expected_local_path,
             "preview_job_id": payload.preview_job_id,
             "source_job_id": payload.source_job_id,
+            "expected_render_path": payload.expected_render_path,
         }
         return json.dumps(data, ensure_ascii=True)
 
@@ -132,6 +134,7 @@ class PreviewUploadTokenStore:
                 expected_local_path=data.get("expected_local_path"),
                 preview_job_id=data.get("preview_job_id"),
                 source_job_id=data.get("source_job_id"),
+                expected_render_path=data.get("expected_render_path"),
             )
         except Exception:
             return None
@@ -907,7 +910,7 @@ async def _deliver_received_upload(token: str) -> None:
 async def _notify_delivery_exhausted(state: PreviewUploadState) -> None:
     payload = state.payload
     safe_name = html.escape(payload.job_name or "Preview")
-    path_hint = payload.expected_dropbox_path or payload.expected_local_path
+    path_hint = payload.expected_render_path or payload.expected_dropbox_path or payload.expected_local_path
     display_path = normalize_preview_path(path_hint) or path_hint or "unknown path"
     message_text = (
         f"⚠️ Preview for {safe_name} could not be delivered after "
@@ -975,7 +978,7 @@ async def _deliver_preview(payload: PreviewUploadPayload, temp_path: Path) -> No
         except Exception as exc:
             logger.debug("Preview animation stop failed: %s", exc)
 
-    path_hint = payload.expected_dropbox_path or payload.expected_local_path
+    path_hint = payload.expected_render_path or payload.expected_dropbox_path or payload.expected_local_path
     display_path = normalize_preview_path(path_hint)
     from app.services.preview.delivery import is_preview_image_path
 

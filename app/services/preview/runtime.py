@@ -189,10 +189,11 @@ async def _run_preview_animation(preview_job_id: str, chat_id: int, message_id: 
 def _extract_preview_context(
     props: Dict[str, Any],
     default_user_id: int,
-) -> Tuple[str, str, int, Dict[str, Any], Optional[str]]:
+) -> Tuple[str, str, str, int, Dict[str, Any], Optional[str]]:
     """Extract preview metadata from job properties."""
     local_path_hint = props.get("Ex0") or ""
     dropbox_path_hint = props.get("Ex1") or ""
+    render_path_hint = ""
 
     extra_dict = props.get("ExDic") or {}
     if not isinstance(extra_dict, dict):
@@ -200,6 +201,7 @@ def _extract_preview_context(
 
     local_path_hint = extra_dict.get("PreviewLocal", local_path_hint)
     dropbox_path_hint = extra_dict.get("PreviewDropbox", dropbox_path_hint)
+    render_path_hint = extra_dict.get("PreviewRenderPath", render_path_hint)
     preview_user_id_str = extra_dict.get("PreviewTelegram")
     preview_source_id = extra_dict.get("PreviewSource")
 
@@ -219,6 +221,8 @@ def _extract_preview_context(
             local_path_hint = payload
         elif prefix == "PreviewDropbox":
             dropbox_path_hint = payload
+        elif prefix == "PreviewRenderPath":
+            render_path_hint = payload
         elif prefix == "PreviewTelegram":
             preview_user_id_str = payload
         elif prefix == "PreviewSource":
@@ -238,7 +242,7 @@ def _extract_preview_context(
     if preview_source_id:
         source_job_id = str(preview_source_id).strip() or None
 
-    return local_path_hint, dropbox_path_hint, target_user_id, extra_dict, source_job_id
+    return local_path_hint, dropbox_path_hint, render_path_hint, target_user_id, extra_dict, source_job_id
 
 
 def _parse_deadline_timestamp(raw_value: object) -> Optional[float]:
@@ -329,6 +333,7 @@ async def _notify_preview_job_completion(
     (
         local_path_hint,
         dropbox_path_hint,
+        render_path_hint,
         target_user_id,
         extra_dict,
         source_job_id,
@@ -525,7 +530,7 @@ async def _notify_preview_job_completion(
 
     max_video_size_mb = 45.0
     size_mb = get_file_size_mb(final_path)
-    path_hint = dropbox_path if dropbox_path else str(final_path)
+    path_hint = render_path_hint or dropbox_path or str(final_path)
     display_path = normalize_preview_path(path_hint) or str(final_path)
     fallback_message = None
     if not is_preview_image_path(final_path) and size_mb > max_video_size_mb:
@@ -581,6 +586,7 @@ async def _notify_preview_job_failure(
     (
         _local_hint,
         _dropbox_hint,
+        _render_hint,
         target_user_id,
         _extra_dict,
         source_job_id,
