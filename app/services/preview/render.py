@@ -498,7 +498,6 @@ async def create_video_from_job(
             preview_job_info[f"EnvironmentKeyValue{idx}"] = f"{key}={value}"
 
     if is_windows_path:
-        stub_placeholder = '"%PREVIEW_STUB%"'
         def split_windows_command(command: str) -> List[str]:
             cmd_trimmed = command.strip()
             if not cmd_trimmed:
@@ -514,31 +513,19 @@ async def create_video_from_job(
             except ValueError:
                 return [cmd_trimmed]
 
-        candidate_commands: List[List[str]] = []
         primary_tokens = split_windows_command(python_exec)
-        fallback_candidates = [
-            ["py"],
-            ["python"],
-        ]
-        for fallback in fallback_candidates:
-            if fallback not in candidate_commands:
-                candidate_commands.append(fallback)
-        if primary_tokens:
-            normalized = " ".join(primary_tokens).strip().lower()
-            if normalized and primary_tokens not in candidate_commands:
-                if normalized in {"python", "py", "py -3", "py -3.11"}:
-                    candidate_commands.append(primary_tokens)
-                else:
-                    candidate_commands.insert(0, primary_tokens)
-
-        command_segments = []
-        for tokens in candidate_commands:
-            cmd_head = subprocess.list2cmdline(tokens)
-            segment = f"{cmd_head} -c {stub_placeholder}"
-            command_segments.append(segment)
-        fallback_command = " || ".join(command_segments)
-        arguments_str = f"/C {fallback_command}"
-        executable = "cmd.exe"
+        normalized_python = " ".join(primary_tokens).strip().lower()
+        if normalized_python in {"", "python"}:
+            py_invocation = subprocess.list2cmdline(["py"] + python_args)
+            python_invocation = subprocess.list2cmdline(["python"] + python_args)
+            arguments_str = (
+                f"/C where py >NUL 2>NUL && ({py_invocation}) "
+                f"|| (where py >NUL 2>NUL && exit /b 1 || {python_invocation})"
+            )
+            executable = "cmd.exe"
+        else:
+            executable = primary_tokens[0]
+            arguments_str = subprocess.list2cmdline(primary_tokens[1:] + python_args)
         command_line = f"{executable} {arguments_str}"
     else:
         executable = python_exec

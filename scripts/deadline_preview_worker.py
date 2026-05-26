@@ -269,6 +269,10 @@ def _scan_sequence_count(pattern: str) -> int:
         return 0
 
 
+def _has_sequence_placeholder(pattern: str) -> bool:
+    return re.search(r"%0\d+d", Path(pattern).name) is not None
+
+
 def _wait_for_input_frames(
     pattern: str,
     expected_frames: int,
@@ -386,6 +390,41 @@ def _expand_sequence(pattern: str) -> Tuple[Path, str, int, List[Path]]:
     if not files:
         raise RuntimeError(f"No frames found matching pattern {pattern}")
     return directory, template, digits, files
+
+
+def _quote_concat_path(path: Path) -> str:
+    # ffmpeg concat manifests use backslash as an escape character, so normalize
+    # Windows paths to forward slashes before single-quoting them.
+    try:
+        absolute_path = path.resolve()
+    except OSError:
+        absolute_path = path.absolute()
+    normalized = str(absolute_path).replace("\\", "/")
+    return "'" + normalized.replace("'", r"'\''") + "'"
+
+
+def _create_concat_manifest(
+    files: List[Path],
+    frame_rate: float,
+    temp_dir: Path,
+) -> Tuple[Path, tempfile.TemporaryDirectory[str]]:
+    if not files:
+        raise RuntimeError("Cannot build preview concat manifest without frames")
+
+    temp_dir_obj = tempfile.TemporaryDirectory(prefix="preview_concat_", dir=str(temp_dir))
+    manifest_dir = Path(temp_dir_obj.name)
+    _register_temp_path(manifest_dir)
+    manifest_path = manifest_dir / "frames.ffconcat"
+    duration = 1.0 / max(float(frame_rate), 0.001)
+    lines = ["ffconcat version 1.0"]
+    for frame_path in files:
+        lines.append(f"file {_quote_concat_path(frame_path)}")
+        lines.append(f"duration {duration:.12g}")
+    # The concat demuxer requires the last file to be repeated for the final
+    # duration directive to take effect.
+    lines.append(f"file {_quote_concat_path(files[-1])}")
+    manifest_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return manifest_path, temp_dir_obj
 
 
 def _resolve_single_frame_path(pattern: str, start_number: int) -> Path:
@@ -592,6 +631,7 @@ def build_ffmpeg_command(
     video_encoder: str,
     preset: str,
     crf: int,
+    concat_manifest: Optional[Path] = None,
 ) -> tuple[list[str], str]:
     selected_encoder = _resolve_video_encoder(ffmpeg_path, video_encoder)
     command: list[str] = [
@@ -600,18 +640,38 @@ def build_ffmpeg_command(
         "-hide_banner",
         "-loglevel",
         "error",
-        "-start_number",
-        str(start_number),
-        "-framerate",
-        f"{frame_rate:g}",
-        "-i",
-        input_pattern,
     ]
+
+    if concat_manifest is not None:
+        command.extend(
+            [
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_manifest),
+            ]
+        )
+    else:
+        command.extend(
+            [
+                "-start_number",
+                str(start_number),
+                "-framerate",
+                f"{frame_rate:g}",
+                "-i",
+                input_pattern,
+            ]
+        )
 
     if lut_path is not None:
         lut_posix = lut_path.as_posix().replace(":", r"\:")
         lut_arg = f"lut3d=file='{lut_posix}'"
         command.extend(["-vf", lut_arg])
+
+    if concat_manifest is not None:
+        command.extend(["-r", f"{frame_rate:g}"])
 
     command.extend(
         _build_encoder_args(
@@ -996,8 +1056,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         ffmpeg_input_pattern = args.input_pattern
         start_number = args.start_number
         lut_path: Optional[Path] = None
+        concat_manifest: Optional[Path] = None
+        available_input_files: List[Path] = []
 
         expected_frames = max(0, int(args.expected_frames or 0))
+        validation_frame_count = expected_frames
         if expected_frames > 0:
             wait_seconds = max(0, int(args.input_wait_seconds or 0))
             found = _wait_for_input_frames(
@@ -1006,10 +1069,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                 wait_seconds,
             )
             if found < expected_frames:
-                raise RuntimeError(
-                    f"Found {found} input frames, expected {expected_frames} "
-                    f"after waiting {wait_seconds}s. Render output may still be "
-                    "syncing to this worker — please retry the preview."
+                logging.warning(
+                    "Found %s input frames, expected %s after waiting %ss; "
+                    "building a partial preview from available frames.",
+                    found,
+                    expected_frames,
+                    wait_seconds,
                 )
 
         if expected_frames == 1:
@@ -1032,6 +1097,18 @@ def main(argv: Optional[list[str]] = None) -> int:
                 raise RuntimeError("Preview upload failed after retries")
             return 0
 
+        if _has_sequence_placeholder(args.input_pattern):
+            _, _, _, available_input_files = _expand_sequence(args.input_pattern)
+            validation_frame_count = len(available_input_files)
+            if expected_frames > 0 and validation_frame_count < expected_frames:
+                logging.info(
+                    "Partial preview source contains %s/%s available frames",
+                    validation_frame_count,
+                    expected_frames,
+                )
+            if not available_input_files:
+                raise RuntimeError(f"No frames found matching pattern {args.input_pattern}")
+
         if apply_color and color_mode == "cpu":
             if config_path is None:
                 raise RuntimeError("OCIO config required for CPU color mode")
@@ -1047,6 +1124,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             ffmpeg_input_pattern = converted_pattern
             if cpu_temp_dir is not None:
                 cleanup_resources.append(cpu_temp_dir)
+            if _has_sequence_placeholder(ffmpeg_input_pattern):
+                _, _, _, available_input_files = _expand_sequence(ffmpeg_input_pattern)
+                validation_frame_count = len(available_input_files)
         elif apply_color:
             if config_path is None:
                 raise RuntimeError("OCIO config required for LUT color mode")
@@ -1066,6 +1146,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                 destination=lut_path,
             )
 
+        if len(available_input_files) > 0:
+            concat_manifest, concat_temp_dir = _create_concat_manifest(
+                available_input_files,
+                args.frame_rate,
+                base_temp_dir,
+            )
+            cleanup_resources.append(concat_temp_dir)
+
         command, selected_encoder = build_ffmpeg_command(
             ffmpeg_path=args.ffmpeg_path,
             start_number=start_number,
@@ -1076,6 +1164,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             video_encoder=args.video_encoder,
             preset=args.preset,
             crf=args.crf,
+            concat_manifest=concat_manifest,
         )
         logging.info("Using preview video encoder: %s", selected_encoder)
 
@@ -1090,6 +1179,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 video_encoder=encoder_name,
                 preset=args.preset,
                 crf=args.crf,
+                concat_manifest=concat_manifest,
             )
             run_ffmpeg(cmd)
             return resolved_encoder
@@ -1104,7 +1194,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             valid, validation_reason = _validate_preview_output(
                 Path(args.output_path),
                 args.ffmpeg_path,
-                expected_frames,
+                validation_frame_count,
             )
             logging.info("Preview validation: %s", validation_reason)
             if not valid:
@@ -1132,7 +1222,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 valid, validation_reason = _validate_preview_output(
                     Path(args.output_path),
                     args.ffmpeg_path,
-                    expected_frames,
+                    validation_frame_count,
                 )
                 logging.info("Preview validation after libx264 retry: %s", validation_reason)
                 if not valid:
@@ -1152,7 +1242,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         final_valid, final_reason = _validate_preview_output(
             Path(args.output_path),
             args.ffmpeg_path,
-            expected_frames,
+            validation_frame_count,
         )
         logging.info("Final preview validation: %s", final_reason)
         if not final_valid:

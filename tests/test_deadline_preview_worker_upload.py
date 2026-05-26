@@ -110,3 +110,54 @@ class DeadlinePreviewWorkerUploadTests(unittest.TestCase):
         self.assertEqual(convert_mock.call_args.kwargs["output_path"], output_path)
         upload_mock.assert_called_once_with(output_path)
         ffmpeg_mock.assert_not_called()
+
+    def test_partial_sequence_preview_uses_available_frames(self) -> None:
+        for frame in (1, 3, 5):
+            self.video_path.with_name(f"preview.{frame:04d}.jpg").write_bytes(b"jpg")
+        output_path = self.video_path.with_suffix(".partial.mp4")
+        manifests = []
+
+        def write_video(command) -> None:
+            manifests.append(Path(command[command.index("-i") + 1]).read_text(encoding="utf-8"))
+            Path(command[-1]).write_bytes(b"x" * 2048)
+
+        with mock.patch.object(
+            deadline_preview_worker,
+            "run_ffmpeg",
+            side_effect=write_video,
+        ) as ffmpeg_mock, mock.patch.object(
+            deadline_preview_worker,
+            "_validate_preview_output",
+            return_value=(True, "ok"),
+        ) as validate_mock, mock.patch.object(
+            deadline_preview_worker,
+            "_maybe_upload_preview",
+            return_value=True,
+        ) as upload_mock:
+            result = deadline_preview_worker.main(
+                [
+                    "--input-pattern",
+                    str(self.video_path.with_name("preview.%04d.jpg")),
+                    "--output-path",
+                    str(output_path),
+                    "--start-number",
+                    "1",
+                    "--expected-frames",
+                    "5",
+                    "--input-wait-seconds",
+                    "0",
+                    "--disable-color",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        command = ffmpeg_mock.call_args.args[0]
+        self.assertIn("-f", command)
+        self.assertIn("concat", command)
+        manifest_text = manifests[-1]
+        self.assertIn("preview.0001.jpg", manifest_text)
+        self.assertIn("preview.0003.jpg", manifest_text)
+        self.assertIn("preview.0005.jpg", manifest_text)
+        self.assertNotIn("preview.0002.jpg", manifest_text)
+        self.assertEqual(validate_mock.call_args_list[-1].args[2], 3)
+        upload_mock.assert_called_once_with(output_path)
