@@ -117,6 +117,196 @@ def _install_signal_handlers() -> None:
 atexit.register(_cleanup_registered_temp_paths)
 
 
+_BOOTSTRAP_ENV_FLAG = "PREVIEW_BOOTSTRAPPED"
+_STUB_FALLBACK = (
+    "import os,sys,base64,zlib,json;"
+    "script=os.environ['PREVIEW_SCRIPT_B64'];"
+    "argv=os.environ['PREVIEW_ARGV_B64'];"
+    "sys.argv=json.loads(base64.b64decode(argv).decode('utf-8'));"
+    "exec(zlib.decompress(base64.b64decode(script)))"
+)
+
+
+def _required_color_modules(args) -> List[str]:
+    if args.disable_color:
+        return []
+    if Path(args.input_pattern).suffix.lower() != ".exr":
+        return []
+    modules = ["PyOpenColorIO"]
+    if args.color_mode.lower() == "cpu" or int(args.expected_frames or 0) == 1:
+        modules.extend(["OpenEXR", "Imath", "numpy", "PIL"])
+    return modules
+
+
+def _missing_modules(modules: List[str]) -> List[str]:
+    import importlib.util
+
+    missing: List[str] = []
+    for module in modules:
+        try:
+            if importlib.util.find_spec(module) is None:
+                missing.append(module)
+        except (ImportError, ValueError):
+            missing.append(module)
+    return missing
+
+
+def _iter_python_candidates() -> List[str]:
+    """Collect other Python interpreters installed on this machine, best-effort."""
+    candidates: List[str] = []
+    seen: Set[str] = set()
+
+    def _add(raw: Optional[str]) -> None:
+        if not raw:
+            return
+        cleaned = raw.strip().strip('"')
+        if not cleaned:
+            return
+        path = Path(cleaned)
+        if not path.is_file():
+            return
+        try:
+            key = os.path.normcase(str(path.resolve()))
+        except OSError:
+            key = os.path.normcase(cleaned)
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(str(path))
+
+    try:
+        seen.add(os.path.normcase(str(Path(sys.executable).resolve())))
+    except OSError:
+        pass
+
+    if os.name == "nt":
+        py_launcher = shutil.which("py")
+        if py_launcher:
+            try:
+                listing = subprocess.run(
+                    [py_launcher, "-0p"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                output = (listing.stdout or "") + "\n" + (listing.stderr or "")
+                for line in output.splitlines():
+                    line = line.strip()
+                    if not line.startswith("-"):
+                        continue
+                    parts = line.split(None, 1)
+                    if len(parts) != 2:
+                        continue
+                    rest = parts[1].strip()
+                    if rest.startswith("*"):
+                        rest = rest[1:].strip()
+                    _add(rest)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        try:
+            where_result = subprocess.run(
+                ["where", "python", "python3"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            for line in (where_result.stdout or "").splitlines():
+                _add(line)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        glob_roots: List[Path] = []
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            glob_roots.append(Path(local_appdata) / "Programs" / "Python")
+            glob_roots.append(Path(local_appdata) / "Microsoft" / "WindowsApps")
+        glob_roots.append(Path("C:/Program Files"))
+        glob_roots.append(Path("C:/"))
+        for root in glob_roots:
+            try:
+                for exe in root.glob("Python3*/python.exe"):
+                    _add(str(exe))
+                for exe in root.glob("python3*.exe"):
+                    _add(str(exe))
+            except OSError:
+                continue
+    else:
+        for name in ("python3", "python"):
+            _add(shutil.which(name))
+
+    return candidates
+
+
+def _probe_interpreter(executable: str, modules: List[str]) -> bool:
+    probe = "import " + ", ".join(modules)
+    try:
+        result = subprocess.run(
+            [executable, "-c", probe],
+            capture_output=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def _maybe_delegate_to_capable_python(args) -> Optional[int]:
+    """Re-run the preview under another interpreter when this one lacks color modules.
+
+    The Deadline job launches whatever `py`/`python` resolves to on the worker, which
+    may change whenever Python is installed or upgraded. Instead of failing, look for
+    an interpreter that has the required OCIO modules and delegate the render to it.
+
+    Returns the delegate's exit code, or None when execution should continue in-process.
+    """
+    if os.environ.get(_BOOTSTRAP_ENV_FLAG):
+        return None
+    modules = _required_color_modules(args)
+    if not modules:
+        return None
+    missing = _missing_modules(modules)
+    if not missing:
+        return None
+
+    logging.warning(
+        "Python %s is missing modules required for the preview color transform (%s); "
+        "searching this machine for a capable interpreter",
+        sys.executable,
+        ", ".join(missing),
+    )
+
+    if os.environ.get("PREVIEW_SCRIPT_B64") and os.environ.get("PREVIEW_ARGV_B64"):
+        stub = os.environ.get("PREVIEW_STUB") or _STUB_FALLBACK
+        tail = ["-c", stub]
+    else:
+        script_path = globals().get("__file__")
+        if not script_path or not Path(script_path).is_file():
+            return None
+        tail = [str(script_path)] + list(sys.argv[1:])
+
+    checked: List[str] = []
+    for candidate in _iter_python_candidates():
+        checked.append(candidate)
+        if not _probe_interpreter(candidate, modules):
+            continue
+        logging.warning("Delegating preview render to %s", candidate)
+        env = dict(os.environ)
+        env[_BOOTSTRAP_ENV_FLAG] = "1"
+        try:
+            completed = subprocess.run([candidate] + tail, env=env)
+        except OSError as exc:
+            logging.error("Failed to start %s: %s", candidate, exc)
+            continue
+        return completed.returncode
+
+    logging.error(
+        "No Python interpreter with the required modules (%s) was found; checked: %s. "
+        "Run scripts/worker_setup.ps1 on this worker to install them.",
+        ", ".join(modules),
+        ", ".join(checked) or "none",
+    )
+    return None
+
+
 def bake_preview_lut(
     *,
     config_path: Path,
@@ -1035,6 +1225,11 @@ def _upload_preview_file(
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_arguments(argv)
     configure_logging(args.verbose)
+
+    delegated_exit = _maybe_delegate_to_capable_python(args)
+    if delegated_exit is not None:
+        return delegated_exit
+
     _install_signal_handlers()
 
     try:

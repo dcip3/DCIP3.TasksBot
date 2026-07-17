@@ -6,7 +6,9 @@
 
 .DESCRIPTION
     - Downloads and installs Python 3.11 from python.org when not already present (falls back to winget).
-    - Upgrades pip and installs the required Python packages system-wide (or per-user).
+    - Upgrades pip and installs the required Python packages into EVERY Python 3 interpreter found on
+      the machine (py launcher registrations, PATH pythons including Microsoft Store, common install dirs),
+      so preview jobs keep working no matter which interpreter `py`/`python` resolves to.
     - Can be executed with administrative privileges to install for all users.
     - Safe to re-run; existing installations will be reused.
 
@@ -261,6 +263,88 @@ function Get-ExistingPythonInterpreter {
     return $null
 }
 
+function Resolve-PythonExecutable {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $null
+    }
+    try {
+        $resolved = & $Path "-c" "import sys; print(sys.executable)"
+        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace("$resolved")) {
+            $resolvedPath = "$resolved".Trim()
+            if (Test-Path $resolvedPath) {
+                return $resolvedPath
+            }
+        }
+    } catch {}
+    return $null
+}
+
+function Get-AllPythonInterpreters {
+    $candidates = @()
+
+    # Interpreters registered with the Python launcher (py -0p)
+    if (Get-Command py -ErrorAction SilentlyContinue) {
+        $listing = cmd /c "py -0p 2>&1"
+        foreach ($line in @($listing)) {
+            $text = "$line".Trim()
+            if (-not $text.StartsWith("-")) { continue }
+            $match = [regex]::Match($text, '^\S+\s+\*?\s*(.+)$')
+            if ($match.Success) {
+                $candidates += $match.Groups[1].Value.Trim()
+            }
+        }
+    }
+
+    # Every python/python3 reachable via PATH (includes Microsoft Store installs)
+    foreach ($commandName in @("python", "python3")) {
+        try {
+            $commandInfos = Get-Command $commandName -All -ErrorAction SilentlyContinue
+            foreach ($commandInfo in @($commandInfos)) {
+                if ($commandInfo -and $commandInfo.Source) {
+                    $candidates += $commandInfo.Source
+                }
+            }
+        } catch {}
+    }
+
+    # Common installation directories
+    $globRoots = @(
+        (Join-Path $env:LocalAppData "Programs\Python"),
+        "C:\Program Files",
+        "C:\"
+    )
+    foreach ($root in $globRoots) {
+        if (-not (Test-Path $root)) { continue }
+        $dirs = Get-ChildItem -Path $root -Directory -Filter "Python3*" -ErrorAction SilentlyContinue
+        foreach ($dir in @($dirs)) {
+            $candidates += (Join-Path $dir.FullName "python.exe")
+        }
+    }
+
+    # Resolve each candidate through the interpreter itself (handles Store aliases),
+    # deduplicate, and keep only Python 3.
+    $resolvedInterpreters = @()
+    $seen = @{}
+    foreach ($candidate in $candidates) {
+        if ([string]::IsNullOrWhiteSpace($candidate) -or -not (Test-Path $candidate)) { continue }
+        $resolved = Resolve-PythonExecutable -Path $candidate
+        if (-not $resolved) { continue }
+        # Deduplicate by directory so python.exe / python3.exe from one install count once
+        $key = (Split-Path $resolved -Parent).ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        try {
+            $major = & $resolved "-c" "import sys; print(sys.version_info.major)"
+            if ($LASTEXITCODE -ne 0 -or "$major".Trim() -ne "3") { continue }
+        } catch { continue }
+        $resolvedInterpreters += $resolved
+    }
+
+    return $resolvedInterpreters
+}
+
 function Ensure-Winget {
     if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
         throw "winget is required but was not found. Install App Installer from Microsoft Store first."
@@ -369,7 +453,33 @@ try {
     if (-not (Test-Path $pythonPath) -and (Test-Path $PythonExecutable)) {
         $pythonPath = $PythonExecutable
     }
-    Install-Packages -PythonPath $pythonPath -Pkgs $Packages
+
+    Write-Section "Detecting Python interpreters"
+    $interpreters = @(Get-AllPythonInterpreters)
+    $resolvedPrimary = Resolve-PythonExecutable -Path $pythonPath
+    if ($resolvedPrimary -and -not ($interpreters | Where-Object { $_.ToLowerInvariant() -eq $resolvedPrimary.ToLowerInvariant() })) {
+        $interpreters = @($resolvedPrimary) + $interpreters
+    }
+    if ($interpreters.Count -eq 0) {
+        $interpreters = @($pythonPath)
+    }
+    Write-Host "Found $($interpreters.Count) Python interpreter(s):"
+    foreach ($interpreter in $interpreters) {
+        Write-Host "  $interpreter"
+    }
+
+    $failedInterpreters = @()
+    foreach ($interpreter in $interpreters) {
+        try {
+            Install-Packages -PythonPath $interpreter -Pkgs $Packages
+        } catch {
+            $failedInterpreters += $interpreter
+            Write-Warning "Package installation failed for '$interpreter': $($_.Exception.Message). Continuing with remaining interpreters."
+        }
+    }
+    if ($failedInterpreters.Count -eq $interpreters.Count) {
+        throw "Package installation failed for every detected Python interpreter."
+    }
 
     Write-Section "Final steps"
     Write-Host "Ensure ffmpeg is installed and reachable on this worker (or set FFMPEG_PATH in .env)."
