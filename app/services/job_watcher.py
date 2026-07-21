@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html
 import logging
 import re
@@ -919,6 +920,177 @@ async def _maybe_cleanup_auto_preview_history() -> None:
         logger.warning("Watcher: failed to cleanup auto_preview_history: %s", exc)
 
 
+async def _unregister_auto_preview_history(telegram_user_id: int, job_id: str) -> None:
+    """Remove a (user, job) pair so the auto-preview flow can retry it later."""
+    conn = get_db_connection()
+    if conn is None:
+        return
+    try:
+        await conn.execute(
+            "DELETE FROM auto_preview_history WHERE telegram_user_id = ? AND job_id = ?",
+            (telegram_user_id, job_id),
+        )
+        await conn.commit()
+    except Exception as exc:
+        logger.warning(
+            "Watcher: failed to unregister auto_preview_history for user %s job %s: %s",
+            telegram_user_id,
+            job_id,
+            exc,
+        )
+
+
+def _job_chunk_count(job: dict, key: str) -> int:
+    try:
+        return int(job.get(key, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _presubmit_ready(job: dict, props: dict) -> bool:
+    """True when a rendering job is on its last tasks and safe to pre-submit a preview for.
+
+    The preview outranks render jobs by priority, so it must only enter the queue
+    once the source render has nothing left to dequeue (all tasks completed or
+    currently rendering). Otherwise a worker would babysit the waiting preview
+    instead of taking the render's own remaining tasks.
+    """
+    try:
+        total_tasks = int(props.get("Tasks", 0) or 0)
+    except (TypeError, ValueError):
+        total_tasks = 0
+    if total_tasks < 2:
+        return False  # single-task jobs (incl. stills) keep the completion-time flow
+
+    # The preview whitelist derives from the render's allow list; without one the
+    # presubmitted preview could camp on an unrelated free machine while waiting.
+    from app.services.preview.render import _resolve_machine_restrictions
+
+    listed_workers, whitelist_flag = _resolve_machine_restrictions(props)
+    if not listed_workers or whitelist_flag is False:
+        return False
+
+    if _job_chunk_count(job, "FailedChunks") > 0:
+        return False
+    queued = _job_chunk_count(job, "QueuedChunks") + _job_chunk_count(job, "PendingChunks")
+    if queued > 0:
+        return False
+    return _job_chunk_count(job, "RenderingChunks") > 0
+
+
+async def _run_auto_preview_presubmit(
+    telegram_user_id: int,
+    job_id: str,
+    job_name: str,
+    default_worker: Optional[str],
+) -> None:
+    """Submit the auto preview while the render finishes its last tasks."""
+    from app.services.preview.runtime import _submit_auto_preview_deadline
+
+    try:
+        submitted = await _submit_auto_preview_deadline(
+            telegram_user_id,
+            job_id,
+            job_name,
+            default_worker,
+            input_wait_seconds=settings.preview_presubmit_input_wait,
+            notify_on_failure=False,
+            waiting_for_render=True,
+        )
+    except Exception as exc:
+        logger.error("Auto preview presubmission failed for job %s: %s", job_id, exc)
+        submitted = False
+
+    if not submitted:
+        # Fall back to the completion-time flow: clear the dedupe records so the
+        # regular scan picks this job up once it completes.
+        auto_preview_jobs.discard((job_id, telegram_user_id))
+        await _unregister_auto_preview_history(telegram_user_id, job_id)
+
+
+async def _reconcile_presubmitted_previews(user: "_WatcherUser", jobs: list) -> None:
+    """Keep waiting preview jobs consistent with their source renders.
+
+    - source failed or was deleted -> delete the preview, update the owner's message
+    - source has queued tasks again (requeue/suspend) -> suspend the preview so it
+      stops outranking the render's own tasks
+    - source back on its last tasks or completed -> resume a suspended preview
+    """
+    from app.services.deadline import delete_job, resume_job, suspend_job
+    from app.services.preview.runtime import _extract_preview_context, pop_preview_message
+
+    jobs_by_id: dict[str, dict] = {}
+    previews: list[tuple[str, dict, dict]] = []
+    for entry in jobs:
+        if not isinstance(entry, dict):
+            continue
+        entry_id = str(entry.get("_id") or "").strip()
+        if not entry_id:
+            continue
+        jobs_by_id[entry_id] = entry
+        props = entry.get("Props") or {}
+        if isinstance(props, dict) and _is_preview_job(props):
+            previews.append((entry_id, entry, props))
+
+    for preview_id, preview, props in previews:
+        preview_stat = preview.get("Stat", 0)
+        if preview_stat not in {1, 2}:  # queued/rendering or suspended
+            continue
+
+        _, _, _, target_user_id, _, source_job_id = _extract_preview_context(
+            props, user.telegram_user_id
+        )
+        if not source_job_id or target_user_id != user.telegram_user_id:
+            continue
+
+        source = jobs_by_id.get(source_job_id)
+        if source is None or source.get("Stat", 0) == 4:
+            reason = "source render failed" if source is not None else "source render was deleted"
+            try:
+                deleted = await delete_job(user.login, user.password, preview_id)
+            except Exception as exc:
+                logger.warning("Watcher: failed to delete stale preview %s: %s", preview_id, exc)
+                continue
+            if deleted:
+                logger.info(
+                    "Watcher: removed preview %s because its %s", preview_id, reason
+                )
+                auto_preview_jobs.discard((source_job_id, target_user_id))
+                await _unregister_auto_preview_history(target_user_id, source_job_id)
+                stored_message = pop_preview_message(preview_id)
+                if stored_message:
+                    with contextlib.suppress(Exception):
+                        await bot.edit_message_text(
+                            f"⏹️ Auto preview cancelled: {reason}.",
+                            chat_id=stored_message[0],
+                            message_id=stored_message[1],
+                        )
+            continue
+
+        source_stat = source.get("Stat", 0)
+        source_queued = _job_chunk_count(source, "QueuedChunks") + _job_chunk_count(
+            source, "PendingChunks"
+        )
+        if preview_stat == 1 and (source_stat == 2 or (source_stat == 1 and source_queued > 0)):
+            with contextlib.suppress(Exception):
+                if await suspend_job(user.login, user.password, preview_id):
+                    logger.info(
+                        "Watcher: suspended preview %s while source %s has queued tasks",
+                        preview_id,
+                        source_job_id,
+                    )
+        elif preview_stat == 2 and (
+            source_stat == 3 or (source_stat == 1 and source_queued == 0)
+        ):
+            with contextlib.suppress(Exception):
+                if await resume_job(user.login, user.password, preview_id):
+                    logger.info(
+                        "Watcher: resumed preview %s for source %s",
+                        preview_id,
+                        source_job_id,
+                    )
+
+
 async def _scan_auto_preview_candidates(users: list[_WatcherUser]) -> int:
     """Find newly completed non-preview jobs and enqueue auto-preview generation."""
     from app.services.deadline import get_jobs_by_credentials
@@ -969,7 +1141,35 @@ async def _scan_auto_preview_candidates(users: list[_WatcherUser]) -> int:
                 if _is_preview_job(props):
                     continue
 
-                if job.get("Stat", 0) != 3:
+                job_stat = job.get("Stat", 0)
+                if job_stat != 3:
+                    if (
+                        settings.preview_presubmit_enabled
+                        and user.preview_method == "deadline"
+                        and job_stat == 1
+                        and _presubmit_ready(job, props)
+                        and _job_matches_scope(user.auto_scope, user.login, props, job)
+                    ):
+                        auto_key = (job_id, user.telegram_user_id)
+                        if auto_key in auto_preview_jobs:
+                            continue
+                        is_new = await _register_auto_preview_history(
+                            user.telegram_user_id, job_id
+                        )
+                        if not is_new:
+                            auto_preview_jobs.add(auto_key)
+                            continue
+                        auto_preview_jobs.add(auto_key)
+                        job_name = str(props.get("Name") or "").split("/")[-1] or job_id
+                        asyncio.create_task(
+                            _run_auto_preview_presubmit(
+                                user.telegram_user_id,
+                                job_id,
+                                job_name,
+                                user.preview_worker,
+                            )
+                        )
+                        scheduled += 1
                     continue
 
                 if not _is_recently_completed(job, props):
@@ -1001,6 +1201,15 @@ async def _scan_auto_preview_candidates(users: list[_WatcherUser]) -> int:
                     )
                 )
                 scheduled += 1
+
+            try:
+                await _reconcile_presubmitted_previews(user, jobs)
+            except Exception as exc:
+                logger.warning(
+                    "Watcher: preview reconcile failed for user %s: %s",
+                    user.telegram_user_id,
+                    exc,
+                )
 
             return scheduled
 

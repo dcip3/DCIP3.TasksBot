@@ -88,6 +88,18 @@ class Settings(BaseSettings):
         "lut",
         description="Color transform mode for previews: 'lut' generates a LUT, 'cpu' applies OCIO on CPU",
     )
+    preview_presubmit_enabled: bool = Field(
+        True,
+        description=(
+            "Submit auto previews while the source render is finishing its last tasks, "
+            "so the freed worker picks the preview before the next render job"
+        ),
+    )
+    preview_presubmit_input_wait: int = Field(
+        3600,
+        ge=60,
+        description="input-wait-seconds passed to presubmitted preview jobs (frames may still be rendering)",
+    )
     ffmpeg_path: str = Field("ffmpeg", description="Path to ffmpeg executable on Deadline workers")
     preview_upload_enabled: bool = Field(
         False,

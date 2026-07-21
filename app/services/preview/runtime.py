@@ -814,7 +814,11 @@ async def _submit_auto_preview_deadline(
     job_id: str,
     job_name: str,
     default_worker: Optional[str],
-) -> None:
+    *,
+    input_wait_seconds: Optional[int] = None,
+    notify_on_failure: bool = True,
+    waiting_for_render: bool = False,
+) -> bool:
     """Submit a Deadline preview job and register progress tracking."""
     from app.services.deadline import WorkerStatusError
     from app.services.preview.render import PreviewSubmissionError, create_video_from_job
@@ -831,13 +835,17 @@ async def _submit_auto_preview_deadline(
             job_id,
             specific_worker=default_worker,
             skip_worker_validation=True,
+            input_wait_seconds=input_wait_seconds,
         )
     except PreviewSubmissionError as exc:
+        if not notify_on_failure:
+            logger.warning("Auto preview presubmission failed for job %s: %s", job_id, exc)
+            return False
         await bot.send_message(
             telegram_user_id,
             f"❌ Auto preview: {exc.user_message}",
         )
-        return
+        return False
     except WorkerStatusError as worker_error:
         logger.warning(
             "Auto preview default worker unavailable for job %s: %s",
@@ -851,6 +859,7 @@ async def _submit_auto_preview_deadline(
                 job_id,
                 use_any_machine=True,
                 skip_worker_validation=True,
+                input_wait_seconds=input_wait_seconds,
             )
         except Exception as exc:
             logger.error("Auto preview fallback submission failed for job %s: %s", job_id, exc)
@@ -860,14 +869,18 @@ async def _submit_auto_preview_deadline(
         result = None
 
     if not result:
-        await bot.send_message(
-            telegram_user_id,
-            "❌ Auto preview: failed to submit preview job.",
-        )
-        return
+        if notify_on_failure:
+            await bot.send_message(
+                telegram_user_id,
+                "❌ Auto preview: failed to submit preview job.",
+            )
+        return False
 
     preview_id = result.get("preview_job_id")
-    header = f"🧾 Auto preview queued for {job_name}"
+    if waiting_for_render:
+        header = f"🧾 Auto preview scheduled for {job_name} (starts right after render)"
+    else:
+        header = f"🧾 Auto preview queued for {job_name}"
     if fallback_used:
         header += " (any worker)"
     message_text = f"{header}\n□ □ □"
@@ -889,6 +902,7 @@ async def _submit_auto_preview_deadline(
     )
     if preview_id:
         register_preview_message(preview_id, progress_msg.chat.id, progress_msg.message_id)
+    return True
 
 
 async def _run_auto_preview_for_job(
