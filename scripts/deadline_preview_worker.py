@@ -7,7 +7,10 @@ Steps:
 2. Invoke ffmpeg to convert the image sequence to an MP4 using the baked LUT.
 
 The script expects that PyOpenColorIO, OpenEXR and NumPy (indirectly via PyOpenColorIO) are installed
-in the Python environment available on the worker.
+in the Python environment available on the worker. When the launched interpreter lacks them, the
+script self-heals: it delegates to another local interpreter that has the modules, then tries an
+unattended `pip install`, and as a last resort excludes this worker from the job's machine list and
+requeues the current task so another worker picks it up.
 """
 
 from __future__ import annotations
@@ -249,14 +252,234 @@ def _probe_interpreter(executable: str, modules: List[str]) -> bool:
     return result.returncode == 0
 
 
-def _maybe_delegate_to_capable_python(args) -> Optional[int]:
-    """Re-run the preview under another interpreter when this one lacks color modules.
+_MODULE_PIP_PACKAGES = {
+    "PyOpenColorIO": "opencolorio",
+    "OpenEXR": "openexr",
+    "Imath": "openexr",
+    "numpy": "numpy",
+    "PIL": "pillow",
+}
+
+
+def _delegation_command_tail() -> Optional[List[str]]:
+    if os.environ.get("PREVIEW_SCRIPT_B64") and os.environ.get("PREVIEW_ARGV_B64"):
+        stub = os.environ.get("PREVIEW_STUB") or _STUB_FALLBACK
+        return ["-c", stub]
+    script_path = globals().get("__file__")
+    if script_path and Path(script_path).is_file():
+        return [str(script_path)] + list(sys.argv[1:])
+    return None
+
+
+def _delegate_to_capable_python(modules: List[str]) -> Optional[int]:
+    """Re-run the preview under another local interpreter that has the modules.
+
+    Returns the delegate's exit code, or None when no capable interpreter was found.
+    """
+    tail = _delegation_command_tail()
+    if tail is None:
+        return None
+
+    checked: List[str] = []
+    for candidate in _iter_python_candidates():
+        checked.append(candidate)
+        if not _probe_interpreter(candidate, modules):
+            continue
+        logging.warning("Delegating preview render to %s", candidate)
+        env = dict(os.environ)
+        env[_BOOTSTRAP_ENV_FLAG] = "1"
+        try:
+            completed = subprocess.run([candidate] + tail, env=env)
+        except OSError as exc:
+            logging.error("Failed to start %s: %s", candidate, exc)
+            continue
+        return completed.returncode
+
+    logging.warning(
+        "No installed Python interpreter has the required modules (%s); checked: %s",
+        ", ".join(modules),
+        ", ".join(checked) or "none",
+    )
+    return None
+
+
+def _auto_install_missing_packages(missing: List[str]) -> bool:
+    """Install the pip packages that provide the missing modules, unattended."""
+    packages: List[str] = []
+    for module in missing:
+        package = _MODULE_PIP_PACKAGES.get(module)
+        if package and package not in packages:
+            packages.append(package)
+    if not packages:
+        return False
+
+    for extra_args in ([], ["--user"]):
+        command = [sys.executable, "-m", "pip", "install", "--upgrade"] + extra_args + packages
+        logging.warning("Attempting automatic package installation: %s", " ".join(command))
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=900)
+        except (OSError, subprocess.SubprocessError) as exc:
+            logging.error("pip could not be launched: %s", exc)
+            return False
+        if result.returncode == 0:
+            logging.warning("Automatic package installation succeeded")
+            return True
+        logging.error(
+            "pip install failed (exit %s): %s",
+            result.returncode,
+            (result.stderr or result.stdout or "").strip()[-2000:],
+        )
+    return False
+
+
+def _find_deadline_command() -> Optional[str]:
+    exe_name = "deadlinecommand.exe" if os.name == "nt" else "deadlinecommand"
+    candidates: List[Path] = []
+    deadline_path = os.environ.get("DEADLINE_PATH")
+    if deadline_path:
+        candidates.append(Path(deadline_path) / exe_name)
+    located = shutil.which("deadlinecommand")
+    if located:
+        candidates.append(Path(located))
+    if os.name == "nt":
+        candidates.append(Path(r"C:\Program Files\Thinkbox\Deadline10\bin") / exe_name)
+    else:
+        candidates.append(Path("/opt/Thinkbox/Deadline10/bin") / exe_name)
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def _run_deadline_command(executable: str, arguments: List[str]) -> Tuple[int, str]:
+    try:
+        result = subprocess.run(
+            [executable] + arguments,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, str(exc)
+    return result.returncode, (result.stdout or "") + (result.stderr or "")
+
+
+def _parse_key_values(output: str) -> dict:
+    values: dict = {}
+    for line in output.splitlines():
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key and key not in values:
+            values[key] = value.strip()
+    return values
+
+
+def _local_worker_names() -> List[str]:
+    if os.name == "nt":
+        program_data = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
+        workers_root = Path(program_data) / "Thinkbox" / "Deadline10" / "workers"
+    else:
+        workers_root = Path("/var/lib/Thinkbox/Deadline10/workers")
+
+    names: List[str] = []
+    try:
+        for entry in workers_root.iterdir():
+            if entry.is_dir():
+                names.append(entry.name)
+    except OSError:
+        pass
+    if not names:
+        import socket
+
+        names.append(socket.gethostname().lower())
+    return names
+
+
+def _requeue_preview_task_elsewhere() -> bool:
+    """Exclude this worker from the preview job's machine list and requeue its task.
+
+    Only the current task is requeued (not the whole job), so any frames rendered by
+    other workers are unaffected. Returns True when the requeue succeeded; the Deadline
+    Worker is then expected to abort this process shortly.
+    """
+    if not (os.environ.get("PREVIEW_SCRIPT_B64") and os.environ.get("PREVIEW_ARGV_B64")):
+        return False  # not launched as a Deadline preview job; leave the farm alone
+
+    deadline_command = _find_deadline_command()
+    if not deadline_command:
+        logging.warning("deadlinecommand was not found; cannot hand the task to another worker")
+        return False
+
+    for worker_name in _local_worker_names():
+        code, output = _run_deadline_command(deadline_command, ["GetSlave", worker_name])
+        if code != 0:
+            continue
+        worker_info = _parse_key_values(output)
+        job_id = worker_info.get("CurrentJobId", "")
+        if not job_id:
+            continue
+
+        job_code, job_output = _run_deadline_command(deadline_command, ["GetJob", job_id])
+        if job_code != 0 or not job_output.strip():
+            continue
+        job_info = _parse_key_values(job_output)
+        job_name = job_info.get("Name", "")
+        if "PreviewJob=1" not in job_output and "- Preview" not in job_name:
+            logging.warning("Current job %s does not look like a preview job; leaving it alone", job_id)
+            continue
+
+        whitelisted = (job_info.get("WhitelistFlag") or "").strip().lower() == "true"
+        if whitelisted:
+            list_command = ["RemoveSlavesFromJobMachineLimitList", job_id, worker_name]
+        else:
+            list_command = ["AddSlavesToJobMachineLimitList", job_id, worker_name]
+        list_code, list_output = _run_deadline_command(deadline_command, list_command)
+        if list_code != 0:
+            logging.error(
+                "Failed to exclude worker %s from job %s: %s",
+                worker_name,
+                job_id,
+                list_output.strip(),
+            )
+            continue
+        logging.warning(
+            "Worker %s excluded from preview job %s (%s)",
+            worker_name,
+            job_id,
+            "removed from allow list" if whitelisted else "added to deny list",
+        )
+
+        task_ids = worker_info.get("CurrentTaskIds", "").strip() or "0"
+        requeue_code, requeue_output = _run_deadline_command(
+            deadline_command, ["RequeueJobTasks", job_id, task_ids]
+        )
+        if requeue_code != 0:
+            logging.error(
+                "Failed to requeue task(s) %s of job %s: %s",
+                task_ids,
+                job_id,
+                requeue_output.strip(),
+            )
+            return False
+        logging.warning("Requeued task(s) %s of preview job %s for another worker", task_ids, job_id)
+        return True
+
+    logging.warning("Could not determine which Deadline job this process belongs to")
+    return False
+
+
+def _ensure_color_runtime(args) -> Optional[int]:
+    """Make sure the color-transform modules are available before rendering.
 
     The Deadline job launches whatever `py`/`python` resolves to on the worker, which
-    may change whenever Python is installed or upgraded. Instead of failing, look for
-    an interpreter that has the required OCIO modules and delegate the render to it.
+    may change whenever Python is installed or upgraded. When modules are missing,
+    escalate through: delegate to another local interpreter -> pip install the
+    packages unattended -> exclude this worker from the job and requeue the task.
 
-    Returns the delegate's exit code, or None when execution should continue in-process.
+    Returns an exit code when the render was delegated, or None when execution
+    should continue in-process.
     """
     if os.environ.get(_BOOTSTRAP_ENV_FLAG):
         return None
@@ -274,35 +497,30 @@ def _maybe_delegate_to_capable_python(args) -> Optional[int]:
         ", ".join(missing),
     )
 
-    if os.environ.get("PREVIEW_SCRIPT_B64") and os.environ.get("PREVIEW_ARGV_B64"):
-        stub = os.environ.get("PREVIEW_STUB") or _STUB_FALLBACK
-        tail = ["-c", stub]
-    else:
-        script_path = globals().get("__file__")
-        if not script_path or not Path(script_path).is_file():
-            return None
-        tail = [str(script_path)] + list(sys.argv[1:])
+    delegated_exit = _delegate_to_capable_python(modules)
+    if delegated_exit is not None:
+        return delegated_exit
 
-    checked: List[str] = []
-    for candidate in _iter_python_candidates():
-        checked.append(candidate)
-        if not _probe_interpreter(candidate, modules):
-            continue
-        logging.warning("Delegating preview render to %s", candidate)
-        env = dict(os.environ)
-        env[_BOOTSTRAP_ENV_FLAG] = "1"
-        try:
-            completed = subprocess.run([candidate] + tail, env=env)
-        except OSError as exc:
-            logging.error("Failed to start %s: %s", candidate, exc)
-            continue
-        return completed.returncode
+    if _auto_install_missing_packages(missing):
+        import importlib
+
+        importlib.invalidate_caches()
+        if not _missing_modules(modules):
+            logging.warning("Continuing preview render after automatic package installation")
+            return None
+        logging.error("Packages were installed but the modules are still not importable")
+
+    if _requeue_preview_task_elsewhere():
+        # The Deadline Worker aborts this process once its task is requeued; wait for
+        # that instead of racing it to an error report.
+        logging.warning("Waiting for the Deadline Worker to stop this process...")
+        time.sleep(60)
 
     logging.error(
-        "No Python interpreter with the required modules (%s) was found; checked: %s. "
-        "Run scripts/worker_setup.ps1 on this worker to install them.",
-        ", ".join(modules),
-        ", ".join(checked) or "none",
+        "No usable Python environment for the preview color transform was found on this "
+        "machine (missing: %s). Run scripts/worker_setup.ps1 on this worker to install "
+        "the required packages.",
+        ", ".join(missing),
     )
     return None
 
@@ -1226,7 +1444,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parse_arguments(argv)
     configure_logging(args.verbose)
 
-    delegated_exit = _maybe_delegate_to_capable_python(args)
+    delegated_exit = _ensure_color_runtime(args)
     if delegated_exit is not None:
         return delegated_exit
 
