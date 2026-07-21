@@ -619,18 +619,23 @@ def _extract_lut_spec(sidecar: Optional[dict]) -> Optional[dict]:
         )
         return None
 
+    # Redshift semantics ("Apply Color Management before LUT"): when the flag is
+    # on, the display transform runs FIRST and the LUT sees the display-referred
+    # image. Older sidecars stored the same parm under the misleading key
+    # "before_cm"; both keys carry the RS_campro_lutBeforeCM value.
+    cm_before_lut_raw = lut.get("cm_before_lut", lut.get("before_cm"))
     spec = {
         "file": str(resolved),
         "strength": min(1.0, strength),
         "is_log": bool(lut.get("is_log")),
-        "before_cm": bool(lut.get("before_cm")),
+        "cm_before_lut": bool(cm_before_lut_raw),
     }
     logging.info(
-        "Applying camera LUT %s (strength=%s, log=%s, before_cm=%s)",
+        "Applying camera LUT %s (strength=%s, log=%s, cm_before_lut=%s)",
         spec["file"],
         spec["strength"],
         spec["is_log"],
-        spec["before_cm"],
+        spec["cm_before_lut"],
     )
     return spec
 
@@ -716,7 +721,17 @@ def _load_cpu_processor(
     file_transform.setInterpolation(ocio.INTERP_TETRAHEDRAL)
 
     group = ocio.GroupTransform()
-    if lut_spec.get("before_cm"):
+    if lut_spec.get("cm_before_lut"):
+        # RS "Apply Color Management before LUT": the LUT is applied to the
+        # display-referred image produced by the view transform.
+        if lut_spec.get("is_log"):
+            logging.warning(
+                "Camera LUT has both 'CM before LUT' and log mode set; ignoring log mode"
+            )
+        group.appendTransform(_display_transform())
+        group.appendTransform(file_transform)
+    else:
+        # LUT is applied to the scene-referred image before color management.
         if lut_spec.get("is_log"):
             # The LUT expects log-encoded input: shape linear data through
             # ACEScct around it (best available match to Redshift's log mode).
@@ -739,10 +754,6 @@ def _load_cpu_processor(
         else:
             group.appendTransform(file_transform)
         group.appendTransform(_display_transform())
-    else:
-        # Redshift default: the LUT is applied to the display-referred image.
-        group.appendTransform(_display_transform())
-        group.appendTransform(file_transform)
 
     primary = _fused(group)
     if lut_spec.get("strength", 1.0) >= 1.0:

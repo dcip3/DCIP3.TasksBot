@@ -708,13 +708,10 @@ async def preview_job_cancel_callback(callback_query: CallbackQuery) -> None:
                     or callback_query.message.message_id != stored_message_id
                 ):
                     with contextlib.suppress(Exception):
-                        await bot.edit_message_text(
-                            "⏹️ Preview generation cancelled.",
-                            chat_id=stored_chat_id,
-                            message_id=stored_message_id,
-                        )
+                        await bot.delete_message(stored_chat_id, stored_message_id)
             if callback_query.message:
-                await callback_query.message.edit_text("⏹️ Preview generation cancelled.", reply_markup=None)
+                with contextlib.suppress(Exception):
+                    await callback_query.message.delete()
             await callback_query.answer("Preview generation cancelled.", show_alert=False)
         else:
             await callback_query.answer("Failed to cancel preview job.", show_alert=True)
