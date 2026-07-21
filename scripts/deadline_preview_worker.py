@@ -523,6 +523,43 @@ def _ensure_color_runtime(args) -> Optional[int]:
     return None
 
 
+def _wait_for_color_sidecar(
+    input_pattern: str,
+    newest_input_mtime: Optional[float],
+    *,
+    base_wait: float = 15.0,
+    fresh_wait: float = 90.0,
+    poll_interval: float = 3.0,
+) -> None:
+    """Give the sync client a moment to deliver preview_color.json.
+
+    The sidecar is written by the render plugin on the render machine; when the
+    preview starts on another machine seconds after the render completes, the
+    tiny json may still be in flight. Renders finished within the last 30
+    minutes get a longer grace period; legacy renders without a sidecar only
+    cost the short base wait.
+    """
+    sidecar_path = Path(input_pattern).parent / "preview_color.json"
+    if sidecar_path.exists():
+        return
+
+    wait_seconds = base_wait
+    if newest_input_mtime is not None and (time.time() - newest_input_mtime) < 30 * 60:
+        wait_seconds = fresh_wait
+
+    logging.info(
+        "Color sidecar not present yet; waiting up to %.0fs for it to sync",
+        wait_seconds,
+    )
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        if sidecar_path.exists():
+            logging.info("Color sidecar appeared; continuing")
+            return
+        time.sleep(poll_interval)
+    logging.info("Color sidecar did not appear; building the preview without a camera LUT")
+
+
 def _load_color_sidecar(input_pattern: str) -> Optional[dict]:
     """Load the render's preview_color.json (written by the farm's Houdini plugin)."""
     try:
@@ -1962,12 +1999,22 @@ def main(argv: Optional[list[str]] = None) -> int:
                 )
 
         lut_spec: Optional[dict] = None
-        if apply_color and not args.no_camera_lut:
-            lut_spec = _extract_lut_spec(_load_color_sidecar(args.input_pattern))
+
+        def _resolve_lut_after_sync(input_files: List[Path]) -> Optional[dict]:
+            if not apply_color or args.no_camera_lut:
+                return None
+            newest_mtime: Optional[float] = None
+            try:
+                newest_mtime = max(frame.stat().st_mtime for frame in input_files)
+            except (ValueError, OSError):
+                pass
+            _wait_for_color_sidecar(args.input_pattern, newest_mtime)
+            return _extract_lut_spec(_load_color_sidecar(args.input_pattern))
 
         if expected_frames == 1:
             input_frame = _resolve_single_frame_path(args.input_pattern, args.start_number)
             _prefetch_input_files([input_frame])
+            lut_spec = _resolve_lut_after_sync([input_frame])
             _convert_single_frame_to_png(
                 input_path=input_frame,
                 output_path=Path(args.output_path),
@@ -2000,6 +2047,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             if not available_input_files:
                 raise RuntimeError(f"No frames found matching pattern {args.input_pattern}")
             _prefetch_input_files(available_input_files)
+            lut_spec = _resolve_lut_after_sync(available_input_files)
 
             reuse_inputs = list(available_input_files)
             sidecar_file = Path(args.input_pattern).parent / "preview_color.json"
