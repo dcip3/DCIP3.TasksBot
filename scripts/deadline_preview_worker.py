@@ -778,6 +778,57 @@ def _has_sequence_placeholder(pattern: str) -> bool:
     return re.search(r"%0\d+d", Path(pattern).name) is not None
 
 
+_CLOUD_PLACEHOLDER_ATTRIBUTES = 0x00400000 | 0x00040000 | 0x00001000
+# FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_OFFLINE
+
+
+def _needs_hydration(path: Path) -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        attributes = os.stat(path).st_file_attributes
+    except (OSError, AttributeError):
+        return False
+    return bool(attributes & _CLOUD_PLACEHOLDER_ATTRIBUTES)
+
+
+def _hydrate_file(path: Path) -> bool:
+    """Force the sync client to download a cloud placeholder by reading it fully."""
+    try:
+        with open(path, "rb") as handle:
+            while handle.read(8 * 1024 * 1024):
+                pass
+        return True
+    except OSError as exc:
+        logging.warning("Could not prefetch %s: %s", path, exc)
+        return False
+
+
+def _prefetch_input_files(files: List[Path], max_threads: int = 16) -> None:
+    """Hydrate cloud-backed (e.g. Dropbox online-only) input frames in parallel.
+
+    Frames rendered by other machines arrive as online-only placeholders; without
+    prefetch each frame download starts serially on its first read during
+    conversion or encoding.
+    """
+    pending = [path for path in files if _needs_hydration(path)]
+    if not pending:
+        return
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    logging.info("Prefetching %s cloud-backed input frames...", len(pending))
+    started = time.monotonic()
+    with ThreadPoolExecutor(max_workers=min(max_threads, len(pending))) as pool:
+        hydrated = sum(1 for ok in pool.map(_hydrate_file, pending) if ok)
+    logging.info(
+        "Prefetched %s/%s frames in %.1fs",
+        hydrated,
+        len(pending),
+        time.monotonic() - started,
+    )
+
+
 def _wait_for_input_frames(
     pattern: str,
     expected_frames: int,
@@ -1611,6 +1662,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         if expected_frames == 1:
             input_frame = _resolve_single_frame_path(args.input_pattern, args.start_number)
+            _prefetch_input_files([input_frame])
             _convert_single_frame_to_png(
                 input_path=input_frame,
                 output_path=Path(args.output_path),
@@ -1640,6 +1692,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 )
             if not available_input_files:
                 raise RuntimeError(f"No frames found matching pattern {args.input_pattern}")
+            _prefetch_input_files(available_input_files)
 
         if apply_color and color_mode == "cpu":
             if config_path is None:
