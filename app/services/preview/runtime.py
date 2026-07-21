@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import html
 import logging
 import time
@@ -13,19 +12,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from aiogram.exceptions import TelegramRetryAfter
-from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from app.core.bot_core import bot
 from app.core.config import settings
 from app.core.ui_helpers import cancel_inline_button
-from app.integrations.video_helpers import get_file_size_mb, prepare_video_for_delivery
+from app.integrations.video_helpers import get_file_size_mb
 from app.services.preview.state import preview_state
 
 logger = logging.getLogger(__name__)
 _PREVIEW_RESOLVE_TIMEOUT_SECONDS = 60.0
-_DROPBOX_RETRY_DELAYS = (0, 1, 2, 4, 8, 12, 16)
 _LOCAL_FILE_RETRY_DELAYS = (0, 1, 2, 4, 8, 12)
-_SINGLE_RETRY_ATTEMPT_TIMEOUT_SECONDS = 20.0
 
 # Track preview submission progress messages (preview_job_id -> (chat_id, message_id)).
 preview_message_registry = preview_state.message_registry
@@ -37,71 +34,6 @@ preview_upload_wait_notice_jobs = preview_state.upload_wait_notice_jobs
 class PreviewCompletionResult:
     status: str
     user_id: Optional[int] = None
-
-
-class _BotPreviewInteraction:
-    """Direct Telegram interaction for background preview workflows."""
-
-    def __init__(self, user_id: int) -> None:
-        self.user_id = user_id
-
-    async def create_progress(
-        self,
-        text: str,
-        *,
-        cancel_callback_data: str | None = None,
-    ) -> Any:
-        del cancel_callback_data
-        return await bot.send_message(self.user_id, text)
-
-    async def update_progress(
-        self,
-        handle: Any,
-        text: str,
-        *,
-        cancel_callback_data: str | None = None,
-    ) -> None:
-        del cancel_callback_data
-        await handle.edit_text(text)
-
-    async def delete_progress(self, handle: Any) -> None:
-        with contextlib.suppress(Exception):
-            await handle.delete()
-
-    async def send_text(self, text: str, *, parse_mode: str | None = None) -> None:
-        await bot.send_message(self.user_id, text, parse_mode=parse_mode)
-
-    async def send_photo(
-        self,
-        path: Path,
-        *,
-        caption: str | None = None,
-        parse_mode: str | None = None,
-    ) -> None:
-        await bot.send_photo(
-            self.user_id,
-            FSInputFile(str(path)),
-            caption=caption,
-            parse_mode=parse_mode,
-        )
-
-    async def send_video(
-        self,
-        path: Path,
-        *,
-        caption: str | None = None,
-        parse_mode: str | None = None,
-    ) -> None:
-        await bot.send_video(
-            self.user_id,
-            FSInputFile(str(path)),
-            caption=caption,
-            parse_mode=parse_mode,
-        )
-
-    async def answer(self, text: str | None = None, *, show_alert: bool = False) -> None:
-        del text, show_alert
-        return None
 
 
 def register_preview_message(preview_job_id: str, chat_id: int, message_id: int) -> None:
@@ -340,46 +272,7 @@ async def _notify_preview_job_completion(
     ) = _extract_preview_context(props, telegram_user_id)
 
     final_path: Optional[Path] = None
-    dropbox_path = dropbox_path_hint
-    downloaded_temp = False
-
-    if dropbox_path_hint:
-        try:
-            from app.services.preview.render import download_video_from_dropbox
-
-            deadline = time.monotonic() + _PREVIEW_RESOLVE_TIMEOUT_SECONDS
-            for delay in _DROPBOX_RETRY_DELAYS:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                if delay:
-                    await asyncio.sleep(min(delay, remaining))
-                attempt_timeout = min(_SINGLE_RETRY_ATTEMPT_TIMEOUT_SECONDS, max(remaining, 1.0))
-                try:
-                    async with asyncio.timeout(attempt_timeout):
-                        result = await download_video_from_dropbox(
-                            login,
-                            password,
-                            job_id,
-                            dropbox_path_hint=dropbox_path_hint,
-                        )
-                except TimeoutError:
-                    logger.warning(
-                        "Timed out downloading preview video from Dropbox for job %s",
-                        job_id,
-                    )
-                    continue
-                if result:
-                    final_path = Path(result[0])
-                    dropbox_path = result[1]
-                    downloaded_temp = True
-                    break
-        except Exception as download_error:
-            logger.warning(
-                "Failed to download preview video from Dropbox for job %s: %s",
-                job_id,
-                download_error,
-            )
+    display_path_hint = dropbox_path_hint
 
     if final_path is None:
         local_path = Path(local_path_hint) if local_path_hint else None
@@ -391,19 +284,11 @@ async def _notify_preview_job_completion(
             logger.warning("Preview job %s has no recorded paths", job_id)
             return PreviewCompletionResult("notified", target_user_id)
 
+        upload_state = None
         if not local_path.exists():
-            deadline = time.monotonic() + _PREVIEW_RESOLVE_TIMEOUT_SECONDS
-            for delay in _LOCAL_FILE_RETRY_DELAYS:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                if delay:
-                    await asyncio.sleep(min(delay, remaining))
-                if local_path.exists():
-                    break
-
-        if not local_path.exists():
-            upload_state = None
+            # The bot host (VPS) usually cannot see render paths at all — the
+            # worker HTTP upload is the delivery channel there. Consult the
+            # upload state first instead of polling an unreachable path.
             try:
                 from app.core.preview_upload import get_preview_upload_state_for_job
 
@@ -435,7 +320,20 @@ async def _notify_preview_job_completion(
                         upload_state.delivery_attempts,
                     )
                     return PreviewCompletionResult("deferred", target_user_id)
+            else:
+                # No upload channel: give a slow shared filesystem a moment to
+                # expose the freshly written file (local/on-prem deployments).
+                deadline = time.monotonic() + _PREVIEW_RESOLVE_TIMEOUT_SECONDS
+                for delay in _LOCAL_FILE_RETRY_DELAYS:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    if delay:
+                        await asyncio.sleep(min(delay, remaining))
+                    if local_path.exists():
+                        break
 
+        if not local_path.exists():
             retry_markup = None
             if source_job_id:
                 retry_markup = InlineKeyboardMarkup(
@@ -520,7 +418,6 @@ async def _notify_preview_job_completion(
             return PreviewCompletionResult("notified", target_user_id)
 
         final_path = local_path
-        dropbox_path = dropbox_path or dropbox_path_hint
 
     from app.core.path_utils import normalize_preview_path
     from app.core.preview_text import build_preview_caption
@@ -530,7 +427,7 @@ async def _notify_preview_job_completion(
 
     max_video_size_mb = 45.0
     size_mb = get_file_size_mb(final_path)
-    path_hint = render_path_hint or dropbox_path or str(final_path)
+    path_hint = render_path_hint or display_path_hint or str(final_path)
     display_path = normalize_preview_path(path_hint) or str(final_path)
     fallback_message = None
     if not is_preview_image_path(final_path) and size_mb > max_video_size_mb:
@@ -564,9 +461,6 @@ async def _notify_preview_job_completion(
         caption=caption,
         delete_job=_delete,
     )
-
-    if downloaded_temp:
-        await asyncio.to_thread(final_path.unlink, missing_ok=True)
 
     logger.info("Preview video sent to user %s for job %s", target_user_id, job_id)
     return PreviewCompletionResult("delivered", target_user_id)
@@ -731,84 +625,6 @@ async def _notify_preview_job_failure(
     return target_user_id
 
 
-async def _send_dropbox_video_to_user(
-    telegram_user_id: int,
-    login: str,
-    password: str,
-    job_id: str,
-    dropbox_path_hint: Optional[str] = None,
-) -> bool:
-    """Download a preview from Dropbox and deliver it to the user."""
-    from app.integrations.video_helpers import cleanup_job_files
-    from app.services.preview.render import download_video_from_dropbox
-
-    progress_msg = await bot.send_message(
-        telegram_user_id,
-        "📥 Auto preview: downloading existing video from Dropbox...",
-    )
-    try:
-        download_result = await download_video_from_dropbox(
-            login,
-            password,
-            job_id,
-            dropbox_path_hint=dropbox_path_hint,
-        )
-    except Exception as exc:
-        from app.core.error_text import describe_error
-
-        logger.error("Auto preview Dropbox download failed for job %s: %s", job_id, exc)
-        user_message = describe_error(exc) or "Auto preview: failed to download from Dropbox."
-        with contextlib.suppress(Exception):
-            await progress_msg.edit_text(f"❌ {user_message}")
-        return False
-
-    if not download_result:
-        with contextlib.suppress(Exception):
-            await progress_msg.delete()
-        return False
-
-    video_path, dropbox_path = download_result
-    video_path_obj = Path(video_path)
-    try:
-        preparation = await prepare_video_for_delivery(
-            video_path_obj,
-            dropbox_path,
-        )
-        from app.core.preview_text import build_preview_caption
-
-        caption = build_preview_caption(video_path_obj.name, dropbox_path or video_path)
-
-        if preparation.fallback_message:
-            await bot.send_message(
-                telegram_user_id,
-                preparation.fallback_message,
-                parse_mode="HTML",
-            )
-        else:
-            await bot.send_video(
-                telegram_user_id,
-                FSInputFile(str(preparation.video_path)),
-                caption=caption,
-                parse_mode="HTML",
-            )
-        with contextlib.suppress(Exception):
-            await progress_msg.delete()
-        return True
-    except Exception as exc:
-        from app.core.error_text import describe_error
-
-        logger.error("Auto preview send failed for job %s: %s", job_id, exc)
-        user_message = describe_error(exc) or "Auto preview: failed to send the video."
-        with contextlib.suppress(Exception):
-            await progress_msg.edit_text(f"❌ {user_message}")
-        return False
-    finally:
-        with contextlib.suppress(Exception):
-            video_path_obj.unlink()
-        with contextlib.suppress(Exception):
-            cleanup_job_files(job_id)
-
-
 async def _submit_auto_preview_deadline(
     telegram_user_id: int,
     job_id: str,
@@ -909,57 +725,15 @@ async def _run_auto_preview_for_job(
     telegram_user_id: int,
     job_id: str,
     job_name: str,
-    login: str,
-    password: str,
-    preview_method: Optional[str],
     default_worker: Optional[str],
 ) -> None:
-    """Dispatch auto preview creation based on the user's configured method."""
-    if preview_method not in {"server", "deadline"}:
-        logger.info(
-            "Auto preview skipped for job %s: no default method set for user %s",
-            job_id,
+    """Dispatch auto preview creation for the completed render job."""
+    try:
+        await _submit_auto_preview_deadline(
             telegram_user_id,
-        )
-        return
-
-    interaction = _BotPreviewInteraction(telegram_user_id)
-    try:
-        from app.services.preview.pipeline import maybe_render_single_frame_preview
-
-        # Single-frame render outputs are often valid locally but fragile in Telegram
-        # when sent as the already-rendered MP4. Match manual regeneration behavior:
-        # send the source frame through the server preview path before considering
-        # an existing Dropbox video.
-        if await maybe_render_single_frame_preview(telegram_user_id, job_id, interaction):
-            return
-    except Exception as exc:
-        logger.warning("Auto preview single-frame check failed for job %s: %s", job_id, exc)
-
-    try:
-        sent_existing = await _send_dropbox_video_to_user(
-            telegram_user_id,
-            login,
-            password,
             job_id,
+            job_name,
+            default_worker,
         )
-        if sent_existing:
-            return
-    except Exception as exc:
-        logger.warning("Auto preview Dropbox send failed for job %s: %s", job_id, exc)
-
-    try:
-        if preview_method == "deadline":
-            await _submit_auto_preview_deadline(
-                telegram_user_id,
-                job_id,
-                job_name,
-                default_worker,
-            )
-            return
-
-        from app.services.preview.pipeline import render_preview_via_server_pipeline
-
-        await render_preview_via_server_pipeline(telegram_user_id, job_id, interaction)
     except Exception as exc:
         logger.error("Auto preview workflow failed for job %s: %s", job_id, exc)

@@ -1,148 +1,17 @@
-import numpy as np
-import OpenEXR
-import PyOpenColorIO as ocio
-import Imath
 from pathlib import Path
 import subprocess
 import os
 import logging
 import contextlib
 from typing import Optional
-from PIL import Image
 import asyncio
 import shutil
-from functools import lru_cache
 from dataclasses import dataclass
 
 from app.core.config import settings
-from app.core.memory_utils import maybe_collect_gc
 
 logger = logging.getLogger(__name__)
 
-
-def _maybe_collect_gc_for_memory_pressure() -> None:
-    maybe_collect_gc(
-        counter_key="video_helpers",
-        log_context="after EXR conversion",
-    )
-
-@lru_cache(maxsize=1)
-def _get_default_cpu_processor() -> ocio.CPUProcessor:
-    """Return a cached OCIO CPU processor built from the default config."""
-    config_path = Path(settings.ocio_config_path)
-    if not config_path.exists():
-        raise RuntimeError(f"OCIO config not found: {config_path}")
-
-    config = ocio.Config.CreateFromFile(str(config_path))
-    transform = ocio.DisplayViewTransform()
-    transform.setSrc("ACEScg")
-    transform.setDisplay("sRGB")
-    transform.setView("ACES 1.0 SDR-video")
-    transform.setDirection(ocio.TRANSFORM_DIR_FORWARD)
-
-    processor = config.getProcessor(transform)
-    cpu_processor = processor.getDefaultCPUProcessor()
-    if cpu_processor is None:
-        raise RuntimeError("Failed to create OCIO CPU processor from config.ocio")
-    return cpu_processor
-
-
-def convert_single_exr_file_streaming(args):
-    """
-    Converts a single EXR file to JPG using streaming processing to minimize memory usage.
-    
-    Args:
-        args: Tuple of (exr_path, conv_root, cpu_processor, width, height, target_width, target_height)
-    
-    Returns:
-        Tuple of (success, exr_path, error_message)
-    """
-    exr_path, conv_root, cpu_processor, _, _, target_width, target_height = args
-    
-    try:
-        FLOAT = Imath.PixelType(Imath.PixelType.FLOAT)
-        
-        exr = OpenEXR.InputFile(str(exr_path))
-        
-        # Get dimensions from the actual file
-        header = exr.header()
-        dw = header['dataWindow']
-        width = dw.max.x - dw.min.x + 1
-        height = dw.max.y - dw.min.y + 1
-        
-        channels = exr.channels(["R", "G", "B"], FLOAT)
-        
-        # Process image in chunks to save memory
-        chunk_size = min(256, height)  # Process in smaller chunks
-        processed_chunks = []
-        
-        for y_start in range(0, height, chunk_size):
-            y_end = min(y_start + chunk_size, height)
-            chunk_height = y_end - y_start
-            
-            # Read chunk data
-            r_chunk = np.frombuffer(channels[0][y_start * width * 4:(y_end * width * 4)], dtype=np.float32).reshape((chunk_height, width))
-            g_chunk = np.frombuffer(channels[1][y_start * width * 4:(y_end * width * 4)], dtype=np.float32).reshape((chunk_height, width))
-            b_chunk = np.frombuffer(channels[2][y_start * width * 4:(y_end * width * 4)], dtype=np.float32).reshape((chunk_height, width))
-            
-            # Stack and process
-            rgb_chunk = np.stack([r_chunk, g_chunk, b_chunk], axis=-1)
-            flat_chunk = rgb_chunk.reshape(-1, 3).astype(np.float32)
-            
-            # Apply color transform (load default if processor not supplied)
-            if cpu_processor is None:
-                cpu_processor = _get_default_cpu_processor()
-            img_desc = ocio.PackedImageDesc(flat_chunk, width, chunk_height, 3)
-            cpu_processor.apply(img_desc)
-            processed_chunk = flat_chunk.reshape(chunk_height, width, 3)
-            
-            processed_chunks.append(processed_chunk)
-            
-            # Clear chunk memory immediately
-            del r_chunk, g_chunk, b_chunk, rgb_chunk, flat_chunk
-        
-        # Close EXR file before combining chunks
-        exr.close()
-        
-        # Combine chunks and convert to 8-bit
-        img = np.vstack(processed_chunks) if processed_chunks else np.zeros((height, width, 3), dtype=np.float32)
-        img = np.clip(img * 255, 0, 255).astype(np.uint8)
-        
-        # Handle resizing if needed
-        if target_width and target_height and (target_width != width or target_height != height):
-            pil_img = Image.fromarray(img)
-            pil_img = pil_img.resize((target_width, target_height), Image.Resampling.LANCZOS)
-            img = np.array(pil_img)
-            del pil_img
-        
-        # Save as JPG
-        jpg_path = conv_root / f"{exr_path.stem}.jpg"
-        pil_img = Image.fromarray(img)
-        pil_img.save(str(jpg_path), "JPEG", quality=95, optimize=True)
-        del pil_img
-        
-        # Cleanup
-        del processed_chunks, img
-        _maybe_collect_gc_for_memory_pressure()
-        
-        # Delete source EXR file immediately after successful conversion
-        try:
-            if exr_path.exists():
-                exr_path.unlink()
-                logger.debug(f"Deleted source file: {exr_path}")
-        except Exception as del_error:
-            logger.warning(f"Failed to delete source file {exr_path}: {del_error}")
-        
-        return (True, exr_path, None)
-        
-    except Exception as e:
-        # Try to close EXR file in case of error
-        try:
-            exr.close()
-        except:
-            pass
-        logger.error(f"Failed to convert {exr_path}: {e}")
-        return (False, exr_path, str(e))
 
 def get_file_size_mb(file_path: Path) -> float:
     """
@@ -286,7 +155,7 @@ class VideoDeliveryPreparation:
 
 async def prepare_video_for_delivery(
     video_path: Path,
-    dropbox_path: Optional[str] = None,
+    display_path: Optional[str] = None,
     max_size_mb: float = 45.0,
     initial_size_mb: Optional[float] = None,
 ) -> VideoDeliveryPreparation:
@@ -311,8 +180,8 @@ async def prepare_video_for_delivery(
     fallback_message = None
     if size_mb > max_size_mb:
         location_hint = (
-            f"<code>{dropbox_path}</code>"
-            if dropbox_path
+            f"<code>{display_path}</code>"
+            if display_path
             else f"<code>{video_path}</code>"
         )
         fallback_message = (
@@ -357,57 +226,3 @@ def cleanup_job_files(job_id: str):
                     
     except Exception as e:
         logger.error(f"Error cleaning up files for job {job_id}: {e}")
-
-def assemble_video_from_jpg(conv_root: Path, exr_folder_name: str) -> Path:
-    """
-    Assembles MP4 from converted JPG/PNG files using ffmpeg.
-    
-    Args:
-        conv_root (Path): Directory with converted frames
-        exr_folder_name (str): Folder name used for output video name
-    
-    Returns:
-        Path: Path to the generated video file
-    
-    Raises:
-        RuntimeError: if no frames found or ffmpeg error occurs
-    """
-    video_path = conv_root / f"{exr_folder_name}.mp4"
-    jpg_files = list(conv_root.glob("*.jpg"))
-    jpeg_files = list(conv_root.glob("*.jpeg"))
-    png_files = list(conv_root.glob("*.png"))
-    if not jpg_files and not jpeg_files and not png_files:
-        raise RuntimeError("No frames found for video assembly.")
-    if (jpg_files or jpeg_files) and png_files:
-        raise RuntimeError("Mixed JPG and PNG sequences are not supported.")
-    if jpg_files and jpeg_files:
-        raise RuntimeError("Mixed JPG and JPEG sequences are not supported.")
-    if jpg_files:
-        pattern = str(conv_root / "*.jpg")
-    elif jpeg_files:
-        pattern = str(conv_root / "*.jpeg")
-    else:
-        pattern = str(conv_root / "*.png")
-    
-    ffmpeg_bin = settings.ffmpeg_path or "ffmpeg"
-    cmd = [
-        ffmpeg_bin,
-        "-y",
-        "-pattern_type", "glob",
-        "-i", pattern,
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "23",
-        "-pix_fmt", "yuv420p",
-        str(video_path)
-    ]
-    subprocess.run(cmd, check=True)
-    
-    try:
-        for frame_file in conv_root.glob(Path(pattern).name):
-            frame_file.unlink()
-        logger.debug("Deleted intermediate frame files")
-    except Exception as e:
-        logger.warning(f"Failed to cleanup frame files: {e}")
-    
-    return video_path 

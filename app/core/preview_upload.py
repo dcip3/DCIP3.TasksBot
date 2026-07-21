@@ -993,7 +993,7 @@ async def _deliver_preview(payload: PreviewUploadPayload, temp_path: Path) -> No
     else:
         preparation = await prepare_video_for_delivery(
             temp_path,
-            dropbox_path=display_path,
+            display_path=display_path,
         )
 
     if preparation.fallback_message and display_path is None:

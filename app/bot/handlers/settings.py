@@ -4,14 +4,13 @@ from typing import cast
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardMarkup, Message
 
 from app.auth import is_authorized
 from app.storage.user_settings import (
     NotificationScope,
     PREVIEW_DEFAULT_WORKER_AUTO,
     get_notification_settings,
-    get_preview_default_method,
     get_preview_default_worker,
     get_preview_auto_enabled,
     get_preview_auto_scope,
@@ -19,7 +18,6 @@ from app.storage.user_settings import (
     set_notification_scope,
     set_preview_auto_enabled,
     set_preview_auto_scope,
-    set_preview_default_method,
     set_preview_default_worker,
 )
 from app.core.ui_helpers import (
@@ -211,8 +209,7 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
         text_lines.extend(
             [
                 f"• Default: {default_label}",
-                "• Applies to: Deadline previews only",
-                "• Server method ignores this setting",
+                "• Applies to: Deadline previews",
                 "",
                 "Choose where Deadline previews should run:",
                 "• ✅ Auto — inherit the source job machine list (whitelist/blacklist)",
@@ -270,56 +267,6 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
             reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
         )
 
-    async def show_preview_method() -> None:
-        default_method = await get_preview_default_method(user_id)
-        method_display = {
-            "server": "Server",
-            "deadline": "Deadline",
-            None: "Always ask",
-        }
-
-        text_lines = [
-            "🎬 Default Method",
-            "",
-            f"• Default: {method_display.get(default_method, 'Always ask')}",
-            "• Applies to: how previews are rendered",
-            "",
-            "Choose the default render method:",
-            "• 🖥️ Server — build preview on the bot host",
-            "• ☁️ Deadline — build preview on the farm",
-            "• ❓ Always ask — show the menu every time",
-        ]
-
-        def _button(label: str, method_value: str, selected: bool) -> InlineKeyboardButton:
-            return selectable_inline_button(
-                text=label,
-                callback_data=f"settings:preview:method:set:{method_value}",
-                selected=selected,
-            )
-
-        keyboard_rows = [
-            [
-                _button("🖥️ Server", "server", default_method == "server"),
-                _button("☁️ Deadline", "deadline", default_method == "deadline"),
-            ],
-            [
-                _button(
-                    "❓ Always ask",
-                    "none",
-                    default_method is None,
-                )
-            ],
-            [
-                back_inline_button(callback_data="settings:preview"),
-            ],
-        ]
-
-        await _edit_or_send(
-            callback_query.message,
-            "\n".join(text_lines),
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
-        )
-
     async def show_preview_menu() -> None:
         auto_enabled = await get_preview_auto_enabled(user_id)
         auto_scope = await get_preview_auto_scope(user_id)
@@ -330,7 +277,6 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
             "",
             f"• Auto preview: {auto_label}",
             f"• Auto preview scope: {scope_label}",
-            "• Uses: your default method",
             "",
             "Choose what to configure for previews.",
         ]
@@ -339,12 +285,6 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
                 inline_button(
                     text="⚡ Auto Preview",
                     callback_data="settings:preview:auto",
-                ),
-            ],
-            [
-                inline_button(
-                    text="🎬 Default Method",
-                    callback_data="settings:preview:method",
                 ),
             ],
             [
@@ -430,10 +370,6 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
                     await show_preview_worker()
                     await callback_query.answer("Updated")
                     return
-                if sub_target == "method":
-                    await show_preview_method()
-                    await callback_query.answer("Updated")
-                    return
             await show_preview_menu()
             await callback_query.answer("Updated")
             return
@@ -477,27 +413,10 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
                     await show_preview_worker()
                     return
             if sub_action == "method":
-                if len(parts) == 3:
-                    await show_preview_method()
-                    await callback_query.answer()
-                    return
-                if len(parts) > 3 and parts[3] == "set" and len(parts) > 4:
-                    method_value = parts[4]
-                    if method_value == "none":
-                        await set_preview_default_method(user_id, None)
-                        await callback_query.answer("Default method set to: Always ask")
-                    elif method_value in {"server", "deadline"}:
-                        await set_preview_default_method(user_id, method_value)
-                        await callback_query.answer(
-                            "Default method set to: Server"
-                            if method_value == "server"
-                            else "Default method set to: Deadline"
-                        )
-                    else:
-                        await callback_query.answer("Unsupported option.", show_alert=True)
-                        return
-                    await show_preview_method()
-                    return
+                # Legacy menu removed: previews are always rendered via Deadline.
+                await show_preview_menu()
+                await callback_query.answer()
+                return
             if sub_action == "auto":
                 if len(parts) == 3:
                     await show_preview_auto()

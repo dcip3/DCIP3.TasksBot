@@ -1,25 +1,19 @@
 import contextlib
 import logging
 import time
-from pathlib import Path
 from typing import Optional
 
 from aiogram import Router
 from aiogram.exceptions import TelegramRetryAfter
-from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from app.auth import get_deadline_credentials
 from app.storage.user_settings import (
     PREVIEW_DEFAULT_WORKER_AUTO,
-    get_preview_default_method,
     get_preview_default_worker,
 )
 from app.core.bot_core import bot
-from app.core.preview_text import build_preview_caption
 from app.core.ui_helpers import cancel_inline_button
-from app.core.maintenance import cleanup_old_files
-from app.integrations.video_helpers import cleanup_job_files
-from app.bot.preview_interaction import TelegramPreviewInteraction
 from app.services.deadline import (
     ALLOWED_WORKER_STATUSES,
     delete_job_by_user_id,
@@ -27,16 +21,9 @@ from app.services.deadline import (
     get_workers_list,
     WorkerStatusError,
 )
-from app.services.preview.pipeline import (
-    maybe_render_single_frame_preview,
-    render_preview_via_server_pipeline,
-)
-from app.services.preview.state import preview_state
 from app.services.preview.render import (
     PreviewSubmissionError,
-    check_video_exists_in_dropbox,
     create_video_from_job,
-    download_video_from_dropbox,
 )
 from app.services.preview.runtime import pop_preview_message, register_preview_message
 
@@ -210,53 +197,6 @@ def _extract_preview_source(job_info: dict) -> tuple[bool, Optional[str]]:
     return is_preview_job, source_id
 
 
-async def _maybe_send_single_frame_preview(
-    callback_query: CallbackQuery,
-    job_id: str,
-) -> bool:
-    if callback_query.from_user is None:
-        return False
-    return await maybe_render_single_frame_preview(
-        callback_query.from_user.id,
-        job_id,
-        TelegramPreviewInteraction(callback_query),
-    )
-
-
-def _build_render_method_keyboard(job_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🖥️ Server",
-                    callback_data=f"preview_render:server:{job_id}",
-                ),
-                InlineKeyboardButton(
-                    text="☁️ Deadline",
-                    callback_data=f"preview_render:deadline:{job_id}",
-                ),
-            ],
-            [
-                cancel_inline_button(callback_data="preview_cancel")
-            ],
-        ]
-    )
-
-
-async def _prompt_render_method(
-    callback_query: CallbackQuery,
-    job_id: str,
-    message_text: Optional[str] = None,
-) -> None:
-    text = message_text or "Choose how to create the preview."
-    keyboard = _build_render_method_keyboard(job_id)
-    target_message = callback_query.message
-    if target_message:
-        await target_message.answer(text, reply_markup=keyboard)
-    elif callback_query.from_user:
-        await bot.send_message(callback_query.from_user.id, text, reply_markup=keyboard)
-
-
 async def _start_deadline_preview(callback_query: CallbackQuery, job_id: str) -> None:
     if callback_query.from_user is None:
         await callback_query.answer("Error: user not found.", show_alert=True)
@@ -337,7 +277,7 @@ async def preview_job_callback(callback_query: CallbackQuery) -> None:
             await callback_query.answer("No credentials found. Please login again.", show_alert=True)
             return
 
-        login, password = credentials
+        del credentials
 
         preview_job_detected = False
         preview_source_id = None
@@ -347,24 +287,6 @@ async def preview_job_callback(callback_query: CallbackQuery) -> None:
             if preview_job_detected and preview_source_id:
                 job_id = preview_source_id
 
-        video_info = await check_video_exists_in_dropbox(login, password, job_id)
-        if video_info:
-            send_button = InlineKeyboardButton(
-                text="📤 Send from Dropbox",
-                callback_data=f"send_dbx_video:{job_id}",
-            )
-            recreate_button = InlineKeyboardButton(
-                text="🔄 New render",
-                callback_data=f"preview_render_options:{job_id}",
-            )
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[[send_button, recreate_button]])
-            await callback_query.message.answer(
-                f"🎬 Video '{video_info['filename']}' already exists on Dropbox.",
-                reply_markup=keyboard,
-            )
-            await callback_query.answer()
-            return
-
         if preview_job_detected and not preview_source_id:
             await callback_query.answer(
                 "This is a preview job. Open the source job to recreate previews.",
@@ -372,20 +294,7 @@ async def preview_job_callback(callback_query: CallbackQuery) -> None:
             )
             return
 
-        default_method = await get_preview_default_method(callback_query.from_user.id)
-        if default_method == "server":
-            await render_preview_via_server(callback_query, job_id)
-            return
-        if default_method == "deadline":
-            await _start_deadline_preview(callback_query, job_id)
-            return
-
-        await _prompt_render_method(
-            callback_query,
-            job_id,
-            "No preview yet. Choose a render method:",
-        )
-        await callback_query.answer()
+        await _start_deadline_preview(callback_query, job_id)
         return
 
     except Exception as exc:
@@ -395,34 +304,16 @@ async def preview_job_callback(callback_query: CallbackQuery) -> None:
 
 @router.callback_query(lambda c: c.data and c.data.startswith("preview_render_options:"))
 async def preview_render_options_callback(callback_query: CallbackQuery) -> None:
-    """Show render method choices when user wants to create a new preview."""
+    """Start a new Deadline preview for the job."""
     if callback_query.data is None:
         await callback_query.answer("Invalid callback data.", show_alert=True)
         return
 
     job_id = callback_query.data.split(":", 1)[1]
 
-    default_method = (
-        await get_preview_default_method(callback_query.from_user.id)
-        if callback_query.from_user
-        else None
-    )
-    if default_method == "server":
-        await render_preview_via_server(callback_query, job_id)
-        return
-    if default_method == "deadline":
-        await _start_deadline_preview(callback_query, job_id)
-        return
-
-    await _prompt_render_method(
-        callback_query,
-        job_id,
-        "Select a preview render method:",
-    )
-    try:
+    await _start_deadline_preview(callback_query, job_id)
+    with contextlib.suppress(Exception):
         await callback_query.answer()
-    except Exception:
-        pass
 
 
 async def create_new_video_process(
@@ -437,9 +328,6 @@ async def create_new_video_process(
     """Submit a Deadline job that generates a preview video via ffmpeg."""
     if callback_query.from_user is None:
         await callback_query.answer("Error: user not found.", show_alert=True)
-        return
-
-    if await _maybe_send_single_frame_preview(callback_query, job_id):
         return
 
     if specific_worker:
@@ -574,7 +462,7 @@ async def create_new_video_process(
 
 @router.callback_query(lambda c: c.data and c.data.startswith("preview_render:"))
 async def preview_render_callback(callback_query: CallbackQuery) -> None:
-    """Handle render method choice for previews."""
+    """Handle legacy render-method buttons; everything renders via Deadline."""
     if callback_query.data is None:
         await callback_query.answer("Invalid callback data.", show_alert=True)
         return
@@ -586,12 +474,9 @@ async def preview_render_callback(callback_query: CallbackQuery) -> None:
 
     _, mode, job_id = parts
 
-    if mode == "deadline":
+    # "server" is a legacy mode from old inline keyboards; route it to Deadline too.
+    if mode in {"deadline", "server"}:
         await _start_deadline_preview(callback_query, job_id)
-        return
-
-    if mode == "server":
-        await render_preview_via_server(callback_query, job_id)
         return
 
     await callback_query.answer("Unknown action.", show_alert=True)
@@ -800,34 +685,8 @@ async def preview_cancel_callback(callback_query: CallbackQuery) -> None:
 
 @router.callback_query(lambda c: c.data and c.data.startswith("preview_server_cancel:"))
 async def preview_server_cancel_callback(callback_query: CallbackQuery) -> None:
-    """Handle cancellation of server-side preview generation."""
-    if callback_query.data is None:
-        await callback_query.answer("Invalid request.", show_alert=True)
-        return
-
-    job_id = callback_query.data.split(":", 1)[1]
-    stop_event = preview_state.stop_downloads.get(job_id)
-    state = preview_state.download_states.get(job_id)
-
-    if stop_event is None or state is None:
-        await callback_query.answer("Nothing to cancel.", show_alert=False)
-        return
-
-    if not stop_event.is_set():
-        stop_event.set()
-
-    state["cancel_requested"] = True
-    progress_handle = state.get("progress_handle")
-    interaction = state.get("interaction")
-
-    if progress_handle and interaction:
-        with contextlib.suppress(Exception):
-            await interaction.update_progress(
-                progress_handle,
-                "⏹️ Cancelling preview generation...",
-            )
-
-    await callback_query.answer("Cancelling preview...", show_alert=False)
+    """Legacy button from removed server-side preview generation."""
+    await callback_query.answer("Nothing to cancel.", show_alert=False)
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("preview_job_cancel:"))
@@ -862,18 +721,6 @@ async def preview_job_cancel_callback(callback_query: CallbackQuery) -> None:
     except Exception as exc:
         logger.error("Error cancelling preview job %s: %s", preview_job_id, exc)
         await callback_query.answer("Error cancelling job.", show_alert=True)
-
-
-async def render_preview_via_server(callback_query: CallbackQuery, job_id: str) -> None:
-    """Thin handler wrapper delegating heavy server pipeline to service layer."""
-    if callback_query.from_user is None:
-        await callback_query.answer("Error: user not found.", show_alert=True)
-        return
-    await render_preview_via_server_pipeline(
-        callback_query.from_user.id,
-        job_id,
-        TelegramPreviewInteraction(callback_query),
-    )
 
 
 async def show_worker_selection_for_preview(callback_query: CallbackQuery, job_id: str) -> None:
@@ -952,77 +799,8 @@ async def show_worker_selection_for_preview(callback_query: CallbackQuery, job_i
 
 @router.callback_query(lambda c: c.data and c.data.startswith("send_dbx_video:"))
 async def send_dbx_video_callback(callback_query: CallbackQuery) -> None:
-    """Handle send video from Dropbox button press."""
-    if callback_query.from_user is None or callback_query.data is None:
-        await callback_query.answer("Invalid request.", show_alert=True)
-        return
-
-    job_id = callback_query.data.split(":", 1)[1]
-
-    try:
-        credentials = await get_deadline_credentials(callback_query.from_user.id)
-        if not credentials:
-            await callback_query.answer("No credentials found. Please login again.", show_alert=True)
-            return
-
-        login, password = credentials
-        progress_msg = await callback_query.message.answer("📥 Downloading existing video from Dropbox...")
-
-        try:
-            download_result = await download_video_from_dropbox(login, password, job_id)
-        except Exception as exc:
-            from app.core.error_text import describe_error
-
-            logger.error("Error downloading video from Dropbox: %s", exc)
-            user_message = describe_error(exc) or "Failed to download the video from Dropbox."
-            await progress_msg.edit_text(f"❌ {user_message}")
-            await callback_query.answer(user_message, show_alert=True)
-            return
-
-        if not download_result:
-            await progress_msg.edit_text("⚠️ Video not found in Dropbox.")
-            await callback_query.answer("No video available on Dropbox.", show_alert=True)
-            return
-
-        if isinstance(download_result, tuple):
-            video_path, dropbox_path = download_result
-        else:
-            video_path = download_result
-            dropbox_path = None
-
-        try:
-            video_file = FSInputFile(video_path)
-            project_name = Path(video_path).stem
-            caption = build_preview_caption(
-                project_name,
-                dropbox_path or video_path,
-            )
-            await callback_query.message.answer_video(
-                video=video_file,
-                caption=caption,
-                parse_mode="HTML",
-            )
-
-            cleanup_job_files(job_id)
-            cleanup_old_files(max_age_hours=6)
-
-            with contextlib.suppress(Exception):
-                Path(video_path).unlink()
-
-            await progress_msg.delete()
-
-            try:
-                await callback_query.answer("Video sent successfully!")
-            except Exception as answer_error:
-                logger.warning("Could not answer callback query: %s", answer_error)
-        except Exception as exc:
-            from app.core.error_text import describe_error
-
-            logger.error("Error sending Dropbox video: %s", exc)
-            user_message = describe_error(exc) or "Failed to send the video."
-            await progress_msg.edit_text(f"❌ {user_message}")
-            await callback_query.answer(user_message, show_alert=True)
-
-    except Exception as exc:
-        logger.error("Error handling send_dbx_video for user %s: %s", callback_query.from_user.id, exc)
-        await callback_query.answer("Error occurred while downloading video.", show_alert=True)
+    """Legacy button from removed Dropbox video delivery."""
+    await callback_query.answer(
+        "This feature was removed. Use the preview button to render a new one.",
+        show_alert=True,
+    )

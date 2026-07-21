@@ -16,7 +16,7 @@ bot = Bot(token=settings.telegram_bot_token)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# Global aiohttp session shared across Dropbox and other APIs
+# Global aiohttp session shared across external API calls
 aiosession: aiohttp.ClientSession | None = None
 
 async def init_aiosession():

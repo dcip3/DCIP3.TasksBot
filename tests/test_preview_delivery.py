@@ -19,11 +19,6 @@ except ModuleNotFoundError as exc:  # pragma: no cover - local env guard
 
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123456:ABCDEFabcdef1234567890")
 os.environ.setdefault("DEADLINE_API_URL", "https://deadline.example/api")
-os.environ.setdefault("DROPBOX_APP_KEY", "app-key")
-os.environ.setdefault("DROPBOX_APP_SECRET", "app-secret")
-os.environ.setdefault("DROPBOX_REFRESH_TOKEN", "refresh-token")
-os.environ.setdefault("DROPBOX_TEAM_MEMBER_ID", "team-member")
-os.environ.setdefault("DROPBOX_ROOT_NAMESPACE_ID", "root-namespace")
 
 
 def _import_delivery_module():

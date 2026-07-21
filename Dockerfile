@@ -6,11 +6,9 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_RETRIES=15 \
     PIP_PROGRESS_BAR=off
 
-# Install system dependencies
+# ffmpeg is used to compress preview videos that exceed the Telegram size limit.
 RUN apt-get update && apt-get install -y \
     ffmpeg \
-    libopenexr-dev \
-    libopencolorio-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory

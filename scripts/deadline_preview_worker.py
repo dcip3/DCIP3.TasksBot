@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import atexit
-import gc
 import http.client
 import logging
 import os

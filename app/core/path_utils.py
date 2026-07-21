@@ -74,12 +74,3 @@ def normalize_dropbox_path(path: Optional[str]) -> Optional[str]:
     return "/" + "/".join(parts)
 
 
-def extract_dropbox_path(fullpath: Optional[str], root_marker: str) -> Optional[str]:
-    if not fullpath or not root_marker:
-        return None
-    full = str(fullpath)
-    idx = full.find(root_marker)
-    if idx == -1:
-        return None
-    trimmed = full[idx:]
-    return normalize_dropbox_path(trimmed)

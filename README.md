@@ -1,14 +1,12 @@
 # TasksBot
 
-TasksBot is a Telegram bot for monitoring Deadline render jobs, managing queue actions, and delivering previews from Dropbox or worker uploads.
+TasksBot is a Telegram bot for monitoring Deadline render jobs, managing queue actions, and delivering previews via worker uploads.
 
 ## What It Does
 - Authenticates users against Deadline REST (RCS) and stores encrypted credentials in SQLite.
 - Shows jobs/workers in Telegram and supports actions: suspend, resume, requeue, delete.
-- Builds previews in two ways:
-  - on Deadline workers (preview job), or
-  - on the bot host (download frames -> convert -> upload -> send).
-- Supports auto-preview when jobs complete.
+- Builds previews on Deadline workers (preview job submitted by the bot).
+- Supports auto-preview when jobs complete (pre-submitted while the render finishes).
 - Accepts direct worker-to-bot preview uploads via HTTP endpoint with one-time tokens.
 
 ## Current Architecture
@@ -17,9 +15,7 @@ TasksBot is a Telegram bot for monitoring Deadline render jobs, managing queue a
 - `app/bot/handlers/` - Telegram routers (`auth`, `jobs`, `preview`, `settings`, `common`).
 - `app/services/` - business/application services:
   - `deadline.py`
-  - `dropbox.py`
   - `job_watcher.py`
-  - `preview/pipeline.py`
   - `preview/render.py`
   - `preview/runtime.py`
 - `app/storage/` - persistence layer:
@@ -27,7 +23,7 @@ TasksBot is a Telegram bot for monitoring Deadline render jobs, managing queue a
   - `user_settings.py` (user preferences CRUD)
 - `app/auth/service.py` - Deadline auth/session logic.
 - `app/core/` - runtime wiring and shared runtime utilities (`lifecycle`, `bot_core`, config, upload server, etc.).
-- `app/integrations/` - Dropbox and media conversion helpers.
+- `app/integrations/` - media delivery helpers.
 
 ### Runtime flow
 1. `main.py` starts aiogram polling.
@@ -115,11 +111,6 @@ python main.py
 | `TELEGRAM_BOT_TOKEN` | Telegram token from BotFather |
 | `DEADLINE_API_URL` | Deadline REST endpoint (including scheme and `/api`) |
 | `ENCRYPTION_KEY` | Fernet key for encrypting stored credentials |
-| `DROPBOX_APP_KEY` | Dropbox app key |
-| `DROPBOX_APP_SECRET` | Dropbox app secret |
-| `DROPBOX_REFRESH_TOKEN` | Dropbox OAuth refresh token |
-| `DROPBOX_TEAM_MEMBER_ID` | Dropbox team member ID |
-| `DROPBOX_ROOT_NAMESPACE_ID` | Dropbox root namespace ID |
 
 Generate key:
 ```bash
@@ -171,17 +162,13 @@ Notes:
 - `🖥️ Workers` - list worker states.
 - `⚙️ Settings` - notification scope, preview defaults, auto-preview settings.
 
-## Preview Modes
-
-### 1) Deadline preview
-- Submits a preview job through Deadline.
-- Worker runs `scripts/deadline_preview_worker.py`.
-- Result is delivered to Telegram and optionally removed from Deadline queue.
-
-### 2) Server preview
-- Bot downloads image sequence from Dropbox.
-- Converts/assembles video locally.
-- Uploads video to Dropbox and sends to Telegram.
+## Preview Flow
+- The bot submits a preview job through Deadline REST (auto previews are pre-submitted
+  while the render finishes its last tasks, so a freed worker picks them up first).
+- The worker runs `scripts/deadline_preview_worker.py` and uploads the result to the
+  bot over HTTP (`PREVIEW_UPLOAD_URL`) — the bot host needs no access to render storage.
+- The result is delivered to Telegram and the preview job is removed from the queue.
+- A copy of the video also stays next to the rendered frames on the farm storage.
 
 ## Worker Setup Scripts
 - `scripts/worker_setup.ps1` - installs Python + preview dependencies on Windows workers.
@@ -212,14 +199,11 @@ Notes:
 │   │   ├── preview_upload.py
 │   │   └── ...
 │   ├── integrations
-│   │   ├── dropbox_helpers.py
 │   │   └── video_helpers.py
 │   ├── services
 │   │   ├── deadline.py
-│   │   ├── dropbox.py
 │   │   ├── job_watcher.py
 │   │   └── preview
-│   │       ├── pipeline.py
 │   │       ├── render.py
 │   │       └── runtime.py
 │   └── storage
@@ -248,7 +232,7 @@ pytest
 ## Troubleshooting
 - Bot does not start: verify `.env`, check `docker compose logs -f tasksbot`.
 - Auth fails: check `DEADLINE_API_URL`, TLS settings, and Deadline credentials.
-- Preview issues: check `OCIO_CONFIG_PATH`, `FFMPEG_PATH`, Dropbox permissions/path mapping.
+- Preview issues: check `OCIO_CONFIG_PATH`, `FFMPEG_PATH`, and worker Python packages (`scripts/worker_setup.ps1`).
 - Worker upload not reaching bot: validate `PREVIEW_UPLOAD_URL`, open port, and token TTL.
 
 ## Notes

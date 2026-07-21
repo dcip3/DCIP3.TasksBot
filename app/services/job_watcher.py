@@ -24,7 +24,7 @@ from app.services.preview.runtime import (
     _run_auto_preview_for_job,
     preview_message_registry,
 )
-from app.storage.user_settings import VALID_PREVIEW_RENDER_METHODS, _normalize_scope
+from app.storage.user_settings import _normalize_scope
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +74,6 @@ class _WatcherUser:
     notifications_enabled: bool
     notification_scope: str
     auto_scope: str
-    preview_method: Optional[str]
     preview_worker: Optional[str]
     auto_preview_enabled: bool
 
@@ -690,7 +689,6 @@ async def _load_watcher_users() -> list[_WatcherUser]:
                    deadline_password,
                    notifications_enabled,
                    notification_scope,
-                   preview_default_method,
                    preview_default_worker,
                    preview_auto_enabled,
                    preview_auto_scope
@@ -710,7 +708,6 @@ async def _load_watcher_users() -> list[_WatcherUser]:
             encrypted_password,
             notifications_enabled,
             scope_raw,
-            preview_method_raw,
             preview_worker,
             preview_auto_enabled,
             preview_auto_scope_raw,
@@ -726,9 +723,6 @@ async def _load_watcher_users() -> list[_WatcherUser]:
 
         scope = _normalize_scope(scope_raw)
         auto_scope = _normalize_scope(preview_auto_scope_raw) if preview_auto_scope_raw else scope
-        preview_method = (preview_method_raw or "").strip().lower()
-        if preview_method not in VALID_PREVIEW_RENDER_METHODS:
-            preview_method = None
 
         users.append(
             _WatcherUser(
@@ -738,7 +732,6 @@ async def _load_watcher_users() -> list[_WatcherUser]:
                 notifications_enabled=bool(notifications_enabled),
                 notification_scope=scope,
                 auto_scope=auto_scope,
-                preview_method=preview_method,
                 preview_worker=preview_worker,
                 auto_preview_enabled=bool(preview_auto_enabled),
             )
@@ -1095,11 +1088,7 @@ async def _scan_auto_preview_candidates(users: list[_WatcherUser]) -> int:
     """Find newly completed non-preview jobs and enqueue auto-preview generation."""
     from app.services.deadline import get_jobs_by_credentials
 
-    auto_users = [
-        user
-        for user in users
-        if user.auto_preview_enabled and user.preview_method in {"server", "deadline"}
-    ]
+    auto_users = [user for user in users if user.auto_preview_enabled]
     if not auto_users:
         return 0
 
@@ -1145,7 +1134,6 @@ async def _scan_auto_preview_candidates(users: list[_WatcherUser]) -> int:
                 if job_stat != 3:
                     if (
                         settings.preview_presubmit_enabled
-                        and user.preview_method == "deadline"
                         and job_stat == 1
                         and _presubmit_ready(job, props)
                         and _job_matches_scope(user.auto_scope, user.login, props, job)
@@ -1194,9 +1182,6 @@ async def _scan_auto_preview_candidates(users: list[_WatcherUser]) -> int:
                         user.telegram_user_id,
                         job_id,
                         job_name,
-                        user.login,
-                        user.password,
-                        user.preview_method,
                         user.preview_worker,
                     )
                 )
@@ -1250,11 +1235,7 @@ async def job_progress_watcher(bot) -> None:
                 )
                 await _process_active_previews_parallel(active_targets)
 
-            auto_enabled_users = [
-                user
-                for user in users
-                if user.auto_preview_enabled and user.preview_method in {"server", "deadline"}
-            ]
+            auto_enabled_users = [user for user in users if user.auto_preview_enabled]
             scheduled_count = 0
             auto_scan_interval = min(
                 settings.job_watcher_interval_normal,

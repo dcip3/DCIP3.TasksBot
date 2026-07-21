@@ -7,13 +7,13 @@ def describe_error(exc: Exception) -> Optional[str]:
     text = str(exc).lower()
 
     if any(token in text for token in ("access_token", "invalid access token", "unauthorized", "401")):
-        return "Dropbox authorization failed. Please check the Dropbox credentials."
+        return "Authorization failed. Please check the credentials."
     if "429" in text or "rate limit" in text:
-        return "Dropbox rate limit reached. Please try again in a few minutes."
+        return "Rate limit reached. Please try again in a few minutes."
     if "timeout" in text or "timed out" in text:
-        return "Network timeout while contacting Dropbox. Please try again."
+        return "Network timeout. Please try again."
     if "ssl" in text or "tls" in text:
-        return "Secure connection error while contacting Dropbox."
+        return "Secure connection error. Please try again."
     if "not found" in text:
         return "The requested file was not found."
 

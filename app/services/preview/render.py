@@ -3,7 +3,7 @@ Preview creation and delivery service functions.
 """
 
 from typing import Optional, List, Dict, Any, Tuple, Union
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import base64
 import json
 import logging
@@ -14,15 +14,7 @@ import shlex
 import subprocess
 import zlib
 
-import aiohttp
-
 from app.core.config import settings
-from app.core.path_utils import extract_dropbox_path, normalize_dropbox_path
-from app.integrations.dropbox_helpers import (
-    get_fresh_access_token,
-    fetch_dropbox_metadata,
-)
-from app.core.bot_core import get_aiosession
 from app.services.deadline import (
     ALLOWED_WORKER_STATUSES,
     DeadlineSubmissionError,
@@ -33,10 +25,6 @@ from app.services.deadline import (
 )
 
 logger = logging.getLogger(__name__)
-_DOWNLOAD_VIDEO_GLOBAL_TIMEOUT_SECONDS = 90.0
-_DOWNLOAD_VIDEO_RETRY_ATTEMPTS = 4
-_DOWNLOAD_VIDEO_RETRY_BASE_DELAY = 0.25
-_DOWNLOAD_VIDEO_RETRY_MAX_DELAY = 2.0
 _SCRIPT_CACHE_PATH: Optional[Path] = None
 _SCRIPT_CACHE_MTIME_NS: Optional[int] = None
 _SCRIPT_CACHE_B64: Optional[str] = None
@@ -206,15 +194,6 @@ async def create_video_from_job(
         )
 
     output_path = outdirs[0]
-    idx = output_path.find(settings.dropbox_root_marker)
-    dropbox_marker_found = idx != -1
-    if idx == -1:
-        logger.warning("Dropbox root marker not found in path: %s", output_path)
-        dropbox_folder = output_path.replace("\\", "/")
-    else:
-        trimmed = output_path[idx:]
-        dropbox_folder = "/" + trimmed.replace("\\", "/").lstrip("/")
-
     out_files = job_info.get("OutFile", [])
     template_name = out_files[0] if out_files else ""
     pattern = template_name or "*.exr"
@@ -253,17 +232,10 @@ async def create_video_from_job(
         video_output_path = posixpath.join(render_output_dir, video_filename)
 
     expected_local_path = video_output_path
-
-    dropbox_folder_normalized = normalize_dropbox_path(dropbox_folder)
-    expected_render_path = dropbox_folder_normalized if dropbox_marker_found else output_path_clean
-    if dropbox_folder_normalized:
-        dropbox_parent = PurePosixPath(dropbox_folder_normalized).parent
-        if str(dropbox_parent) in {"", "."}:
-            expected_dropbox_video = video_filename
-        else:
-            expected_dropbox_video = str(dropbox_parent / video_filename)
-    else:
-        expected_dropbox_video = video_filename
+    expected_render_path = output_path_clean
+    # Forward-slash form of the video path, used for user-facing captions and
+    # carried in job metadata under the historical PreviewDropbox key.
+    expected_display_video = video_output_path.replace("\\", "/")
 
     upload_token: Optional[str] = None
     upload_url: Optional[str] = None
@@ -276,11 +248,10 @@ async def create_video_from_job(
 
         upload_url = get_preview_upload_url()
         if upload_url:
-            dropbox_hint = expected_dropbox_video if dropbox_marker_found else None
             payload = PreviewUploadPayload(
                 telegram_user_id=telegram_user_id,
                 job_name=str(props.get("Name") or props.get("Batch") or job_id),
-                expected_dropbox_path=dropbox_hint,
+                expected_dropbox_path=None,
                 expected_filename=video_filename,
                 expected_local_path=expected_local_path,
                 expected_render_path=expected_render_path,
@@ -474,9 +445,9 @@ async def create_video_from_job(
         "Priority": preview_priority,
         "MachineLimit": len(preferred_slaves) if preferred_slaves else 0,
         "ExtraInfo0": expected_local_path,
-        "ExtraInfo1": expected_dropbox_video,
+        "ExtraInfo1": expected_display_video,
         "ExtraInfoKeyValue0": f"PreviewLocal={expected_local_path}",
-        "ExtraInfoKeyValue1": f"PreviewDropbox={expected_dropbox_video}",
+        "ExtraInfoKeyValue1": f"PreviewDropbox={expected_display_video}",
         "ExtraInfoKeyValue2": "PreviewJob=1",
         "ExtraInfoKeyValue3": f"PreviewTelegram={telegram_user_id}",
         "ExtraInfoKeyValue4": f"PreviewSource={job_id}",
@@ -544,29 +515,13 @@ async def create_video_from_job(
         arguments_str = python_args_str
         command_line = f"{python_exec} {python_args_str}"
 
-    startup_dir: Optional[str] = render_output_dir
-    try:
-        if startup_dir and not Path(startup_dir).exists():
-            logger.warning(
-                "Preview startup directory %s is not accessible; using default working directory",
-                startup_dir,
-            )
-            startup_dir = None
-    except Exception as path_error:
-        logger.warning(
-            "Could not verify preview startup directory %s: %s",
-            startup_dir,
-            path_error,
-        )
-        startup_dir = None
-
+    # No StartupDirectory: render paths are not visible from the bot host (VPS),
+    # and the worker script uses absolute paths everywhere anyway.
     plugin_info = {
         "Executable": executable,
         "Arguments": arguments_str,
         "Shell": "default",
     }
-    if startup_dir:
-        plugin_info["StartupDirectory"] = startup_dir
 
     try:
         submission_response = await submit_deadline_job(
@@ -602,242 +557,10 @@ async def create_video_from_job(
 
     return {
         "preview_job_id": preview_job_id,
-        "expected_dropbox_path": expected_dropbox_video,
+        "expected_display_path": expected_display_video,
         "expected_local_path": expected_local_path,
         "expected_render_path": expected_render_path,
         "command_line": command_line,
         "preferred_slaves": preferred_slaves,
         "submission": submission_response,
     }
-
-
-async def check_video_exists_in_dropbox(
-    login: str,
-    password: str,
-    job_id: str,
-    dropbox_path_hint: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
-    """
-    Check if video already exists in Dropbox for a job.
-    
-    Args:
-        login: User login
-        password: User password
-        job_id: Job ID
-        dropbox_path_hint: Optional explicit Dropbox path to the expected video file
-        
-    Returns:
-        Video info dict if exists, None otherwise
-    """
-    try:
-        import aiohttp
-        from pathlib import PurePosixPath
-        from app.integrations.dropbox_helpers import get_fresh_access_token, fetch_dropbox_metadata
-        from app.core.config import settings
-        
-        session_dbx = await get_aiosession()
-        headers_dbx = {
-            "Authorization": f"Bearer {await get_fresh_access_token()}",
-            "Dropbox-API-Select-User": settings.dropbox_team_member_id,
-            "Dropbox-API-Path-Root": {".tag": "root", "root": settings.dropbox_root_namespace_id},
-            "Content-Type": "application/json"
-        }
-
-        normalized_hint = normalize_dropbox_path(dropbox_path_hint)
-        if normalized_hint:
-            try:
-                video_metadata = await fetch_dropbox_metadata(session_dbx, normalized_hint, headers_dbx)
-                if video_metadata.get(".tag") == "file":
-                    video_filename = PurePosixPath(normalized_hint).name
-                    return {
-                        "exists": True,
-                        "filename": video_filename,
-                        "dropbox_path": normalized_hint,
-                        "metadata": video_metadata,
-                    }
-            except Exception as hint_error:
-                logger.debug(
-                    "Dropbox hint lookup failed for job %s at %s: %s",
-                    job_id,
-                    normalized_hint,
-                    hint_error,
-                )
-
-        # Fallback to resolving path through the Deadline job
-        job_info = await get_job_info(login, password, job_id)
-        if not job_info:
-            logger.error(f"Could not get job info for {job_id}")
-            return None
-
-        outdirs = job_info.get("OutDir", [])
-        if not outdirs:
-            logger.error(f"No OutDir found for job {job_id}")
-            return None
-
-        fullpath = outdirs[0]
-        dropbox_path = extract_dropbox_path(fullpath, settings.dropbox_root_marker)
-        if not dropbox_path:
-            logger.info(
-                "Skipping Dropbox lookup for job %s: output path is outside configured Dropbox root (%s)",
-                job_id,
-                fullpath,
-            )
-            return None
-
-        # Get metadata for the folder
-        metadata = await fetch_dropbox_metadata(session_dbx, dropbox_path, headers_dbx)
-            
-        if metadata.get(".tag") != "folder":
-            logger.error("Not a folder")
-            return None
-                
-        # Check if video exists in the same folder
-        exr_parent = str(PurePosixPath(metadata["path_display"]).parent)
-        video_filename = f"{metadata['name']}.mp4"
-        video_dropbox_path = f"{exr_parent}/{video_filename}"
-            
-        try:
-            # Try to get metadata for the video file
-            video_metadata = await fetch_dropbox_metadata(session_dbx, video_dropbox_path, headers_dbx)
-            if video_metadata.get(".tag") == "file":
-                return {
-                    "exists": True,
-                    "filename": video_filename,
-                    "dropbox_path": video_dropbox_path,
-                    "metadata": video_metadata
-                }
-        except Exception:
-            # Video doesn't exist
-            pass
-                
-        return None
-            
-    except Exception as e:
-        logger.error(f"Error checking video existence for job {job_id}: {e}")
-        return None
-
-
-async def download_video_from_dropbox(
-    login: str,
-    password: str,
-    job_id: str,
-    dropbox_path_hint: Optional[str] = None,
-) -> Optional[tuple[str, str]]:
-    """
-    Download existing video from Dropbox.
-    
-    Args:
-        login: User login
-        password: User password
-        job_id: Job ID
-        
-    Returns:
-        Local path to downloaded video or None if error
-    """
-    try:
-        import aiohttp
-        import aiofiles
-        import json
-        import asyncio
-        import random
-        import contextlib
-        from pathlib import Path
-        from app.integrations.dropbox_helpers import get_fresh_access_token
-        from app.core.config import settings
-        
-        # Check if video exists
-        video_info = await check_video_exists_in_dropbox(
-            login,
-            password,
-            job_id,
-            dropbox_path_hint=dropbox_path_hint,
-        )
-        if not video_info:
-            logger.error(f"Video not found in Dropbox for job {job_id}")
-            return None
-            
-        # Create temp directory
-        temp_dir = Path(settings.temp_dir)
-        temp_dir.mkdir(exist_ok=True)
-        
-        # Download video
-        download_url = "https://content.dropboxapi.com/2/files/download"
-        dl_headers = {
-            "Authorization": f"Bearer {await get_fresh_access_token()}",
-            "Dropbox-API-Select-User": settings.dropbox_team_member_id,
-            "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
-            "Dropbox-API-Arg": json.dumps({"path": video_info["dropbox_path"]})
-        }
-        
-        session_dbx = await get_aiosession()
-        retry_statuses = {401, 408, 429, 500, 502, 503, 504}
-
-        def _compute_delay(attempt: int, retry_after: Optional[str]) -> float:
-            if retry_after:
-                try:
-                    return max(float(retry_after), 0.0)
-                except ValueError:
-                    pass
-            delay = min(
-                _DOWNLOAD_VIDEO_RETRY_BASE_DELAY * (2 ** attempt),
-                _DOWNLOAD_VIDEO_RETRY_MAX_DELAY,
-            )
-            return delay + random.uniform(0.0, _DOWNLOAD_VIDEO_RETRY_BASE_DELAY)
-
-        # Use the original filename for local storage
-        filename = video_info["filename"]
-        temp_path = temp_dir / filename
-        temp_path.parent.mkdir(parents=True, exist_ok=True)
-
-        async with asyncio.timeout(_DOWNLOAD_VIDEO_GLOBAL_TIMEOUT_SECONDS):
-            for attempt in range(_DOWNLOAD_VIDEO_RETRY_ATTEMPTS):
-                dl_headers = {
-                    "Authorization": f"Bearer {await get_fresh_access_token()}",
-                    "Dropbox-API-Select-User": settings.dropbox_team_member_id,
-                    "Dropbox-API-Path-Root": json.dumps({".tag": "root", "root": settings.dropbox_root_namespace_id}),
-                    "Dropbox-API-Arg": json.dumps({"path": video_info["dropbox_path"]})
-                }
-                try:
-                    async with session_dbx.post(download_url, headers=dl_headers) as resp:
-                        if resp.status == 200:
-                            async with aiofiles.open(temp_path, "wb") as f:
-                                async for chunk in resp.content.iter_chunked(1024 * 1024):
-                                    await f.write(chunk)
-                            logger.info(f"Video downloaded to {temp_path}")
-                            return (str(temp_path), video_info["dropbox_path"])
-
-                        text = await resp.text()
-                        if resp.status in retry_statuses and attempt < (_DOWNLOAD_VIDEO_RETRY_ATTEMPTS - 1):
-                            delay = _compute_delay(attempt, resp.headers.get("Retry-After"))
-                            logger.warning(
-                                "Retrying Dropbox download %s (%s): %s",
-                                filename,
-                                resp.status,
-                                text,
-                            )
-                            await asyncio.sleep(delay)
-                        else:
-                            logger.error(f"Error downloading video: {text}")
-                            return None
-                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                    if attempt < (_DOWNLOAD_VIDEO_RETRY_ATTEMPTS - 1):
-                        delay = _compute_delay(attempt, None)
-                        logger.warning("Retrying Dropbox download %s after error: %s", filename, exc)
-                        await asyncio.sleep(delay)
-                    else:
-                        logger.error(f"Error downloading video for job {job_id}: {exc}")
-                        return None
-                if temp_path.exists():
-                    with contextlib.suppress(Exception):
-                        temp_path.unlink()
-    except TimeoutError:
-        logger.error(
-            "Timed out downloading video for job %s after %.0f seconds",
-            job_id,
-            _DOWNLOAD_VIDEO_GLOBAL_TIMEOUT_SECONDS,
-        )
-        return None
-
-    except Exception as e:
-        logger.error(f"Error downloading video for job {job_id}: {e}")
-        return None

@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     Application settings configuration.
     
     Manages all application settings including Telegram bot token,
-    Deadline API configuration, Dropbox API credentials, and local configuration options.
+    Deadline API configuration, and local configuration options.
     """
     
     # Telegram Bot Configuration
@@ -32,14 +32,6 @@ class Settings(BaseSettings):
         True,
         description="Verify TLS certificates for Deadline API requests",
     )
-    
-    # Dropbox API Configuration
-    dropbox_app_key: str
-    dropbox_app_secret: str
-    dropbox_refresh_token: str
-    dropbox_team_member_id: str
-    dropbox_root_namespace_id: str
-    dropbox_root_marker: str = "Team Folder"
     
     # Local Application Settings
     sqlite_db_path: str = Field("data/app.db", description="SQLite database file path")
@@ -151,7 +143,6 @@ class Settings(BaseSettings):
     encryption_key: str = Field(..., description="Fernet encryption key for password storage (generate with Fernet.generate_key())")
 
     # Application Limits
-    max_concurrent_downloads: int = Field(2, ge=1, description="Max parallel Dropbox downloads")
     min_free_space_bytes: int = Field(10 * 1024 * 1024 * 1024, description="Minimum required free disk space in bytes")
 
     # Job monitoring intervals (seconds)
@@ -185,13 +176,6 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore"
     )
-
-    @field_validator("dropbox_root_marker")
-    def non_empty_marker(cls, v):
-        """Validate that dropbox_root_marker is not empty"""
-        if not v.strip():
-            raise ValueError("DROPBOX_ROOT_MARKER must not be empty")
-        return v
 
     @field_validator("preview_ocio_remote_config", mode="before")
     def normalize_preview_ocio_remote_config(cls, v):
