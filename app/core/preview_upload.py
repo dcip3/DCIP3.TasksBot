@@ -38,6 +38,7 @@ STATUS_DELIVERING = "delivering"
 STATUS_FAILED = "failed"
 _DELIVERY_LEASE_SECONDS = 5 * 60
 _UPLOAD_STATUSES_WITH_FILE = {STATUS_RECEIVED, STATUS_DELIVERING, STATUS_FAILED}
+_UPLOAD_META_FILENAME = "upload_meta.json"
 _UPLOAD_PART_SUFFIX = ".part"
 _STATE_COLUMNS = """
     token, expires_at, created_at, claimed_until, payload_json,
@@ -765,12 +766,18 @@ def _resolve_upload_temp_path(state: PreviewUploadState) -> Optional[Path]:
         candidates.extend(
             path
             for path in upload_dir.iterdir()
-            if path.is_file() and not path.name.endswith(_UPLOAD_PART_SUFFIX)
+            if path.is_file()
+            and not path.name.endswith(_UPLOAD_PART_SUFFIX)
+            and path.name != _UPLOAD_META_FILENAME
         )
 
     for candidate in candidates:
         try:
-            if candidate.is_file() and not candidate.name.endswith(_UPLOAD_PART_SUFFIX):
+            if (
+                candidate.is_file()
+                and not candidate.name.endswith(_UPLOAD_PART_SUFFIX)
+                and candidate.name != _UPLOAD_META_FILENAME
+            ):
                 return candidate
         except Exception:
             continue
@@ -871,6 +878,19 @@ async def _handle_preview_upload(request: web.Request) -> web.Response:
             part_path.unlink(missing_ok=True)
             temp_path.unlink(missing_ok=True)
             return web.Response(status=500, text="Upload finalize failed")
+
+        upload_meta: dict = {}
+        lut_header = request.headers.get("X-Preview-Lut")
+        if lut_header:
+            upload_meta["lut"] = urllib.parse.unquote(lut_header).strip()
+        resolution_header = request.headers.get("X-Preview-Resolution")
+        if resolution_header:
+            upload_meta["resolution"] = resolution_header.strip()
+        if upload_meta:
+            with contextlib.suppress(Exception):
+                (upload_dir / _UPLOAD_META_FILENAME).write_text(
+                    json.dumps(upload_meta), encoding="utf-8"
+                )
 
         await _token_store.mark_received(token, temp_path, bytes_written)
         should_release_claim = False
@@ -1006,8 +1026,23 @@ async def _deliver_preview(payload: PreviewUploadPayload, temp_path: Path) -> No
     from app.services.deadline import delete_job_by_user_id
     from app.services.preview.delivery import send_ready_preview_video
 
+    upload_meta: dict = {}
+    try:
+        meta_path = temp_path.parent / _UPLOAD_META_FILENAME
+        if meta_path.is_file():
+            loaded_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if isinstance(loaded_meta, dict):
+                upload_meta = loaded_meta
+    except Exception as meta_error:
+        logger.debug("Could not read upload metadata: %s", meta_error)
+
     display_name = payload.expected_filename or preparation.video_path.name
-    caption = build_preview_caption(display_name, display_path)
+    caption = build_preview_caption(
+        display_name,
+        display_path,
+        lut=upload_meta.get("lut"),
+        resolution=upload_meta.get("resolution"),
+    )
 
     async def _delete() -> bool:
         if not payload.preview_job_id:
@@ -1031,6 +1066,7 @@ async def _deliver_preview(payload: PreviewUploadPayload, temp_path: Path) -> No
     for folder in {temp_path.parent, preparation.video_path.parent}:
         try:
             if folder.name.startswith("upload_"):
+                (folder / _UPLOAD_META_FILENAME).unlink(missing_ok=True)
                 folder.rmdir()
         except Exception:
             pass

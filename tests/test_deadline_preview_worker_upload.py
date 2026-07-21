@@ -108,7 +108,8 @@ class DeadlinePreviewWorkerUploadTests(unittest.TestCase):
         convert_mock.assert_called_once()
         self.assertEqual(convert_mock.call_args.kwargs["input_path"], source_frame)
         self.assertEqual(convert_mock.call_args.kwargs["output_path"], output_path)
-        upload_mock.assert_called_once_with(output_path)
+        upload_mock.assert_called_once()
+        self.assertEqual(upload_mock.call_args.args[0], output_path)
         ffmpeg_mock.assert_not_called()
 
     def test_partial_sequence_preview_uses_available_frames(self) -> None:
@@ -160,4 +161,5 @@ class DeadlinePreviewWorkerUploadTests(unittest.TestCase):
         self.assertIn("preview.0005.jpg", manifest_text)
         self.assertNotIn("preview.0002.jpg", manifest_text)
         self.assertEqual(validate_mock.call_args_list[-1].args[2], 3)
-        upload_mock.assert_called_once_with(output_path)
+        upload_mock.assert_called_once()
+        self.assertEqual(upload_mock.call_args.args[0], output_path)

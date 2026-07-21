@@ -1727,7 +1727,56 @@ def _env_flag(name: str) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
-def _maybe_upload_preview(output_path: Path) -> bool:
+def _probe_output_resolution(output_path: Path, ffmpeg_path: str) -> Optional[str]:
+    """Return the output's resolution as "WxH" from container metadata."""
+    ffprobe_path = _resolve_ffprobe_path(ffmpeg_path)
+    try:
+        probe = subprocess.run(
+            [
+                ffprobe_path,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "csv=s=x:p=0",
+                str(output_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except Exception:
+        return None
+    if probe.returncode != 0:
+        return None
+    for line in (probe.stdout or "").strip().splitlines():
+        value = line.strip().strip("x")
+        if value:
+            return value
+    return None
+
+
+def _upload_metadata_headers(
+    lut_spec: Optional[dict],
+    output_path: Path,
+    ffmpeg_path: str,
+) -> dict:
+    """Describe the preview for the bot's caption (camera LUT, resolution)."""
+    headers: dict = {}
+    if lut_spec and lut_spec.get("file"):
+        lut_name = Path(lut_spec["file"]).name
+        headers["X-Preview-Lut"] = urllib.parse.quote(lut_name, safe="")
+    resolution = _probe_output_resolution(output_path, ffmpeg_path)
+    if resolution:
+        headers["X-Preview-Resolution"] = resolution
+    return headers
+
+
+def _maybe_upload_preview(output_path: Path, extra_headers: Optional[dict] = None) -> bool:
     upload_url = os.environ.get("PREVIEW_UPLOAD_URL", "").strip()
     token = os.environ.get("PREVIEW_UPLOAD_TOKEN", "").strip()
     if not upload_url or not token:
@@ -1750,6 +1799,7 @@ def _maybe_upload_preview(output_path: Path) -> bool:
                 upload_url,
                 token,
                 _env_flag("PREVIEW_UPLOAD_INSECURE"),
+                extra_headers=extra_headers,
             )
             got_http_response = True
         except Exception as exc:
@@ -1791,6 +1841,7 @@ def _upload_preview_file(
     token: str,
     insecure: bool,
     timeout: int = 120,
+    extra_headers: Optional[dict] = None,
 ) -> bool:
     parsed = urllib.parse.urlparse(upload_url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -1824,6 +1875,8 @@ def _upload_preview_file(
         connection.putheader("Content-Length", str(file_size))
         connection.putheader("X-Preview-Token", token)
         connection.putheader("X-Preview-Filename", output_path.name)
+        for header_name, header_value in (extra_headers or {}).items():
+            connection.putheader(header_name, header_value)
         connection.endheaders()
 
         with open(output_path, "rb") as handle:
@@ -1930,7 +1983,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             if not output_path.exists() or output_path.stat().st_size <= 0:
                 raise RuntimeError(f"Single-frame PNG was not written: {output_path}")
             logging.info("Preview still successfully written to %s", output_path)
-            if not _maybe_upload_preview(output_path):
+            upload_headers = _upload_metadata_headers(lut_spec, output_path, args.ffmpeg_path)
+            if not _maybe_upload_preview(output_path, extra_headers=upload_headers):
                 _handle_upload_failure()
             return 0
 
@@ -1962,7 +2016,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                     "Reusing existing preview output %s (newer than all input frames)",
                     args.output_path,
                 )
-                if not _maybe_upload_preview(Path(args.output_path)):
+                upload_headers = _upload_metadata_headers(
+                    lut_spec, Path(args.output_path), args.ffmpeg_path
+                )
+                if not _maybe_upload_preview(
+                    Path(args.output_path), extra_headers=upload_headers
+                ):
                     _handle_upload_failure()
                 return 0
 
@@ -2097,7 +2156,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                 )
 
         logging.info("Preview video successfully written to %s", args.output_path)
-        if not _maybe_upload_preview(Path(args.output_path)):
+        upload_headers = _upload_metadata_headers(
+            lut_spec, Path(args.output_path), args.ffmpeg_path
+        )
+        if not _maybe_upload_preview(Path(args.output_path), extra_headers=upload_headers):
             _handle_upload_failure()
     except Exception as exc:  # pragma: no cover - Deadline handles logging
         logging.error("Preview conversion failed: %s", exc, exc_info=True)
