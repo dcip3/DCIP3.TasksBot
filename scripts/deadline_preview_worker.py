@@ -589,13 +589,13 @@ def _convert_exr_to_png_cpu(
     exr_path: Path,
     output_path: Path,
     cpu_processor,
-    width_chunk: int = 256,
 ):
     try:
         import OpenEXR
         import Imath
         import numpy as np
         from PIL import Image
+        from PyOpenColorIO import PackedImageDesc  # type: ignore
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError(
             "CPU color mode requires OpenEXR, Imath, numpy, and Pillow"
@@ -610,54 +610,151 @@ def _convert_exr_to_png_cpu(
         height = dw.max.y - dw.min.y + 1
 
         channels = exr.channels(["R", "G", "B"], FLOAT)
+        r = np.frombuffer(channels[0], dtype=np.float32).reshape(height, width)
+        g = np.frombuffer(channels[1], dtype=np.float32).reshape(height, width)
+        b = np.frombuffer(channels[2], dtype=np.float32).reshape(height, width)
 
-        processed_chunks = []
-        for y_start in range(0, height, width_chunk):
-            y_end = min(y_start + width_chunk, height)
-            chunk_height = y_end - y_start
+        flat = np.stack([r, g, b], axis=-1).reshape(-1, 3)
+        img_desc = PackedImageDesc(flat, width, height, 3)
+        cpu_processor.apply(img_desc)
 
-            r_chunk = np.frombuffer(
-                channels[0][y_start * width * 4 : y_end * width * 4],
-                dtype=np.float32,
-            ).reshape((chunk_height, width))
-            g_chunk = np.frombuffer(
-                channels[1][y_start * width * 4 : y_end * width * 4],
-                dtype=np.float32,
-            ).reshape((chunk_height, width))
-            b_chunk = np.frombuffer(
-                channels[2][y_start * width * 4 : y_end * width * 4],
-                dtype=np.float32,
-            ).reshape((chunk_height, width))
-
-            rgb_chunk = np.stack([r_chunk, g_chunk, b_chunk], axis=-1)
-            flat_chunk = rgb_chunk.reshape(-1, 3).astype(np.float32)
-            from PyOpenColorIO import PackedImageDesc  # type: ignore
-
-            img_desc = PackedImageDesc(flat_chunk, width, chunk_height, 3)
-            cpu_processor.apply(img_desc)
-            processed_chunk = flat_chunk.reshape(chunk_height, width, 3)
-            processed_chunks.append(processed_chunk)
-
-            del r_chunk, g_chunk, b_chunk, rgb_chunk, flat_chunk
-            gc.collect()
-
-        img = (
-            np.vstack(processed_chunks)
-            if processed_chunks
-            else np.zeros((height, width, 3), dtype=np.float32)
-        )
-        img = np.clip(img, 0.0, 1.0)
+        img = np.clip(flat.reshape(height, width, 3), 0.0, 1.0)
         img8 = (img * 255.0 + 0.5).astype(np.uint8)
 
         pil_img = Image.fromarray(img8, mode="RGB")
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        pil_img.save(str(output_path), "PNG")
+        # These PNGs are transient ffmpeg inputs; trade compression for speed.
+        pil_img.save(str(output_path), "PNG", compress_level=1)
     finally:
         try:
             exr.close()
         except Exception:
             pass
-        gc.collect()
+
+
+def _run_cpu_convert_manifest(manifest_path: str) -> int:
+    """Child-process mode: convert the frames listed in a JSON manifest."""
+    import json
+
+    data = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    cpu_processor = _load_cpu_processor(
+        Path(data["config"]),
+        data["input_space"],
+        data["display"],
+        data["view"],
+    )
+    for source, destination in data["files"]:
+        _convert_exr_to_png_cpu(Path(source), Path(destination), cpu_processor)
+    return 0
+
+
+def _self_invocation_command(argv_tail: List[str], env: dict) -> Optional[List[str]]:
+    """Build a command that re-runs this script with different arguments.
+
+    Mutates env so the Deadline stub (which takes sys.argv from PREVIEW_ARGV_B64)
+    picks up argv_tail as well.
+    """
+    import base64
+    import json
+
+    if os.environ.get("PREVIEW_SCRIPT_B64") and os.environ.get("PREVIEW_ARGV_B64"):
+        stub = os.environ.get("PREVIEW_STUB") or _STUB_FALLBACK
+        argv_json = json.dumps(["deadline_preview_worker.py"] + argv_tail)
+        env["PREVIEW_ARGV_B64"] = base64.b64encode(argv_json.encode("utf-8")).decode("ascii")
+        return [sys.executable, "-c", stub]
+    script_path = globals().get("__file__")
+    if script_path and Path(script_path).is_file():
+        return [sys.executable, str(script_path)] + argv_tail
+    return None
+
+
+def _convert_frames_cpu(
+    conversions: List[Tuple[Path, Path]],
+    *,
+    config_path: Path,
+    input_space: str,
+    display: str,
+    view: str,
+    shard_dir: Path,
+    worker_processes: int,
+) -> None:
+    """Convert EXR frames to PNG, fanning out across worker subprocesses.
+
+    Falls back to sequential in-process conversion when subprocesses cannot be
+    spawned or for whatever frames the shards did not produce.
+    """
+    import json
+
+    if worker_processes <= 0:
+        worker_processes = min(8, max(1, (os.cpu_count() or 4) - 1))
+    worker_processes = min(worker_processes, len(conversions))
+
+    if worker_processes > 1:
+        shards: List[List[Tuple[Path, Path]]] = [[] for _ in range(worker_processes)]
+        for index, conversion in enumerate(conversions):
+            shards[index % worker_processes].append(conversion)
+
+        processes = []
+        for shard_index, shard in enumerate(shards):
+            manifest = shard_dir / f"cpu_shard_{shard_index}.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "config": str(config_path),
+                        "input_space": input_space,
+                        "display": display,
+                        "view": view,
+                        "files": [[str(src), str(dst)] for src, dst in shard],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            env = dict(os.environ)
+            env[_BOOTSTRAP_ENV_FLAG] = "1"
+            command = _self_invocation_command(["--cpu-convert-manifest", str(manifest)], env)
+            if command is None:
+                break
+            try:
+                processes.append(
+                    subprocess.Popen(
+                        command,
+                        env=env,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                    )
+                )
+            except OSError as exc:
+                logging.warning("Could not spawn conversion shard: %s", exc)
+                break
+
+        if processes:
+            logging.info(
+                "Converting %s frames in %s parallel processes",
+                len(conversions),
+                len(processes),
+            )
+        for process in processes:
+            output, _ = process.communicate()
+            if process.returncode != 0:
+                logging.warning(
+                    "Conversion shard exited with %s: %s",
+                    process.returncode,
+                    (output or "").strip()[-1000:],
+                )
+
+    # Sequential pass over anything the shards did not produce (or everything,
+    # when parallel execution was unavailable). Idempotent and order-independent.
+    remaining = [(src, dst) for src, dst in conversions if not dst.exists()]
+    if remaining:
+        if len(remaining) < len(conversions):
+            logging.warning(
+                "Re-converting %s frames the parallel shards did not produce",
+                len(remaining),
+            )
+        cpu_processor = _load_cpu_processor(config_path, input_space, display, view)
+        for source, destination in remaining:
+            _convert_exr_to_png_cpu(source, destination, cpu_processor)
 
 
 def _scan_sequence_count(pattern: str) -> int:
@@ -976,13 +1073,12 @@ def convert_sequence_cpu(
     display: str,
     view: str,
     temp_dir: Optional[Union[str, Path]],
+    worker_processes: int = 0,
 ) -> Tuple[str, int, Optional[tempfile.TemporaryDirectory[str]]]:
     directory, template, digits, files = _expand_sequence(input_pattern)
 
     if config_path is None or not config_path.exists():
         raise RuntimeError("OCIO config is required for CPU color mode")
-
-    cpu_processor = _load_cpu_processor(config_path, input_space, display, view)
 
     temp_dir_obj: Optional[tempfile.TemporaryDirectory[str]]
     base_dir: Optional[Path]
@@ -1001,16 +1097,23 @@ def convert_sequence_cpu(
     try:
         frame_regex = re.compile(r"(\d+)(?=\.[^.]+$)")
         frame_numbers: List[int] = []
+        conversions: List[Tuple[Path, Path]] = []
         for exr_path in files:
             match = frame_regex.search(exr_path.name)
             if not match:
                 raise RuntimeError(f"Could not extract frame number from {exr_path.name}")
-            frame_num = int(match.group(1))
-            frame_numbers.append(frame_num)
-            output_filename = exr_path.with_suffix(".png").name
-            output_path = cpu_dir / output_filename
-            logging.debug("Converting %s -> %s", exr_path, output_path)
-            _convert_exr_to_png_cpu(exr_path, output_path, cpu_processor)
+            frame_numbers.append(int(match.group(1)))
+            conversions.append((exr_path, cpu_dir / exr_path.with_suffix(".png").name))
+
+        _convert_frames_cpu(
+            conversions,
+            config_path=config_path,
+            input_space=input_space,
+            display=display,
+            view=view,
+            shard_dir=cpu_dir,
+            worker_processes=worker_processes,
+        )
 
         first_frame = frame_numbers[0] if frame_numbers else start_number
         png_template = template
@@ -1314,6 +1417,12 @@ def parse_arguments(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default="lut",
         help="Color transform mode: 'lut' (default) or 'cpu' to run OCIO on CPU",
     )
+    parser.add_argument(
+        "--cpu-workers",
+        type=int,
+        default=0,
+        help="Parallel processes for CPU color conversion (0 = auto)",
+    )
 
     color_group = parser.add_argument_group("color management")
     color_group.add_argument("--disable-color", action="store_true", help="Disable OCIO color transform")
@@ -1441,6 +1550,16 @@ def _upload_preview_file(
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    if "--cpu-convert-manifest" in argv_list:
+        configure_logging(1)
+        manifest_index = argv_list.index("--cpu-convert-manifest")
+        try:
+            return _run_cpu_convert_manifest(argv_list[manifest_index + 1])
+        except Exception:
+            logging.exception("CPU conversion shard failed")
+            return 1
+
     args = parse_arguments(argv)
     configure_logging(args.verbose)
 
@@ -1530,6 +1649,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 start_number=args.start_number,
                 config_path=config_path,
                 input_space=args.input_space,
+                worker_processes=args.cpu_workers,
                 display=args.display,
                 view=args.view,
                 temp_dir=base_temp_dir,
