@@ -881,6 +881,39 @@ def _probe_frame_count(
     return None, error_snippet
 
 
+def _reusable_existing_output(
+    output_path: Path,
+    input_files: List[Path],
+    ffmpeg_path: str,
+    expected_frames: int,
+) -> bool:
+    """True when a previous run already produced this preview from the same frames.
+
+    Happens when a worker converted successfully but failed to upload and the
+    task moved to another machine. Guards against stale files from earlier
+    render versions by requiring the video to be newer than every input frame
+    (mtimes survive Dropbox sync).
+    """
+    try:
+        if not input_files or not output_path.exists():
+            return False
+        out_stat = output_path.stat()
+        if out_stat.st_size < 1024:
+            return False
+        newest_frame = max(frame.stat().st_mtime for frame in input_files)
+        if out_stat.st_mtime <= newest_frame:
+            return False
+    except OSError:
+        return False
+
+    valid, reason = _validate_preview_output(output_path, ffmpeg_path, expected_frames)
+    if valid:
+        logging.info("Existing preview output validated for reuse: %s", reason)
+        return True
+    logging.info("Existing preview output not reusable: %s", reason)
+    return False
+
+
 def _validate_preview_output(
     output_path: Path,
     ffmpeg_path: str,
@@ -1487,7 +1520,12 @@ def _maybe_upload_preview(output_path: Path) -> bool:
 
     # Up to ~22 minutes of cumulative retry, covering bot restarts and network blips.
     attempt_delays = (0, 5, 15, 30, 60, 120, 240, 480, 480)
+    # When every attempt dies at the connection level (reset/refused/timeout),
+    # the path from THIS machine to the bot is broken and more retries will not
+    # help — give up early so the task can move to another worker.
+    transport_failfast_attempts = 4
     total_attempts = len(attempt_delays)
+    got_http_response = False
     for attempt, delay in enumerate(attempt_delays, start=1):
         if delay:
             time.sleep(delay)
@@ -1498,6 +1536,7 @@ def _maybe_upload_preview(output_path: Path) -> bool:
                 token,
                 _env_flag("PREVIEW_UPLOAD_INSECURE"),
             )
+            got_http_response = True
         except Exception as exc:
             logging.warning(
                 "Preview upload attempt %s/%s error: %s",
@@ -1510,7 +1549,25 @@ def _maybe_upload_preview(output_path: Path) -> bool:
             logging.info("Preview upload succeeded on attempt %s/%s", attempt, total_attempts)
             return True
         logging.warning("Preview upload attempt %s/%s failed", attempt, total_attempts)
+        if not got_http_response and attempt >= transport_failfast_attempts:
+            logging.error(
+                "Upload endpoint never responded after %s connection-level failures; "
+                "this machine likely cannot reach the bot",
+                attempt,
+            )
+            return False
     return False
+
+
+def _handle_upload_failure() -> None:
+    """Hand the task to another worker when this machine cannot deliver the upload."""
+    if _requeue_preview_task_elsewhere():
+        logging.warning(
+            "Preview upload failed; task requeued for another worker. "
+            "Waiting for the Deadline Worker to stop this process..."
+        )
+        time.sleep(60)
+    raise RuntimeError("Preview upload failed after retries")
 
 
 def _upload_preview_file(
@@ -1654,7 +1711,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 raise RuntimeError(f"Single-frame PNG was not written: {output_path}")
             logging.info("Preview still successfully written to %s", output_path)
             if not _maybe_upload_preview(output_path):
-                raise RuntimeError("Preview upload failed after retries")
+                _handle_upload_failure()
             return 0
 
         if _has_sequence_placeholder(args.input_pattern):
@@ -1669,6 +1726,20 @@ def main(argv: Optional[list[str]] = None) -> int:
             if not available_input_files:
                 raise RuntimeError(f"No frames found matching pattern {args.input_pattern}")
             _prefetch_input_files(available_input_files)
+
+            if _reusable_existing_output(
+                Path(args.output_path),
+                available_input_files,
+                args.ffmpeg_path,
+                validation_frame_count,
+            ):
+                logging.info(
+                    "Reusing existing preview output %s (newer than all input frames)",
+                    args.output_path,
+                )
+                if not _maybe_upload_preview(Path(args.output_path)):
+                    _handle_upload_failure()
+                return 0
 
         if apply_color:
             if config_path is None:
@@ -1801,7 +1872,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         logging.info("Preview video successfully written to %s", args.output_path)
         if not _maybe_upload_preview(Path(args.output_path)):
-            raise RuntimeError("Preview upload failed after retries")
+            _handle_upload_failure()
     except Exception as exc:  # pragma: no cover - Deadline handles logging
         logging.error("Preview conversion failed: %s", exc, exc_info=True)
         return 1
