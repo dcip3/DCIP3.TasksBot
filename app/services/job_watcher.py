@@ -1130,6 +1130,11 @@ async def _scan_auto_preview_candidates(users: list[_WatcherUser]) -> int:
                 if _is_preview_job(props):
                     continue
 
+                if not job.get("OutDir"):
+                    # Utility jobs (no render output) cannot be previewed;
+                    # skip silently instead of messaging the user with an error.
+                    continue
+
                 job_stat = job.get("Stat", 0)
                 if job_stat != 3:
                     if (
