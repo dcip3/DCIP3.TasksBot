@@ -523,48 +523,248 @@ def _ensure_color_runtime(args) -> Optional[int]:
     return None
 
 
+def _load_color_sidecar(input_pattern: str) -> Optional[dict]:
+    """Load the render's preview_color.json (written by the farm's Houdini plugin)."""
+    try:
+        sidecar_path = Path(input_pattern).parent / "preview_color.json"
+        if not sidecar_path.is_file():
+            return None
+        import json
+
+        data = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logging.warning("Could not read preview color sidecar: %s", exc)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _resolve_lut_path(raw_path: str) -> Optional[Path]:
+    """Locate the camera LUT on THIS machine.
+
+    The sidecar records the path from the machine that rendered (often inside
+    its Redshift installation, e.g. C:/Program Files/Maxon Redshift .../Data/LUT/...),
+    while the previewing machine may have Redshift installed elsewhere.
+    """
+    if not raw_path:
+        return None
+    normalized = raw_path.replace("\\", "/")
+    candidate = Path(normalized)
+    if candidate.is_file():
+        return candidate
+
+    suffix: Optional[str] = None
+    marker = "/Data/"
+    idx = normalized.find(marker)
+    if idx != -1:
+        suffix = normalized[idx + len(marker):]
+
+    roots: List[Path] = []
+    for env_name in ("REDSHIFT_COREDATAPATH", "REDSHIFT_LOCALDATAPATH"):
+        env_value = os.environ.get(env_name, "").strip()
+        if env_value:
+            roots.append(Path(env_value))
+    if os.name == "nt":
+        for base in (Path("C:/Program Files"), Path("C:/ProgramData")):
+            try:
+                roots.extend(entry for entry in base.glob("*Redshift*") if entry.is_dir())
+            except OSError:
+                pass
+    else:
+        roots.append(Path("/usr/redshift"))
+
+    for root in roots:
+        for data_dir in (root / "Data", root):
+            if suffix:
+                resolved = data_dir / suffix
+                if resolved.is_file():
+                    return resolved
+
+    # Last resort: search by file name under the local Redshift LUT libraries.
+    lut_name = Path(normalized).name
+    for root in roots:
+        for lut_dir in (root / "Data" / "LUT", root / "LUT"):
+            if not lut_dir.is_dir():
+                continue
+            try:
+                found = next(lut_dir.rglob(lut_name), None)
+            except OSError:
+                found = None
+            if found is not None:
+                return found
+    return None
+
+
+def _extract_lut_spec(sidecar: Optional[dict]) -> Optional[dict]:
+    """Normalize the sidecar into a LUT spec for the OCIO pipeline, or None."""
+    if not sidecar:
+        return None
+    lut = sidecar.get("lut")
+    if not isinstance(lut, dict) or not lut.get("enabled"):
+        return None
+    raw_file = str(lut.get("file") or "").strip()
+    if not raw_file:
+        return None
+    try:
+        strength = float(lut.get("strength", 1.0))
+    except (TypeError, ValueError):
+        strength = 1.0
+    if strength <= 0:
+        return None
+
+    resolved = _resolve_lut_path(raw_file)
+    if resolved is None:
+        logging.warning(
+            "Camera LUT %s was not found on this machine; building the preview without it",
+            raw_file,
+        )
+        return None
+
+    spec = {
+        "file": str(resolved),
+        "strength": min(1.0, strength),
+        "is_log": bool(lut.get("is_log")),
+        "before_cm": bool(lut.get("before_cm")),
+    }
+    logging.info(
+        "Applying camera LUT %s (strength=%s, log=%s, before_cm=%s)",
+        spec["file"],
+        spec["strength"],
+        spec["is_log"],
+        spec["before_cm"],
+    )
+    return spec
+
+
+class _ColorPipeline:
+    """Fused OCIO evaluation, optionally blending in a camera LUT by strength."""
+
+    def __init__(self, primary, base=None, strength: float = 1.0):
+        self._primary = primary
+        self._base = base
+        self._strength = strength
+
+    def apply_frame(self, flat_rgb_f32, width: int, height: int, out_uint8) -> None:
+        import numpy as np
+        import PyOpenColorIO as ocio
+
+        def _run(processor, destination):
+            src = ocio.PackedImageDesc(flat_rgb_f32, width, height, 3)
+            dst = ocio.PackedImageDesc(
+                destination,
+                width,
+                height,
+                3,
+                ocio.BIT_DEPTH_UINT8,
+                ocio.AutoStride,
+                ocio.AutoStride,
+                ocio.AutoStride,
+            )
+            processor.apply(src, dst)
+
+        _run(self._primary, out_uint8)
+        if self._base is None:
+            return
+        base = np.empty_like(out_uint8)
+        _run(self._base, base)
+        blended = (
+            out_uint8.astype(np.float32) * self._strength
+            + base.astype(np.float32) * (1.0 - self._strength)
+        )
+        np.copyto(out_uint8, (blended + 0.5).astype(np.uint8))
+
+
 def _load_cpu_processor(
     config_path: Path,
     input_space: str,
     display: str,
     view: str,
-):
+    lut_spec: Optional[dict] = None,
+) -> "_ColorPipeline":
     try:
         import PyOpenColorIO as ocio
     except ImportError as exc:  # pragma: no cover - depends on worker environment
         raise RuntimeError("PyOpenColorIO is required for CPU color mode") from exc
 
     config = ocio.Config.CreateFromFile(str(config_path))
-    transform = ocio.DisplayViewTransform()
-    transform.setSrc(input_space)
-    transform.setDisplay(display)
-    transform.setView(view)
-    transform.setDirection(ocio.TRANSFORM_DIR_FORWARD)
-    processor = config.getProcessor(transform)
-    # Fused F32 -> UINT8 evaluation: quantization happens inside OCIO, so the
-    # per-frame clip/convert pass is not needed (verified bit-identical).
-    cpu_processor = processor.getOptimizedCPUProcessor(
-        ocio.BIT_DEPTH_F32,
-        ocio.BIT_DEPTH_UINT8,
-        ocio.OPTIMIZATION_DEFAULT,
+
+    def _fused(transform):
+        processor = config.getProcessor(transform)
+        # Fused F32 -> UINT8 evaluation: quantization happens inside OCIO, so a
+        # separate clip/convert pass per frame is not needed (verified bit-identical).
+        cpu_processor = processor.getOptimizedCPUProcessor(
+            ocio.BIT_DEPTH_F32,
+            ocio.BIT_DEPTH_UINT8,
+            ocio.OPTIMIZATION_DEFAULT,
+        )
+        if cpu_processor is None:
+            raise RuntimeError("Failed to create OCIO CPU processor")
+        return cpu_processor
+
+    def _display_transform():
+        transform = ocio.DisplayViewTransform()
+        transform.setSrc(input_space)
+        transform.setDisplay(display)
+        transform.setView(view)
+        transform.setDirection(ocio.TRANSFORM_DIR_FORWARD)
+        return transform
+
+    if not lut_spec:
+        return _ColorPipeline(_fused(_display_transform()))
+
+    file_transform = ocio.FileTransform()
+    file_transform.setSrc(lut_spec["file"])
+    file_transform.setInterpolation(ocio.INTERP_TETRAHEDRAL)
+
+    group = ocio.GroupTransform()
+    if lut_spec.get("before_cm"):
+        if lut_spec.get("is_log"):
+            # The LUT expects log-encoded input: shape linear data through
+            # ACEScct around it (best available match to Redshift's log mode).
+            try:
+                to_log = ocio.ColorSpaceTransform()
+                to_log.setSrc(input_space)
+                to_log.setDst("ACEScct")
+                from_log = ocio.ColorSpaceTransform()
+                from_log.setSrc("ACEScct")
+                from_log.setDst(input_space)
+                group.appendTransform(to_log)
+                group.appendTransform(file_transform)
+                group.appendTransform(from_log)
+            except Exception as log_error:
+                logging.warning(
+                    "Could not build log shaper for camera LUT (%s); applying it linearly",
+                    log_error,
+                )
+                group.appendTransform(file_transform)
+        else:
+            group.appendTransform(file_transform)
+        group.appendTransform(_display_transform())
+    else:
+        # Redshift default: the LUT is applied to the display-referred image.
+        group.appendTransform(_display_transform())
+        group.appendTransform(file_transform)
+
+    primary = _fused(group)
+    if lut_spec.get("strength", 1.0) >= 1.0:
+        return _ColorPipeline(primary)
+    return _ColorPipeline(
+        primary,
+        base=_fused(_display_transform()),
+        strength=float(lut_spec["strength"]),
     )
-    if cpu_processor is None:
-        raise RuntimeError("Failed to create OCIO CPU processor")
-    return cpu_processor
 
 
 def _convert_exr_frame_cpu(
     exr_path: Path,
     output_path: Path,
-    cpu_processor,
+    pipeline: "_ColorPipeline",
 ):
-    """Convert one EXR frame to PNG/BMP (by output suffix) via the OCIO CPU processor."""
+    """Convert one EXR frame to PNG/BMP (by output suffix) via the OCIO color pipeline."""
     try:
         import OpenEXR
         import Imath
         import numpy as np
         from PIL import Image
-        import PyOpenColorIO as ocio  # type: ignore
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError(
             "CPU color mode requires OpenEXR, Imath, numpy, and Pillow"
@@ -585,18 +785,7 @@ def _convert_exr_frame_cpu(
 
         flat = np.stack([r, g, b], axis=-1).reshape(-1, 3)
         img8 = np.empty((height, width, 3), dtype=np.uint8)
-        src_desc = ocio.PackedImageDesc(flat, width, height, 3)
-        dst_desc = ocio.PackedImageDesc(
-            img8,
-            width,
-            height,
-            3,
-            ocio.BIT_DEPTH_UINT8,
-            ocio.AutoStride,
-            ocio.AutoStride,
-            ocio.AutoStride,
-        )
-        cpu_processor.apply(src_desc, dst_desc)
+        pipeline.apply_frame(flat, width, height, img8)
 
         pil_img = Image.fromarray(img8, mode="RGB")
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -618,14 +807,15 @@ def _run_cpu_convert_manifest(manifest_path: str) -> int:
     import json
 
     data = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
-    cpu_processor = _load_cpu_processor(
+    pipeline = _load_cpu_processor(
         Path(data["config"]),
         data["input_space"],
         data["display"],
         data["view"],
+        lut_spec=data.get("lut"),
     )
     for source, destination in data["files"]:
-        _convert_exr_frame_cpu(Path(source), Path(destination), cpu_processor)
+        _convert_exr_frame_cpu(Path(source), Path(destination), pipeline)
     return 0
 
 
@@ -658,6 +848,7 @@ def _convert_frames_cpu(
     view: str,
     shard_dir: Path,
     worker_processes: int,
+    lut_spec: Optional[dict] = None,
 ) -> None:
     """Convert EXR frames to PNG, fanning out across worker subprocesses.
 
@@ -685,6 +876,7 @@ def _convert_frames_cpu(
                         "input_space": input_space,
                         "display": display,
                         "view": view,
+                        "lut": lut_spec,
                         "files": [[str(src), str(dst)] for src, dst in shard],
                     }
                 ),
@@ -733,9 +925,11 @@ def _convert_frames_cpu(
                 "Re-converting %s frames the parallel shards did not produce",
                 len(remaining),
             )
-        cpu_processor = _load_cpu_processor(config_path, input_space, display, view)
+        pipeline = _load_cpu_processor(
+            config_path, input_space, display, view, lut_spec=lut_spec
+        )
         for source, destination in remaining:
-            _convert_exr_frame_cpu(source, destination, cpu_processor)
+            _convert_exr_frame_cpu(source, destination, pipeline)
 
 
 def _scan_sequence_count(pattern: str) -> int:
@@ -1049,6 +1243,7 @@ def _convert_single_frame_to_png(
     display: str,
     view: str,
     ffmpeg_path: str,
+    lut_spec: Optional[dict] = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     input_ext = input_path.suffix.lower()
@@ -1056,8 +1251,10 @@ def _convert_single_frame_to_png(
     if input_ext == ".exr" and apply_color:
         if config_path is None:
             raise RuntimeError("OCIO config required for single-frame EXR conversion")
-        cpu_processor = _load_cpu_processor(config_path, input_space, display, view)
-        _convert_exr_frame_cpu(input_path, output_path, cpu_processor)
+        pipeline = _load_cpu_processor(
+            config_path, input_space, display, view, lut_spec=lut_spec
+        )
+        _convert_exr_frame_cpu(input_path, output_path, pipeline)
         return
 
     if input_ext in {".jpg", ".jpeg", ".png"}:
@@ -1158,6 +1355,7 @@ def convert_sequence_cpu(
     view: str,
     temp_dir: Optional[Union[str, Path]],
     worker_processes: int = 0,
+    lut_spec: Optional[dict] = None,
 ) -> Tuple[str, int, Optional[tempfile.TemporaryDirectory[str]]]:
     directory, template, digits, files = _expand_sequence(input_pattern)
 
@@ -1197,6 +1395,7 @@ def convert_sequence_cpu(
             view=view,
             shard_dir=cpu_dir,
             worker_processes=worker_processes,
+            lut_spec=lut_spec,
         )
 
         first_frame = frame_numbers[0] if frame_numbers else start_number
@@ -1498,6 +1697,11 @@ def parse_arguments(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
     color_group = parser.add_argument_group("color management")
     color_group.add_argument("--disable-color", action="store_true", help="Disable OCIO color transform")
+    color_group.add_argument(
+        "--no-camera-lut",
+        action="store_true",
+        help="Ignore the camera LUT recorded in the render's preview_color.json sidecar",
+    )
     color_group.add_argument("--ocio-config", help="Path to OCIO config file")
     color_group.add_argument("--input-space", default="ACEScg", help="OCIO input space")
     color_group.add_argument("--display", default="sRGB", help="OCIO display")
@@ -1693,6 +1897,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                     wait_seconds,
                 )
 
+        lut_spec: Optional[dict] = None
+        if apply_color and not args.no_camera_lut:
+            lut_spec = _extract_lut_spec(_load_color_sidecar(args.input_pattern))
+
         if expected_frames == 1:
             input_frame = _resolve_single_frame_path(args.input_pattern, args.start_number)
             _prefetch_input_files([input_frame])
@@ -1705,6 +1913,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 display=args.display,
                 view=args.view,
                 ffmpeg_path=args.ffmpeg_path,
+                lut_spec=lut_spec,
             )
             output_path = Path(args.output_path)
             if not output_path.exists() or output_path.stat().st_size <= 0:
@@ -1727,9 +1936,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                 raise RuntimeError(f"No frames found matching pattern {args.input_pattern}")
             _prefetch_input_files(available_input_files)
 
+            reuse_inputs = list(available_input_files)
+            sidecar_file = Path(args.input_pattern).parent / "preview_color.json"
+            if sidecar_file.is_file():
+                # A newer sidecar (e.g. changed camera LUT) must invalidate reuse.
+                reuse_inputs.append(sidecar_file)
             if _reusable_existing_output(
                 Path(args.output_path),
-                available_input_files,
+                reuse_inputs,
                 args.ffmpeg_path,
                 validation_frame_count,
             ):
@@ -1753,6 +1967,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 display=args.display,
                 view=args.view,
                 temp_dir=base_temp_dir,
+                lut_spec=lut_spec,
             )
             ffmpeg_input_pattern = converted_pattern
             if cpu_temp_dir is not None:
