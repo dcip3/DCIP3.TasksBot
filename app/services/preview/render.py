@@ -316,8 +316,6 @@ async def create_video_from_job(
         )
         apply_color = False
 
-    color_mode = (getattr(settings, "preview_color_mode", "lut") or "lut").strip().lower()
-
     script_args: List[str] = [
         "--input-pattern",
         input_sequence_path,
@@ -338,7 +336,6 @@ async def create_video_from_job(
         "--max-size-mb",
         "45",
     ]
-    script_args.extend(["--color-mode", color_mode])
 
     if expected_frames > 0:
         script_args.extend(["--expected-frames", str(expected_frames)])
@@ -360,8 +357,6 @@ async def create_video_from_job(
                 settings.preview_display,
                 "--view",
                 settings.preview_view,
-                "--lut-size",
-                str(settings.preview_lut_size),
             ]
         )
     else:

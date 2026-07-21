@@ -56,10 +56,6 @@ class Settings(BaseSettings):
         "ACES 1.0 SDR-video",
         description="OCIO view for preview conversion",
     )
-    preview_lut_size: int = Field(
-        65,
-        description="Cube size to bake for preview LUT (only used on render nodes)",
-    )
     preview_ocio_remote_config: Optional[str] = Field(
         default=None,
         description="Absolute path to OCIO config accessible from Deadline workers",
@@ -75,10 +71,6 @@ class Settings(BaseSettings):
     preview_temp_dir: Optional[str] = Field(
         default=None,
         description="Optional temp directory on workers for preview helper script",
-    )
-    preview_color_mode: str = Field(
-        "lut",
-        description="Color transform mode for previews: 'lut' generates a LUT, 'cpu' applies OCIO on CPU",
     )
     preview_presubmit_enabled: bool = Field(
         True,

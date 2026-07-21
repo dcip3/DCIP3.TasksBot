@@ -3,8 +3,10 @@
 Helper script executed on Deadline workers to build preview videos with proper OCIO color management.
 
 Steps:
-1. Optionally bake a temporary LUT using the supplied OCIO config / display / view.
-2. Invoke ffmpeg to convert the image sequence to an MP4 using the baked LUT.
+1. Convert the EXR sequence with the OCIO display/view transform on CPU
+   (parallel worker processes; renders are HDR ACEScg, so a 0-1 domain LUT
+   would clip highlights — hence no LUT mode).
+2. Invoke ffmpeg (NVENC when available) to encode the converted frames to MP4.
 
 The script expects that PyOpenColorIO, OpenEXR and NumPy (indirectly via PyOpenColorIO) are installed
 in the Python environment available on the worker. When the launched interpreter lacks them, the
@@ -134,10 +136,7 @@ def _required_color_modules(args) -> List[str]:
         return []
     if Path(args.input_pattern).suffix.lower() != ".exr":
         return []
-    modules = ["PyOpenColorIO"]
-    if args.color_mode.lower() == "cpu" or int(args.expected_frames or 0) == 1:
-        modules.extend(["OpenEXR", "Imath", "numpy", "PIL"])
-    return modules
+    return ["PyOpenColorIO", "OpenEXR", "Imath", "numpy", "PIL"]
 
 
 def _missing_modules(modules: List[str]) -> List[str]:
@@ -522,42 +521,6 @@ def _ensure_color_runtime(args) -> Optional[int]:
         ", ".join(missing),
     )
     return None
-
-
-def bake_preview_lut(
-    *,
-    config_path: Path,
-    input_space: str,
-    display: str,
-    view: str,
-    lut_size: int,
-    destination: Path,
-) -> None:
-    try:
-        import PyOpenColorIO as ocio
-    except ImportError as exc:
-        raise RuntimeError("PyOpenColorIO is required on Deadline workers to bake preview LUTs") from exc
-
-    logging.info("Baking preview LUT using config %s", config_path)
-    config = ocio.Config.CreateFromFile(str(config_path))
-    baker = ocio.Baker()
-    baker.setConfig(config)
-    baker.setFormat("iridas_cube")
-    baker.setCubeSize(max(2, int(lut_size)))
-    baker.setInputSpace(input_space)
-    try:
-        baker.setDisplayView(display, view)
-    except Exception as display_error:  # pragma: no cover - defensive fallback for misconfigured displays
-        logging.warning(
-            "Failed to apply display/view (%s). Falling back to target space sRGB.",
-            display_error,
-        )
-        baker.setTargetSpace("sRGB")
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    baked = baker.bake()
-    destination.write_text(baked)
-    logging.info("Preview LUT written to %s", destination)
 
 
 def _load_cpu_processor(
@@ -1226,7 +1189,6 @@ def build_ffmpeg_command(
     frame_rate: float,
     input_pattern: str,
     output_path: str,
-    lut_path: Optional[Path],
     video_encoder: str,
     preset: str,
     crf: int,
@@ -1263,11 +1225,6 @@ def build_ffmpeg_command(
                 input_pattern,
             ]
         )
-
-    if lut_path is not None:
-        lut_posix = lut_path.as_posix().replace(":", r"\:")
-        lut_arg = f"lut3d=file='{lut_posix}'"
-        command.extend(["-vf", lut_arg])
 
     if concat_manifest is not None:
         command.extend(["-r", f"{frame_rate:g}"])
@@ -1500,12 +1457,6 @@ def parse_arguments(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="How long to wait for the full input frame set to appear before encoding.",
     )
     parser.add_argument(
-        "--color-mode",
-        choices=["lut", "cpu"],
-        default="lut",
-        help="Color transform mode: 'lut' (default) or 'cpu' to run OCIO on CPU",
-    )
-    parser.add_argument(
         "--cpu-workers",
         type=int,
         default=0,
@@ -1518,16 +1469,6 @@ def parse_arguments(argv: Optional[list[str]] = None) -> argparse.Namespace:
     color_group.add_argument("--input-space", default="ACEScg", help="OCIO input space")
     color_group.add_argument("--display", default="sRGB", help="OCIO display")
     color_group.add_argument("--view", default="ACES 1.0 SDR-video", help="OCIO view")
-    color_group.add_argument("--lut-size", type=int, default=65, help="Preview LUT cube size")
-    color_group.add_argument(
-        "--keep-lut",
-        action="store_true",
-        help="Leave the baked LUT on disk for debugging",
-    )
-    color_group.add_argument(
-        "--lut-path",
-        help="Explicit LUT output path. Uses temp file if omitted.",
-    )
 
     parser.add_argument("-v", "--verbose", action="count", default=0, help="Increase logging verbosity")
     return parser.parse_args(argv)
@@ -1661,7 +1602,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         cleanup_resources: List[tempfile.TemporaryDirectory[str]] = []
         base_temp_dir = _resolve_base_temp_dir(args.temp_dir)
 
-        color_mode = args.color_mode.lower()
         apply_color = not args.disable_color
         input_ext = Path(args.input_pattern).suffix.lower()
         is_exr_input = input_ext == ".exr"
@@ -1675,7 +1615,6 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         ffmpeg_input_pattern = args.input_pattern
         start_number = args.start_number
-        lut_path: Optional[Path] = None
         concat_manifest: Optional[Path] = None
         available_input_files: List[Path] = []
 
@@ -1731,9 +1670,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                 raise RuntimeError(f"No frames found matching pattern {args.input_pattern}")
             _prefetch_input_files(available_input_files)
 
-        if apply_color and color_mode == "cpu":
+        if apply_color:
             if config_path is None:
-                raise RuntimeError("OCIO config required for CPU color mode")
+                raise RuntimeError("OCIO config required for the preview color transform")
             converted_pattern, start_number, cpu_temp_dir = convert_sequence_cpu(
                 input_pattern=args.input_pattern,
                 start_number=args.start_number,
@@ -1750,24 +1689,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             if _has_sequence_placeholder(ffmpeg_input_pattern):
                 _, _, _, available_input_files = _expand_sequence(ffmpeg_input_pattern)
                 validation_frame_count = len(available_input_files)
-        elif apply_color:
-            if config_path is None:
-                raise RuntimeError("OCIO config required for LUT color mode")
-            if args.lut_path:
-                lut_path = Path(args.lut_path)
-            else:
-                lut_temp_dir = tempfile.TemporaryDirectory(prefix="preview_lut_", dir=str(base_temp_dir))
-                cleanup_resources.append(lut_temp_dir)
-                _register_temp_path(Path(lut_temp_dir.name))
-                lut_path = Path(lut_temp_dir.name) / "preview_lut.cube"
-            bake_preview_lut(
-                config_path=config_path,
-                input_space=args.input_space,
-                display=args.display,
-                view=args.view,
-                lut_size=args.lut_size,
-                destination=lut_path,
-            )
 
         if len(available_input_files) > 0:
             concat_manifest, concat_temp_dir = _create_concat_manifest(
@@ -1783,7 +1704,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             frame_rate=args.frame_rate,
             input_pattern=ffmpeg_input_pattern,
             output_path=args.output_path,
-            lut_path=lut_path if apply_color and color_mode == "lut" else None,
             video_encoder=args.video_encoder,
             preset=args.preset,
             crf=args.crf,
@@ -1798,7 +1718,6 @@ def main(argv: Optional[list[str]] = None) -> int:
                 frame_rate=args.frame_rate,
                 input_pattern=ffmpeg_input_pattern,
                 output_path=args.output_path,
-                lut_path=lut_path if apply_color and color_mode == "lut" else None,
                 video_encoder=encoder_name,
                 preset=args.preset,
                 crf=args.crf,
@@ -1883,9 +1802,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         logging.info("Preview video successfully written to %s", args.output_path)
         if not _maybe_upload_preview(Path(args.output_path)):
             raise RuntimeError("Preview upload failed after retries")
-
-        if apply_color and color_mode == "lut" and args.keep_lut:
-            logging.info("LUT kept at %s", lut_path)
     except Exception as exc:  # pragma: no cover - Deadline handles logging
         logging.error("Preview conversion failed: %s", exc, exc_info=True)
         return 1
