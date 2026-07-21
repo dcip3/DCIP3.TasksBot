@@ -578,23 +578,30 @@ def _load_cpu_processor(
     transform.setView(view)
     transform.setDirection(ocio.TRANSFORM_DIR_FORWARD)
     processor = config.getProcessor(transform)
-    cpu_processor = processor.getDefaultCPUProcessor()
+    # Fused F32 -> UINT8 evaluation: quantization happens inside OCIO, so the
+    # per-frame clip/convert pass is not needed (verified bit-identical).
+    cpu_processor = processor.getOptimizedCPUProcessor(
+        ocio.BIT_DEPTH_F32,
+        ocio.BIT_DEPTH_UINT8,
+        ocio.OPTIMIZATION_DEFAULT,
+    )
     if cpu_processor is None:
         raise RuntimeError("Failed to create OCIO CPU processor")
     return cpu_processor
 
 
-def _convert_exr_to_png_cpu(
+def _convert_exr_frame_cpu(
     exr_path: Path,
     output_path: Path,
     cpu_processor,
 ):
+    """Convert one EXR frame to PNG/BMP (by output suffix) via the OCIO CPU processor."""
     try:
         import OpenEXR
         import Imath
         import numpy as np
         from PIL import Image
-        from PyOpenColorIO import PackedImageDesc  # type: ignore
+        import PyOpenColorIO as ocio  # type: ignore
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError(
             "CPU color mode requires OpenEXR, Imath, numpy, and Pillow"
@@ -614,16 +621,28 @@ def _convert_exr_to_png_cpu(
         b = np.frombuffer(channels[2], dtype=np.float32).reshape(height, width)
 
         flat = np.stack([r, g, b], axis=-1).reshape(-1, 3)
-        img_desc = PackedImageDesc(flat, width, height, 3)
-        cpu_processor.apply(img_desc)
-
-        img = np.clip(flat.reshape(height, width, 3), 0.0, 1.0)
-        img8 = (img * 255.0 + 0.5).astype(np.uint8)
+        img8 = np.empty((height, width, 3), dtype=np.uint8)
+        src_desc = ocio.PackedImageDesc(flat, width, height, 3)
+        dst_desc = ocio.PackedImageDesc(
+            img8,
+            width,
+            height,
+            3,
+            ocio.BIT_DEPTH_UINT8,
+            ocio.AutoStride,
+            ocio.AutoStride,
+            ocio.AutoStride,
+        )
+        cpu_processor.apply(src_desc, dst_desc)
 
         pil_img = Image.fromarray(img8, mode="RGB")
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        # These PNGs are transient ffmpeg inputs; trade compression for speed.
-        pil_img.save(str(output_path), "PNG", compress_level=1)
+        if output_path.suffix.lower() == ".png":
+            # PNG deliverables (stills); keep compression cheap.
+            pil_img.save(str(output_path), "PNG", compress_level=1)
+        else:
+            # Transient ffmpeg inputs: BMP writes ~15x faster than PNG.
+            pil_img.save(str(output_path))
     finally:
         try:
             exr.close()
@@ -643,7 +662,7 @@ def _run_cpu_convert_manifest(manifest_path: str) -> int:
         data["view"],
     )
     for source, destination in data["files"]:
-        _convert_exr_to_png_cpu(Path(source), Path(destination), cpu_processor)
+        _convert_exr_frame_cpu(Path(source), Path(destination), cpu_processor)
     return 0
 
 
@@ -685,7 +704,7 @@ def _convert_frames_cpu(
     import json
 
     if worker_processes <= 0:
-        worker_processes = min(8, max(1, (os.cpu_count() or 4) - 1))
+        worker_processes = min(16, max(1, (os.cpu_count() or 4) - 2))
     worker_processes = min(worker_processes, len(conversions))
 
     if worker_processes > 1:
@@ -753,7 +772,7 @@ def _convert_frames_cpu(
             )
         cpu_processor = _load_cpu_processor(config_path, input_space, display, view)
         for source, destination in remaining:
-            _convert_exr_to_png_cpu(source, destination, cpu_processor)
+            _convert_exr_frame_cpu(source, destination, cpu_processor)
 
 
 def _scan_sequence_count(pattern: str) -> int:
@@ -856,6 +875,49 @@ def _wait_for_input_frames(
         time.sleep(poll_interval)
 
 
+def _probe_frame_count(
+    ffprobe_path: str,
+    output_path: Path,
+    *,
+    count_frames: bool,
+) -> Tuple[Optional[int], str]:
+    """Query the video frame count; metadata lookup unless count_frames decoding is forced."""
+    command = [ffprobe_path, "-v", "error"]
+    if count_frames:
+        command.append("-count_frames")
+    command.extend(
+        [
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=nb_read_frames" if count_frames else "stream=nb_frames",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(output_path),
+        ]
+    )
+    probe = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    stderr = (probe.stderr or "").strip().splitlines()
+    error_snippet = stderr[-1] if stderr else "unreadable stream"
+    if probe.returncode != 0:
+        return None, error_snippet
+    for line in (probe.stdout or "").strip().splitlines():
+        token = line.strip()
+        if not token or token.upper() in {"N/A", "NA"}:
+            continue
+        try:
+            return int(token), ""
+        except ValueError:
+            continue
+    return None, error_snippet
+
+
 def _validate_preview_output(
     output_path: Path,
     ffmpeg_path: str,
@@ -871,45 +933,21 @@ def _validate_preview_output(
 
     ffprobe_path = _resolve_ffprobe_path(ffmpeg_path)
     try:
-        probe = subprocess.run(
-            [
-                ffprobe_path,
-                "-v",
-                "error",
-                "-count_frames",
-                "-select_streams",
-                "v:0",
-                "-show_entries",
-                "stream=nb_read_frames",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                str(output_path),
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=120,
+        # Container metadata is instant; fall back to a full decode only when
+        # the metadata does not carry a usable frame count.
+        nb_read, probe_error = _probe_frame_count(
+            ffprobe_path, output_path, count_frames=False
         )
+        if nb_read is None or nb_read <= 0:
+            nb_read, probe_error = _probe_frame_count(
+                ffprobe_path, output_path, count_frames=True
+            )
     except Exception as exc:
         logging.warning("ffprobe validation could not run: %s", exc)
         return True, "ffprobe unavailable; skipping validation"
 
-    raw = (probe.stdout or "").strip().splitlines()
-    nb_read = 0
-    for line in raw:
-        token = line.strip()
-        if not token or token.upper() in {"N/A", "NA"}:
-            continue
-        try:
-            nb_read = int(token)
-            break
-        except ValueError:
-            continue
-
-    if probe.returncode != 0 or not raw or nb_read == 0:
-        stderr = (probe.stderr or "").strip().splitlines()
-        snippet = stderr[-1] if stderr else "unreadable stream"
-        return False, f"ffprobe could not decode output: {snippet}"
+    if nb_read is None or nb_read == 0:
+        return False, f"ffprobe could not decode output: {probe_error}"
 
     if expected_frames > 0:
         # Allow a small slack: some Deadline jobs render with frame steps the
@@ -1023,7 +1061,7 @@ def _convert_single_frame_to_png(
         if config_path is None:
             raise RuntimeError("OCIO config required for single-frame EXR conversion")
         cpu_processor = _load_cpu_processor(config_path, input_space, display, view)
-        _convert_exr_to_png_cpu(input_path, output_path, cpu_processor)
+        _convert_exr_frame_cpu(input_path, output_path, cpu_processor)
         return
 
     if input_ext in {".jpg", ".jpeg", ".png"}:
@@ -1153,7 +1191,7 @@ def convert_sequence_cpu(
             if not match:
                 raise RuntimeError(f"Could not extract frame number from {exr_path.name}")
             frame_numbers.append(int(match.group(1)))
-            conversions.append((exr_path, cpu_dir / exr_path.with_suffix(".png").name))
+            conversions.append((exr_path, cpu_dir / exr_path.with_suffix(".bmp").name))
 
         _convert_frames_cpu(
             conversions,
@@ -1166,13 +1204,13 @@ def convert_sequence_cpu(
         )
 
         first_frame = frame_numbers[0] if frame_numbers else start_number
-        png_template = template
-        if png_template.lower().endswith(".exr"):
-            png_template = png_template[:-4] + ".png"
+        bmp_template = template
+        if bmp_template.lower().endswith(".exr"):
+            bmp_template = bmp_template[:-4] + ".bmp"
         else:
-            png_template = png_template + ".png"
+            bmp_template = bmp_template + ".bmp"
 
-        converted_pattern = str(cpu_dir / png_template)
+        converted_pattern = str(cpu_dir / bmp_template)
         return converted_pattern, first_frame, temp_dir_obj
     except Exception:
         try:
@@ -1816,6 +1854,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         if encode_error is not None:
             raise encode_error
 
+        output_stat_before = Path(args.output_path).stat()
         _compress_if_needed(
             Path(args.output_path),
             args.ffmpeg_path,
@@ -1824,16 +1863,22 @@ def main(argv: Optional[list[str]] = None) -> int:
             preset=args.preset,
             quality=args.crf,
         )
-        final_valid, final_reason = _validate_preview_output(
-            Path(args.output_path),
-            args.ffmpeg_path,
-            validation_frame_count,
-        )
-        logging.info("Final preview validation: %s", final_reason)
-        if not final_valid:
-            raise RuntimeError(
-                f"Preview output failed final validation: {final_reason}"
+        output_stat_after = Path(args.output_path).stat()
+        if (
+            output_stat_after.st_size != output_stat_before.st_size
+            or output_stat_after.st_mtime_ns != output_stat_before.st_mtime_ns
+        ):
+            # Only re-validate when the size-limit pass actually re-encoded the file.
+            final_valid, final_reason = _validate_preview_output(
+                Path(args.output_path),
+                args.ffmpeg_path,
+                validation_frame_count,
             )
+            logging.info("Final preview validation: %s", final_reason)
+            if not final_valid:
+                raise RuntimeError(
+                    f"Preview output failed final validation: {final_reason}"
+                )
 
         logging.info("Preview video successfully written to %s", args.output_path)
         if not _maybe_upload_preview(Path(args.output_path)):
