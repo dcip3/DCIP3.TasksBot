@@ -1215,6 +1215,35 @@ async def _scan_auto_preview_candidates(users: list[_WatcherUser]) -> int:
     return total_scheduled
 
 
+async def _filter_suspended_auth_users(users: list[_WatcherUser]) -> list[_WatcherUser]:
+    """Drop users whose stored Deadline credentials are rejected (401 loop).
+
+    The first time a login gets suspended, its user is told to /login again.
+    """
+    from app.services.deadline import is_auth_suspended, pop_auth_failure_notification
+
+    active: list[_WatcherUser] = []
+    for user in users:
+        if not is_auth_suspended(user.login):
+            active.append(user)
+            continue
+        if pop_auth_failure_notification(user.login):
+            try:
+                await bot.send_message(
+                    user.telegram_user_id,
+                    "⚠️ Deadline rejected your stored credentials (401 Unauthorized).\n"
+                    "Farm monitoring for your account is paused. "
+                    "Please /login again to resume.",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Could not notify user %s about invalid credentials: %s",
+                    user.telegram_user_id,
+                    exc,
+                )
+    return active
+
+
 async def job_progress_watcher(bot) -> None:
     """Monitor active preview jobs and auto-preview candidates."""
     del bot  # Runtime preview helpers use shared bot instance from bot_core.
@@ -1226,6 +1255,7 @@ async def job_progress_watcher(bot) -> None:
         while True:
             loop_started = time.monotonic()
             users = await _load_watcher_users()
+            users = await _filter_suspended_auth_users(users)
 
             active_targets = _collect_active_preview_targets(users)
             if active_targets:

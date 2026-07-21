@@ -75,6 +75,9 @@ async def authenticate_user(username: str, password: str, telegram_user_id: int)
             ssl=settings.deadline_tls_verify,
         ) as resp:
             if resp.status == 200:
+                from app.services.deadline import clear_auth_suspension
+
+                clear_auth_suspension(username)
                 return True
             else:
                 logger.warning(f"Deadline RCS auth failed for user {username}: {resp.status}")

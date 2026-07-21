@@ -153,7 +153,10 @@ async def _fetch_jobs_by_credentials(
         if resp.status != 200:
             response_text = await resp.text()
             logger.error("Failed to get jobs: %s, response: %s", resp.status, response_text)
+            if resp.status == 401:
+                _record_auth_failure(login)
             return []
+        _record_auth_success(login)
         data = await resp.json()
         request_ms = int((time.monotonic() - request_started_at) * 1000)
         total_ms = int((time.monotonic() - started_at) * 1000)
@@ -182,6 +185,77 @@ def _invalidate_jobs_cache(login: str) -> None:
 def invalidate_all_jobs_cache() -> None:
     """Drop every cached jobs listing (used when a farm push event arrives)."""
     _jobs_cache.clear()
+
+
+# --- Stored-credential failure tracking -------------------------------------
+# After several consecutive 401s the login is suspended: the watcher stops
+# polling with it (and notifies the user once) until either a successful
+# re-login clears it or the retry window allows a single probe again — the
+# latter protects against transient server-side auth outages.
+_AUTH_FAILURE_THRESHOLD = 3
+_AUTH_SUSPENSION_RETRY_SECONDS = 30 * 60
+_auth_failures: dict[str, int] = {}
+_auth_suspended_until: dict[str, float] = {}
+_auth_notify_pending: set[str] = set()
+_auth_already_notified: set[str] = set()
+
+
+def _auth_key(login: str) -> str:
+    return str(login or "").strip().lower()
+
+
+def _record_auth_failure(login: str) -> None:
+    key = _auth_key(login)
+    count = _auth_failures.get(key, 0) + 1
+    _auth_failures[key] = count
+    if count >= _AUTH_FAILURE_THRESHOLD:
+        _auth_suspended_until[key] = time.monotonic() + _AUTH_SUSPENSION_RETRY_SECONDS
+        if key not in _auth_already_notified:
+            _auth_already_notified.add(key)
+            _auth_notify_pending.add(key)
+        logger.warning(
+            "Login %s hit %s consecutive 401s; pausing farm polling for this account",
+            login,
+            count,
+        )
+
+
+def _record_auth_success(login: str) -> None:
+    key = _auth_key(login)
+    _auth_failures.pop(key, None)
+    _auth_suspended_until.pop(key, None)
+    _auth_already_notified.discard(key)
+
+
+def is_auth_suspended(login: str) -> bool:
+    key = _auth_key(login)
+    until = _auth_suspended_until.get(key)
+    if until is None:
+        return False
+    if time.monotonic() >= until:
+        # Allow a single probe; one more 401 re-suspends without re-notifying.
+        _auth_suspended_until.pop(key, None)
+        _auth_failures[key] = _AUTH_FAILURE_THRESHOLD - 1
+        return False
+    return True
+
+
+def pop_auth_failure_notification(login: str) -> bool:
+    """Return True exactly once after a login gets suspended."""
+    key = _auth_key(login)
+    if key in _auth_notify_pending:
+        _auth_notify_pending.discard(key)
+        return True
+    return False
+
+
+def clear_auth_suspension(login: str) -> None:
+    """Forget auth failures for a login (called after a successful /login)."""
+    key = _auth_key(login)
+    _auth_failures.pop(key, None)
+    _auth_suspended_until.pop(key, None)
+    _auth_notify_pending.discard(key)
+    _auth_already_notified.discard(key)
 
 
 def _invalidate_workers_cache(login: str) -> None:
