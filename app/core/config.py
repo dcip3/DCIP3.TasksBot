@@ -72,6 +72,13 @@ class Settings(BaseSettings):
         default=None,
         description="Optional temp directory on workers for preview helper script",
     )
+    deadline_event_secret: Optional[str] = Field(
+        default=None,
+        description=(
+            "Shared secret for the /deadline-event push endpoint (must match the "
+            "TasksBot Deadline event plugin config); empty disables the endpoint"
+        ),
+    )
     preview_presubmit_enabled: bool = Field(
         True,
         description=(

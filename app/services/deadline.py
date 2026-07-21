@@ -179,6 +179,11 @@ def _invalidate_jobs_cache(login: str) -> None:
     _jobs_cache.pop(_jobs_cache_key(login), None)
 
 
+def invalidate_all_jobs_cache() -> None:
+    """Drop every cached jobs listing (used when a farm push event arrives)."""
+    _jobs_cache.clear()
+
+
 def _invalidate_workers_cache(login: str) -> None:
     _workers_cache.pop(_workers_cache_key(login), None)
 

@@ -687,6 +687,10 @@ async def start_preview_upload_server() -> None:
     app = web.Application(client_max_size=max_size_bytes)
     app.router.add_post(UPLOAD_PATH, _handle_preview_upload)
 
+    from app.core.farm_events import EVENT_PATH, handle_deadline_event
+
+    app.router.add_post(EVENT_PATH, handle_deadline_event)
+
     runner = web.AppRunner(app)
     try:
         await runner.setup()

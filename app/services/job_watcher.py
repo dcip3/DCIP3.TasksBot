@@ -1270,6 +1270,13 @@ async def job_progress_watcher(bot) -> None:
                 if notification_users:
                     next_interval = min(next_interval, _ERROR_REPORT_SCAN_INTERVAL_SECONDS)
 
-            await asyncio.sleep(next_interval)
+            from app.core.farm_events import wait_for_wake
+
+            if await wait_for_wake(next_interval):
+                # A farm push event arrived: run every scan immediately instead
+                # of waiting for the per-scan schedule to come around.
+                logger.info("Watcher woken by farm event; scanning immediately")
+                next_auto_scan_at = 0.0
+                next_error_scan_at = 0.0
     except asyncio.CancelledError:
         logger.info("Job progress watcher cancelled")
