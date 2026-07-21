@@ -18,11 +18,18 @@ logger = logging.getLogger(__name__)
 
 ALLOWED_WORKER_STATUSES = {0, 1, 2}
 T = TypeVar("T")
-_JOBS_CACHE_TTL_SECONDS = 5.0
+# Farm snapshot windows. Data younger than FRESH is served as-is; between FRESH
+# and STALE_MAX it is served instantly while a background refresh runs
+# (stale-while-revalidate, snapshot API only); older entries require a blocking
+# fetch. Every fetch still uses the caller's own credentials, so per-login
+# password validation and 401 tracking are fully preserved.
+_JOBS_FRESH_SECONDS = 10.0
+_JOBS_STALE_MAX_SECONDS = 300.0
 _JOBS_CACHE_MAX_ENTRIES = 256
 _jobs_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 _jobs_cache_lock = asyncio.Lock()
-_WORKERS_CACHE_TTL_SECONDS = 20.0
+_WORKERS_FRESH_SECONDS = 30.0
+_WORKERS_STALE_MAX_SECONDS = 300.0
 _WORKERS_CACHE_MAX_ENTRIES = 256
 _workers_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 _workers_cache_lock = asyncio.Lock()
@@ -78,45 +85,36 @@ def _workers_cache_key(login: str) -> str:
     return str(login or "").strip().lower()
 
 
-def _prune_jobs_cache() -> None:
+def _prune_snapshot_cache(cache: dict, stale_max: float, max_entries: int) -> None:
+    """Drop entries older than the stale window, then enforce the size cap."""
     now = time.monotonic()
     expired_keys = [
         key
-        for key, (expires_at, _) in _jobs_cache.items()
-        if expires_at <= now
+        for key, (fetched_at, _) in cache.items()
+        if (now - fetched_at) >= stale_max
     ]
     for key in expired_keys:
-        _jobs_cache.pop(key, None)
+        cache.pop(key, None)
 
-    if len(_jobs_cache) <= _JOBS_CACHE_MAX_ENTRIES:
+    if len(cache) <= max_entries:
         return
 
-    # Keep entries with the highest expiration timestamps.
-    survivors = sorted(_jobs_cache.items(), key=lambda item: item[1][0], reverse=True)[
-        :_JOBS_CACHE_MAX_ENTRIES
+    # Keep the most recently fetched entries.
+    survivors = sorted(cache.items(), key=lambda item: item[1][0], reverse=True)[
+        :max_entries
     ]
-    _jobs_cache.clear()
-    _jobs_cache.update(survivors)
+    cache.clear()
+    cache.update(survivors)
+
+
+def _prune_jobs_cache() -> None:
+    _prune_snapshot_cache(_jobs_cache, _JOBS_STALE_MAX_SECONDS, _JOBS_CACHE_MAX_ENTRIES)
 
 
 def _prune_workers_cache() -> None:
-    now = time.monotonic()
-    expired_keys = [
-        key
-        for key, (expires_at, _) in _workers_cache.items()
-        if expires_at <= now
-    ]
-    for key in expired_keys:
-        _workers_cache.pop(key, None)
-
-    if len(_workers_cache) <= _WORKERS_CACHE_MAX_ENTRIES:
-        return
-
-    survivors = sorted(_workers_cache.items(), key=lambda item: item[1][0], reverse=True)[
-        :_WORKERS_CACHE_MAX_ENTRIES
-    ]
-    _workers_cache.clear()
-    _workers_cache.update(survivors)
+    _prune_snapshot_cache(
+        _workers_cache, _WORKERS_STALE_MAX_SECONDS, _WORKERS_CACHE_MAX_ENTRIES
+    )
 
 
 async def _fetch_jobs_by_credentials(
@@ -132,7 +130,7 @@ async def _fetch_jobs_by_credentials(
 
     if use_cache and not force_refresh:
         cached = _jobs_cache.get(cache_key)
-        if cached and cached[0] > now:
+        if cached and (now - cached[0]) < _JOBS_FRESH_SECONDS:
             logger.info(
                 "Jobs cache hit for login %s in %sms",
                 login,
@@ -172,8 +170,7 @@ async def _fetch_jobs_by_credentials(
 
     if use_cache:
         async with _jobs_cache_lock:
-            expires_at = time.monotonic() + _JOBS_CACHE_TTL_SECONDS
-            _jobs_cache[cache_key] = (expires_at, data)
+            _jobs_cache[cache_key] = (time.monotonic(), data)
             _prune_jobs_cache()
     return data
 
@@ -183,8 +180,79 @@ def _invalidate_jobs_cache(login: str) -> None:
 
 
 def invalidate_all_jobs_cache() -> None:
-    """Drop every cached jobs listing (used when a farm push event arrives)."""
-    _jobs_cache.clear()
+    """Mark every cached jobs listing stale (used when a farm push event arrives).
+
+    Data is kept so snapshot readers can still answer instantly; the next
+    consumer (typically the event-woken watcher) refreshes it with its own
+    credentials.
+    """
+    stale_at = time.monotonic() - _JOBS_FRESH_SECONDS - 1.0
+    for key, (fetched_at, data) in list(_jobs_cache.items()):
+        _jobs_cache[key] = (min(fetched_at, stale_at), data)
+
+
+# --- Farm snapshot (stale-while-revalidate) ----------------------------------
+_refresh_tasks: dict[str, asyncio.Task] = {}
+
+
+def _spawn_background_refresh(task_key: str, coro_factory) -> None:
+    """Run one background refresh per key at a time (single-flight)."""
+    existing = _refresh_tasks.get(task_key)
+    if existing and not existing.done():
+        return
+
+    async def _run() -> None:
+        try:
+            await coro_factory()
+        except Exception as exc:
+            logger.warning("Background snapshot refresh %s failed: %s", task_key, exc)
+        finally:
+            _refresh_tasks.pop(task_key, None)
+
+    _refresh_tasks[task_key] = asyncio.create_task(_run())
+
+
+async def get_jobs_snapshot(login: str, password: str) -> List[Dict[str, Any]]:
+    """Jobs list with instant answers: fresh -> cached; stale -> cached now,
+    refresh in background; missing/too old -> blocking fetch.
+
+    Always fetches with the caller's own credentials, preserving per-login
+    password validation and 401 tracking.
+    """
+    cached = _jobs_cache.get(_jobs_cache_key(login))
+    if cached is not None:
+        age = time.monotonic() - cached[0]
+        if age < _JOBS_FRESH_SECONDS:
+            return cached[1]
+        if age < _JOBS_STALE_MAX_SECONDS:
+            _spawn_background_refresh(
+                f"jobs:{_jobs_cache_key(login)}",
+                lambda: _fetch_jobs_by_credentials(
+                    login, password, use_cache=True, force_refresh=True
+                ),
+            )
+            return cached[1]
+    return await _fetch_jobs_by_credentials(
+        login, password, use_cache=True, force_refresh=True
+    )
+
+
+async def get_workers_snapshot(login: str, password: str) -> List[Dict[str, Any]]:
+    """Workers list with the same stale-while-revalidate semantics as jobs."""
+    cached = _workers_cache.get(_workers_cache_key(login))
+    if cached is not None:
+        age = time.monotonic() - cached[0]
+        if age < _WORKERS_FRESH_SECONDS:
+            return cached[1]
+        if age < _WORKERS_STALE_MAX_SECONDS:
+            _spawn_background_refresh(
+                f"workers:{_workers_cache_key(login)}",
+                lambda: _fetch_workers(
+                    login, password, use_cache=True, force_refresh=True
+                ),
+            )
+            return cached[1]
+    return await _fetch_workers(login, password, use_cache=True, force_refresh=True)
 
 
 # --- Stored-credential failure tracking -------------------------------------
@@ -279,11 +347,9 @@ async def get_jobs_list(telegram_user_id: int) -> List[Dict[str, Any]]:
     """
     async def _op(login: str, password: str) -> List[Dict[str, Any]]:
         logger.info("Requesting jobs for user %s", telegram_user_id)
-        return await _fetch_jobs_by_credentials(
-            login,
-            password,
-            use_cache=True,
-        )
+        # Snapshot semantics: answer instantly from the last known farm state
+        # and refresh in the background when it is getting stale.
+        return await get_jobs_snapshot(login, password)
 
     return await _with_user_credentials(
         telegram_user_id,
@@ -321,7 +387,7 @@ async def _fetch_workers(
     now = time.monotonic()
     if use_cache and not force_refresh:
         cached = _workers_cache.get(cache_key)
-        if cached and cached[0] > now:
+        if cached and (now - cached[0]) < _WORKERS_FRESH_SECONDS:
             return cached[1]
 
     try:
@@ -334,8 +400,7 @@ async def _fetch_workers(
                 logger.info(f"Slaves API returned {len(data) if isinstance(data, list) else 'non-list'} items")
                 if isinstance(data, list) and use_cache:
                     async with _workers_cache_lock:
-                        expires_at = time.monotonic() + _WORKERS_CACHE_TTL_SECONDS
-                        _workers_cache[cache_key] = (expires_at, data)
+                        _workers_cache[cache_key] = (time.monotonic(), data)
                         _prune_workers_cache()
                 return data
             response_text = await resp.text()
@@ -358,7 +423,7 @@ async def get_workers_list(telegram_user_id: int) -> List[Dict[str, Any]]:
     """
     async def _op(login: str, password: str) -> List[Dict[str, Any]]:
         logger.info("Requesting slaves for user %s with login %s", telegram_user_id, login)
-        return await _fetch_workers(login, password)
+        return await get_workers_snapshot(login, password)
 
     return await _with_user_credentials(
         telegram_user_id,
