@@ -838,6 +838,23 @@ def _extract_lut_spec(sidecar: Optional[dict]) -> Optional[dict]:
     return spec
 
 
+def _output_already_has_color(sidecar: Optional[dict], is_hdr_input: bool) -> bool:
+    """True when Redshift already baked color management/LUT/controls into the frames.
+
+    The ROP's "Color Management and Post Effects" section has a per-output-type
+    "Color/LUT/Controls" toggle. For LDR outputs (PNG/JPG) it is on by default —
+    those frames are already display-referred. For HDR (EXR) it is off by
+    default, which is why the preview applies the view transform itself; if a
+    scene turns it on, applying it again would double up.
+    """
+    output = (sidecar or {}).get("output")
+    if not isinstance(output, dict):
+        # Sidecar v1 (or none): assume Redshift's defaults.
+        return not is_hdr_input
+    key = "hdr_color" if is_hdr_input else "ldr_color"
+    return bool(output.get(key, not is_hdr_input))
+
+
 def _extract_camera_color_spec(sidecar: Optional[dict]) -> Optional[dict]:
     """Collect every camera-side color post effect the preview reproduces.
 
@@ -2282,9 +2299,16 @@ def main(argv: Optional[list[str]] = None) -> int:
                 )
 
         color_spec: Optional[dict] = None
+        color_already_baked = False
 
         def _resolve_lut_after_sync(input_files: List[Path]) -> Optional[dict]:
-            if not apply_color or (args.no_camera_lut and args.no_color_controls):
+            """Read the sidecar and decide what color work is left for the preview.
+
+            Sets color_already_baked when Redshift wrote frames that already
+            carry the view transform / LUT / color controls.
+            """
+            nonlocal color_already_baked
+            if not apply_color:
                 return None
             newest_mtime: Optional[float] = None
             try:
@@ -2292,7 +2316,19 @@ def main(argv: Optional[list[str]] = None) -> int:
             except (ValueError, OSError):
                 pass
             _wait_for_color_sidecar(args.input_pattern, newest_mtime)
-            spec = _extract_camera_color_spec(_load_color_sidecar(args.input_pattern))
+            sidecar = _load_color_sidecar(args.input_pattern)
+
+            if _output_already_has_color(sidecar, is_exr_input):
+                logging.info(
+                    "Redshift already baked color management into these frames "
+                    "(ROP output setting); leaving them untouched"
+                )
+                color_already_baked = True
+                return None
+
+            if args.no_camera_lut and args.no_color_controls:
+                return None
+            spec = _extract_camera_color_spec(sidecar)
             if not spec:
                 return None
             if args.no_camera_lut:
@@ -2305,6 +2341,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             input_frame = _resolve_single_frame_path(args.input_pattern, args.start_number)
             _prefetch_input_files([input_frame])
             color_spec = _resolve_lut_after_sync([input_frame])
+            if color_already_baked:
+                apply_color = False
             _convert_single_frame_to_png(
                 input_path=input_frame,
                 output_path=Path(args.output_path),
@@ -2338,6 +2376,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 raise RuntimeError(f"No frames found matching pattern {args.input_pattern}")
             _prefetch_input_files(available_input_files)
             color_spec = _resolve_lut_after_sync(available_input_files)
+            if color_already_baked:
+                apply_color = False
 
             reuse_inputs = list(available_input_files)
             sidecar_file = Path(args.input_pattern).parent / "preview_color.json"
