@@ -122,6 +122,8 @@ atexit.register(_cleanup_registered_temp_paths)
 
 
 _BOOTSTRAP_ENV_FLAG = "PREVIEW_BOOTSTRAPPED"
+# Bump when the color pipeline changes so previously built previews are not reused.
+_COLOR_PIPELINE_VERSION = 2
 _STUB_FALLBACK = (
     "import os,sys,base64,zlib,json;"
     "script=os.environ['PREVIEW_SCRIPT_B64'];"
@@ -1320,18 +1322,62 @@ def _probe_frame_count(
     return None, error_snippet
 
 
+def _color_signature(color_spec: Optional[dict]) -> str:
+    """Stable tag describing how this preview was color-processed.
+
+    Written into the MP4 as a comment so a later run can tell whether an
+    existing file was built with the same color pipeline (bumping
+    _COLOR_PIPELINE_VERSION invalidates every previously built preview).
+    """
+    import hashlib
+    import json
+
+    payload = json.dumps(color_spec or {}, sort_keys=True, default=str)
+    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+    return f"tasksbot:{_COLOR_PIPELINE_VERSION}:{digest}"
+
+
+def _read_output_signature(output_path: Path, ffmpeg_path: str) -> Optional[str]:
+    ffprobe_path = _resolve_ffprobe_path(ffmpeg_path)
+    try:
+        probe = subprocess.run(
+            [
+                ffprobe_path,
+                "-v",
+                "error",
+                "-show_entries",
+                "format_tags=comment",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(output_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except Exception:
+        return None
+    if probe.returncode != 0:
+        return None
+    value = (probe.stdout or "").strip()
+    return value or None
+
+
 def _reusable_existing_output(
     output_path: Path,
     input_files: List[Path],
     ffmpeg_path: str,
     expected_frames: int,
+    color_signature: Optional[str] = None,
 ) -> bool:
     """True when a previous run already produced this preview from the same frames.
 
     Happens when a worker converted successfully but failed to upload and the
     task moved to another machine. Guards against stale files from earlier
     render versions by requiring the video to be newer than every input frame
-    (mtimes survive Dropbox sync).
+    (mtimes survive Dropbox sync) and to carry the same color-pipeline
+    signature.
     """
     try:
         if not input_files or not output_path.exists():
@@ -1344,6 +1390,17 @@ def _reusable_existing_output(
             return False
     except OSError:
         return False
+
+    if color_signature:
+        existing = _read_output_signature(output_path, ffmpeg_path)
+        if existing != color_signature:
+            logging.info(
+                "Existing preview was built with a different color pipeline "
+                "(%s != %s); rebuilding",
+                existing or "no signature",
+                color_signature,
+            )
+            return False
 
     valid, reason = _validate_preview_output(output_path, ffmpeg_path, expected_frames)
     if valid:
@@ -1670,6 +1727,7 @@ def build_ffmpeg_command(
     preset: str,
     crf: int,
     concat_manifest: Optional[Path] = None,
+    color_signature: Optional[str] = None,
 ) -> tuple[list[str], str]:
     selected_encoder = _resolve_video_encoder(ffmpeg_path, video_encoder)
     command: list[str] = [
@@ -1720,9 +1778,11 @@ def build_ffmpeg_command(
             "-movflags",
             "+faststart",
             "-an",
-            output_path,
         ]
     )
+    if color_signature:
+        command.extend(["-metadata", f"comment={color_signature}"])
+    command.append(output_path)
     return command, selected_encoder
 
 
@@ -2289,6 +2349,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 reuse_inputs,
                 args.ffmpeg_path,
                 validation_frame_count,
+                color_signature=_color_signature(color_spec),
             ):
                 logging.info(
                     "Reusing existing preview output %s (newer than all input frames)",
@@ -2342,6 +2403,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             preset=args.preset,
             crf=args.crf,
             concat_manifest=concat_manifest,
+            color_signature=_color_signature(color_spec),
         )
         logging.info("Using preview video encoder: %s", selected_encoder)
 
@@ -2356,6 +2418,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 preset=args.preset,
                 crf=args.crf,
                 concat_manifest=concat_manifest,
+                color_signature=_color_signature(color_spec),
             )
             run_ffmpeg(cmd)
             return resolved_encoder
