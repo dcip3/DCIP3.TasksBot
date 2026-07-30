@@ -2,6 +2,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -12,6 +13,46 @@ os.environ.setdefault(
 )
 
 from app.services import deadline
+
+
+class InteractiveNotificationTests(unittest.IsolatedAsyncioTestCase):
+    """User-initiated requests must report rejected credentials every time."""
+
+    def setUp(self) -> None:
+        deadline.clear_auth_suspension("tester")
+
+    async def _run(self, call) -> list:
+        sent: list = []
+
+        async def fake_notify(user_id: int) -> None:
+            sent.append(user_id)
+
+        with mock.patch.object(
+            deadline, "_notify_rejected_credentials", side_effect=fake_notify
+        ), mock.patch(
+            "app.auth.get_deadline_credentials",
+            new=mock.AsyncMock(return_value=("tester", "pw")),
+        ):
+            await deadline._with_user_credentials(
+                42, default=[], operation_name="test op", call=call
+            )
+        return sent
+
+    async def test_notifies_on_fresh_401(self) -> None:
+        async def call(login: str, password: str):
+            deadline._record_auth_failure(login)  # simulates a 401 response
+            return []
+
+        self.assertEqual(await self._run(call), [42])
+        # Every further attempt notifies again, so the user always gets an answer.
+        self.assertEqual(await self._run(call), [42])
+
+    async def test_silent_when_request_succeeds(self) -> None:
+        async def call(login: str, password: str):
+            deadline._record_auth_success(login)
+            return [{"_id": "job"}]
+
+        self.assertEqual(await self._run(call), [])
 
 
 class AuthSuspensionTests(unittest.TestCase):

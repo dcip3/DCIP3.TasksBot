@@ -65,6 +65,7 @@ async def _with_user_credentials(
         return default
 
     login, password = credentials
+    failures_before = _auth_failures.get(_auth_key(login), 0)
     try:
         return await call(login, password)
     except Exception as exc:
@@ -75,6 +76,31 @@ async def _with_user_credentials(
             exc,
         )
         return default
+    finally:
+        # This path is only used by user-initiated actions, so tell the user
+        # right away when their stored credentials were just rejected.
+        if _auth_failures.get(_auth_key(login), 0) > failures_before:
+            await _notify_rejected_credentials(telegram_user_id)
+
+
+CREDENTIALS_REJECTED_MESSAGE = (
+    "⚠️ Deadline rejected your stored credentials (401 Unauthorized).\n"
+    "Please /login again to continue."
+)
+
+
+async def _notify_rejected_credentials(telegram_user_id: int) -> None:
+    """Tell the user their stored credentials no longer work."""
+    try:
+        from app.core.bot_core import bot
+
+        await bot.send_message(telegram_user_id, CREDENTIALS_REJECTED_MESSAGE)
+    except Exception as exc:
+        logger.warning(
+            "Could not notify user %s about rejected credentials: %s",
+            telegram_user_id,
+            exc,
+        )
 
 
 def _jobs_cache_key(login: str) -> str:

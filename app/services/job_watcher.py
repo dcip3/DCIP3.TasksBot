@@ -1226,19 +1226,25 @@ async def _filter_suspended_auth_users(users: list[_WatcherUser]) -> list[_Watch
     The first time a login gets suspended, its user is told to /login again.
     """
     from app.services.deadline import is_auth_suspended, pop_auth_failure_notification
+    from app.storage.user_settings import claim_auth_failure_notice
 
     active: list[_WatcherUser] = []
     for user in users:
         if not is_auth_suspended(user.login):
             active.append(user)
             continue
-        if pop_auth_failure_notification(user.login):
+        # The in-memory flag fires once per process; the DB claim keeps restarts
+        # from repeating the warning (at most one reminder per day).
+        if pop_auth_failure_notification(user.login) and await claim_auth_failure_notice(
+            user.telegram_user_id
+        ):
             try:
                 await bot.send_message(
                     user.telegram_user_id,
                     "⚠️ Deadline rejected your stored credentials (401 Unauthorized).\n"
                     "Farm monitoring for your account is paused. "
-                    "Please /login again to resume.",
+                    "Please /login again to resume.\n\n"
+                    "You will not be reminded again until you log in.",
                 )
             except Exception as exc:
                 logger.warning(

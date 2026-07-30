@@ -20,6 +20,8 @@ __all__ = [
     "PREVIEW_POST_EFFECTS",
     "get_preview_post_effects",
     "set_preview_post_effect",
+    "claim_auth_failure_notice",
+    "clear_auth_failure_notice",
     "_normalize_scope",
     "get_notification_settings",
     "set_notification_enabled",
@@ -281,6 +283,59 @@ async def set_preview_auto_enabled(telegram_user_id: int, enabled: bool) -> bool
     except Exception as e:
         logger.error("Failed to set preview auto flag for user %s: %s", telegram_user_id, e)
         return False
+
+
+async def claim_auth_failure_notice(telegram_user_id: int) -> bool:
+    """Return True the first time the user should be warned about rejected credentials.
+
+    The timestamp is persisted, so the background warning is sent exactly once
+    (surviving bot restarts) until a successful /login clears it. Interactive
+    requests report the problem separately, every time they hit it.
+    """
+    import time
+
+    conn = get_db_connection()
+    if conn is None:
+        return True
+
+    try:
+        async with conn.execute(
+            "SELECT auth_failure_notified_at FROM user_sessions WHERE telegram_user_id = ?",
+            (telegram_user_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row and row[0]:
+            return False
+
+        await conn.execute(
+            "UPDATE user_sessions SET auth_failure_notified_at = ? WHERE telegram_user_id = ?",
+            (int(time.time()), telegram_user_id),
+        )
+        await conn.commit()
+        return True
+    except Exception as e:
+        logger.error(
+            "Failed to record auth failure notice for user %s: %s", telegram_user_id, e
+        )
+        # Do not spam when the bookkeeping itself fails.
+        return False
+
+
+async def clear_auth_failure_notice(telegram_user_id: int) -> None:
+    """Forget the credential warning after a successful login."""
+    conn = get_db_connection()
+    if conn is None:
+        return
+    try:
+        await conn.execute(
+            "UPDATE user_sessions SET auth_failure_notified_at = NULL WHERE telegram_user_id = ?",
+            (telegram_user_id,),
+        )
+        await conn.commit()
+    except Exception as e:
+        logger.error(
+            "Failed to clear auth failure notice for user %s: %s", telegram_user_id, e
+        )
 
 
 PREVIEW_POST_EFFECTS = {

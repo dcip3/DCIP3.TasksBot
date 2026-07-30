@@ -107,6 +107,9 @@ async def init_db():
     await _ensure_user_session_column("preview_default_method", "TEXT")
     await _ensure_user_session_column("preview_auto_enabled", "INTEGER DEFAULT 0")
     await _ensure_user_session_column("preview_auto_scope", "TEXT")
+    # When the user was last told their stored credentials are rejected, so the
+    # warning is not repeated on every bot restart.
+    await _ensure_user_session_column("auth_failure_notified_at", "INTEGER")
     # Per-user preview post effects; all enabled by default.
     await _ensure_user_session_column("preview_apply_color_transform", "INTEGER DEFAULT 1")
     await _ensure_user_session_column("preview_apply_lut", "INTEGER DEFAULT 1")
