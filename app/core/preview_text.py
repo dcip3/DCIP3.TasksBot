@@ -20,11 +20,12 @@ def build_preview_caption(
     icon: str = "📁",
     lut: Optional[str] = None,
     resolution: Optional[str] = None,
+    color_controls: Optional[str] = None,
 ) -> str:
     """Build a consistent caption for preview media.
 
-    Layout: title, blank line, optional render details (camera LUT and
-    resolution), blank line, source path.
+    Layout: title, blank line, optional render details (resolution, camera LUT,
+    camera color controls), blank line, source path.
     """
     parts = [f"{icon} {_normalize_title(title)}"]
 
@@ -34,6 +35,8 @@ def build_preview_caption(
         details.append(f"📐 <code>{html.escape(display_resolution)}</code>")
     if lut:
         details.append(f"🎨 <code>{html.escape(str(lut))}</code>")
+    if color_controls:
+        details.append(f"🎛 <code>{html.escape(str(color_controls))}</code>")
     if details:
         parts.append("\n".join(details))
 

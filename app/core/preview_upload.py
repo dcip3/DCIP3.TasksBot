@@ -887,6 +887,11 @@ async def _handle_preview_upload(request: web.Request) -> web.Response:
         lut_header = request.headers.get("X-Preview-Lut")
         if lut_header:
             upload_meta["lut"] = urllib.parse.unquote(lut_header).strip()
+        controls_header = request.headers.get("X-Preview-Color-Controls")
+        if controls_header:
+            upload_meta["color_controls"] = urllib.parse.unquote(
+                controls_header
+            ).strip()
         resolution_header = request.headers.get("X-Preview-Resolution")
         if resolution_header:
             upload_meta["resolution"] = resolution_header.strip()
@@ -1046,6 +1051,7 @@ async def _deliver_preview(payload: PreviewUploadPayload, temp_path: Path) -> No
         display_path,
         lut=upload_meta.get("lut"),
         resolution=upload_meta.get("resolution"),
+        color_controls=upload_meta.get("color_controls"),
     )
 
     async def _delete() -> bool:

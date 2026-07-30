@@ -631,6 +631,165 @@ def _resolve_lut_path(raw_path: str) -> Optional[Path]:
     return None
 
 
+def _parse_curve_points(raw: object) -> Optional[List[Tuple[float, float]]]:
+    """Parse a Redshift curve string: "<count> x0 y0 x1 y1 ...".
+
+    Returns None for identity curves (nothing to apply).
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    tokens = raw.split()
+    try:
+        values = [float(token) for token in tokens]
+    except ValueError:
+        return None
+    if len(values) < 3:
+        return None
+
+    count = int(values[0])
+    coords = values[1:]
+    if count < 2 or len(coords) < count * 2:
+        return None
+
+    points = [(coords[i * 2], coords[i * 2 + 1]) for i in range(count)]
+    points.sort(key=lambda point: point[0])
+    if len(points) == 2 and all(
+        abs(point[0] - point[1]) < 1e-6 for point in points
+    ) and abs(points[0][0]) < 1e-6 and abs(points[1][0] - 1.0) < 1e-6:
+        return None  # straight 0->0, 1->1 line
+    return points
+
+
+def _sample_curve(points: List[Tuple[float, float]], xs):
+    """Evaluate a curve at xs with monotone cubic (PCHIP) interpolation.
+
+    Monotone interpolation matches how curve widgets behave (smooth, but never
+    overshooting between control points).
+    """
+    import numpy as np
+
+    px = np.array([point[0] for point in points], dtype=np.float64)
+    py = np.array([point[1] for point in points], dtype=np.float64)
+    n = len(px)
+    if n < 2:
+        return np.clip(xs, 0.0, 1.0)
+
+    h = np.diff(px)
+    h[h == 0] = 1e-9
+    delta = np.diff(py) / h
+
+    slopes = np.zeros(n, dtype=np.float64)
+    slopes[0] = delta[0]
+    slopes[-1] = delta[-1]
+    for i in range(1, n - 1):
+        if delta[i - 1] * delta[i] <= 0:
+            slopes[i] = 0.0
+        else:
+            w1 = 2 * h[i] + h[i - 1]
+            w2 = h[i] + 2 * h[i - 1]
+            slopes[i] = (w1 + w2) / (w1 / delta[i - 1] + w2 / delta[i])
+
+    xs = np.asarray(xs, dtype=np.float64)
+    idx = np.clip(np.searchsorted(px, xs, side="right") - 1, 0, n - 2)
+    x0 = px[idx]
+    dx = xs - x0
+    hh = h[idx]
+    t = np.clip(dx / hh, 0.0, 1.0)
+    t2 = t * t
+    t3 = t2 * t
+    h00 = 2 * t3 - 3 * t2 + 1
+    h10 = t3 - 2 * t2 + t
+    h01 = -2 * t3 + 3 * t2
+    h11 = t3 - t2
+    result = (
+        h00 * py[idx]
+        + h10 * hh * slopes[idx]
+        + h01 * py[idx + 1]
+        + h11 * hh * slopes[idx + 1]
+    )
+    # Outside the control-point range the curve holds its endpoints.
+    result = np.where(xs <= px[0], py[0], result)
+    result = np.where(xs >= px[-1], py[-1], result)
+    return np.clip(result, 0.0, 1.0)
+
+
+def _extract_color_controls(sidecar: Optional[dict]) -> Optional[dict]:
+    """Read the camera's Color Controls section (contrast + RGB curves).
+
+    Returns None when the section is disabled or fully neutral.
+    """
+    if not sidecar:
+        return None
+    params = sidecar.get("camera_params")
+    if not isinstance(params, dict):
+        return None
+    if not params.get("RS_campro_colorEnable"):
+        return None
+
+    try:
+        contrast = float(params.get("RS_campro_colorContrast", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        contrast = 0.0
+    contrast = max(-1.0, min(1.0, contrast))
+
+    curves = {}
+    for key, parm_name in (
+        ("rgb", "RS_campro_colorCurvesRGB"),
+        ("r", "RS_campro_colorCurvesR"),
+        ("g", "RS_campro_colorCurvesG"),
+        ("b", "RS_campro_colorCurvesB"),
+    ):
+        points = _parse_curve_points(params.get(parm_name))
+        if points:
+            curves[key] = points
+
+    if abs(contrast) < 1e-6 and not curves:
+        return None
+
+    spec = {"contrast": contrast, "curves": curves}
+    logging.info(
+        "Applying camera color controls (contrast=%s, curves=%s)",
+        contrast,
+        ",".join(sorted(curves)) or "none",
+    )
+    return spec
+
+
+def _build_color_controls_transform(controls: dict, ocio):
+    """Bake contrast + curves into a single 1D LUT (display-referred, 0..1)."""
+    import numpy as np
+
+    size = 1024
+    xs = np.linspace(0.0, 1.0, size, dtype=np.float64)
+
+    contrast = float(controls.get("contrast") or 0.0)
+    if abs(contrast) > 1e-6:
+        # Linear contrast around mid-grey; RS exposes -1..1 with 0 as neutral.
+        base = np.clip((xs - 0.5) * (1.0 + contrast) + 0.5, 0.0, 1.0)
+    else:
+        base = xs
+
+    curves = controls.get("curves") or {}
+    channels = []
+    for key in ("r", "g", "b"):
+        values = base
+        if key in curves:
+            values = _sample_curve(curves[key], values)
+        if "rgb" in curves:
+            values = _sample_curve(curves["rgb"], values)
+        channels.append(values)
+
+    lut = ocio.Lut1DTransform(length=size)
+    for index in range(size):
+        lut.setValue(
+            index,
+            float(channels[0][index]),
+            float(channels[1][index]),
+            float(channels[2][index]),
+        )
+    return lut
+
+
 def _extract_lut_spec(sidecar: Optional[dict]) -> Optional[dict]:
     """Normalize the sidecar into a LUT spec for the OCIO pipeline, or None."""
     if not sidecar:
@@ -677,6 +836,19 @@ def _extract_lut_spec(sidecar: Optional[dict]) -> Optional[dict]:
     return spec
 
 
+def _extract_camera_color_spec(sidecar: Optional[dict]) -> Optional[dict]:
+    """Collect every camera-side color post effect the preview reproduces.
+
+    Returns {"lut": <lut spec or None>, "controls": <controls or None>} or None
+    when the camera contributes nothing.
+    """
+    lut = _extract_lut_spec(sidecar)
+    controls = _extract_color_controls(sidecar)
+    if not lut and not controls:
+        return None
+    return {"lut": lut, "controls": controls}
+
+
 class _ColorPipeline:
     """Fused OCIO evaluation, optionally blending in a camera LUT by strength."""
 
@@ -720,14 +892,24 @@ def _load_cpu_processor(
     input_space: str,
     display: str,
     view: str,
-    lut_spec: Optional[dict] = None,
+    color_spec: Optional[dict] = None,
 ) -> "_ColorPipeline":
+    """Build the fused OCIO pipeline: view transform + camera color post effects.
+
+    Chain (matching Redshift's camera post FX order):
+      scene-linear -> display/view transform -> Color Controls -> camera LUT
+    With "Apply Color Management before LUT" off, the LUT instead runs on the
+    scene-referred image before the view transform.
+    """
     try:
         import PyOpenColorIO as ocio
     except ImportError as exc:  # pragma: no cover - depends on worker environment
         raise RuntimeError("PyOpenColorIO is required for CPU color mode") from exc
 
     config = ocio.Config.CreateFromFile(str(config_path))
+    color_spec = color_spec or {}
+    lut_spec = color_spec.get("lut")
+    controls = color_spec.get("controls")
 
     def _fused(transform):
         processor = config.getProcessor(transform)
@@ -750,8 +932,18 @@ def _load_cpu_processor(
         transform.setDirection(ocio.TRANSFORM_DIR_FORWARD)
         return transform
 
+    def _append_display_and_controls(group) -> None:
+        group.appendTransform(_display_transform())
+        if controls:
+            # Contrast and RGB curves operate on the display-referred image.
+            group.appendTransform(_build_color_controls_transform(controls, ocio))
+
     if not lut_spec:
-        return _ColorPipeline(_fused(_display_transform()))
+        if not controls:
+            return _ColorPipeline(_fused(_display_transform()))
+        group = ocio.GroupTransform()
+        _append_display_and_controls(group)
+        return _ColorPipeline(_fused(group))
 
     file_transform = ocio.FileTransform()
     file_transform.setSrc(lut_spec["file"])
@@ -765,7 +957,7 @@ def _load_cpu_processor(
             logging.warning(
                 "Camera LUT has both 'CM before LUT' and log mode set; ignoring log mode"
             )
-        group.appendTransform(_display_transform())
+        _append_display_and_controls(group)
         group.appendTransform(file_transform)
     else:
         # LUT is applied to the scene-referred image before color management.
@@ -790,14 +982,19 @@ def _load_cpu_processor(
                 group.appendTransform(file_transform)
         else:
             group.appendTransform(file_transform)
-        group.appendTransform(_display_transform())
+        _append_display_and_controls(group)
 
     primary = _fused(group)
     if lut_spec.get("strength", 1.0) >= 1.0:
         return _ColorPipeline(primary)
+
+    # LUT strength blends against the same image without the LUT, so the color
+    # controls stay fully applied on both sides of the blend.
+    base_group = ocio.GroupTransform()
+    _append_display_and_controls(base_group)
     return _ColorPipeline(
         primary,
-        base=_fused(_display_transform()),
+        base=_fused(base_group),
         strength=float(lut_spec["strength"]),
     )
 
@@ -860,7 +1057,7 @@ def _run_cpu_convert_manifest(manifest_path: str) -> int:
         data["input_space"],
         data["display"],
         data["view"],
-        lut_spec=data.get("lut"),
+        color_spec=data.get("color"),
     )
     for source, destination in data["files"]:
         _convert_exr_frame_cpu(Path(source), Path(destination), pipeline)
@@ -896,7 +1093,7 @@ def _convert_frames_cpu(
     view: str,
     shard_dir: Path,
     worker_processes: int,
-    lut_spec: Optional[dict] = None,
+    color_spec: Optional[dict] = None,
 ) -> None:
     """Convert EXR frames to PNG, fanning out across worker subprocesses.
 
@@ -924,7 +1121,7 @@ def _convert_frames_cpu(
                         "input_space": input_space,
                         "display": display,
                         "view": view,
-                        "lut": lut_spec,
+                        "color": color_spec,
                         "files": [[str(src), str(dst)] for src, dst in shard],
                     }
                 ),
@@ -974,7 +1171,7 @@ def _convert_frames_cpu(
                 len(remaining),
             )
         pipeline = _load_cpu_processor(
-            config_path, input_space, display, view, lut_spec=lut_spec
+            config_path, input_space, display, view, color_spec=color_spec
         )
         for source, destination in remaining:
             _convert_exr_frame_cpu(source, destination, pipeline)
@@ -1291,7 +1488,7 @@ def _convert_single_frame_to_png(
     display: str,
     view: str,
     ffmpeg_path: str,
-    lut_spec: Optional[dict] = None,
+    color_spec: Optional[dict] = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     input_ext = input_path.suffix.lower()
@@ -1300,7 +1497,7 @@ def _convert_single_frame_to_png(
         if config_path is None:
             raise RuntimeError("OCIO config required for single-frame EXR conversion")
         pipeline = _load_cpu_processor(
-            config_path, input_space, display, view, lut_spec=lut_spec
+            config_path, input_space, display, view, color_spec=color_spec
         )
         _convert_exr_frame_cpu(input_path, output_path, pipeline)
         return
@@ -1403,7 +1600,7 @@ def convert_sequence_cpu(
     view: str,
     temp_dir: Optional[Union[str, Path]],
     worker_processes: int = 0,
-    lut_spec: Optional[dict] = None,
+    color_spec: Optional[dict] = None,
 ) -> Tuple[str, int, Optional[tempfile.TemporaryDirectory[str]]]:
     directory, template, digits, files = _expand_sequence(input_pattern)
 
@@ -1443,7 +1640,7 @@ def convert_sequence_cpu(
             view=view,
             shard_dir=cpu_dir,
             worker_processes=worker_processes,
-            lut_spec=lut_spec,
+            color_spec=color_spec,
         )
 
         first_frame = frame_numbers[0] if frame_numbers else start_number
@@ -1750,6 +1947,11 @@ def parse_arguments(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Ignore the camera LUT recorded in the render's preview_color.json sidecar",
     )
+    color_group.add_argument(
+        "--no-color-controls",
+        action="store_true",
+        help="Ignore the camera Color Controls (contrast/curves) from the sidecar",
+    )
     color_group.add_argument("--ocio-config", help="Path to OCIO config file")
     color_group.add_argument("--input-space", default="ACEScg", help="OCIO input space")
     color_group.add_argument("--display", default="sRGB", help="OCIO display")
@@ -1797,16 +1999,37 @@ def _probe_output_resolution(output_path: Path, ffmpeg_path: str) -> Optional[st
     return None
 
 
+def _describe_color_controls(controls: Optional[dict]) -> str:
+    """Short human-readable summary of the applied Color Controls."""
+    if not controls:
+        return ""
+    parts: List[str] = []
+    contrast = float(controls.get("contrast") or 0.0)
+    if abs(contrast) > 1e-6:
+        parts.append(f"Contrast {contrast:g}")
+    curves = controls.get("curves") or {}
+    if curves:
+        order = [key for key in ("rgb", "r", "g", "b") if key in curves]
+        parts.append("Curves " + "+".join(key.upper() for key in order))
+    return ", ".join(parts)
+
+
 def _upload_metadata_headers(
-    lut_spec: Optional[dict],
+    color_spec: Optional[dict],
     output_path: Path,
     ffmpeg_path: str,
 ) -> dict:
-    """Describe the preview for the bot's caption (camera LUT, resolution)."""
+    """Describe the preview for the bot's caption (LUT, color controls, resolution)."""
     headers: dict = {}
+    lut_spec = (color_spec or {}).get("lut")
     if lut_spec and lut_spec.get("file"):
         lut_name = Path(lut_spec["file"]).name
         headers["X-Preview-Lut"] = urllib.parse.quote(lut_name, safe="")
+    controls_summary = _describe_color_controls((color_spec or {}).get("controls"))
+    if controls_summary:
+        headers["X-Preview-Color-Controls"] = urllib.parse.quote(
+            controls_summary, safe=""
+        )
     resolution = _probe_output_resolution(output_path, ffmpeg_path)
     if resolution:
         headers["X-Preview-Resolution"] = resolution
@@ -1998,10 +2221,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                     wait_seconds,
                 )
 
-        lut_spec: Optional[dict] = None
+        color_spec: Optional[dict] = None
 
         def _resolve_lut_after_sync(input_files: List[Path]) -> Optional[dict]:
-            if not apply_color or args.no_camera_lut:
+            if not apply_color or (args.no_camera_lut and args.no_color_controls):
                 return None
             newest_mtime: Optional[float] = None
             try:
@@ -2009,12 +2232,19 @@ def main(argv: Optional[list[str]] = None) -> int:
             except (ValueError, OSError):
                 pass
             _wait_for_color_sidecar(args.input_pattern, newest_mtime)
-            return _extract_lut_spec(_load_color_sidecar(args.input_pattern))
+            spec = _extract_camera_color_spec(_load_color_sidecar(args.input_pattern))
+            if not spec:
+                return None
+            if args.no_camera_lut:
+                spec["lut"] = None
+            if args.no_color_controls:
+                spec["controls"] = None
+            return spec if (spec["lut"] or spec["controls"]) else None
 
         if expected_frames == 1:
             input_frame = _resolve_single_frame_path(args.input_pattern, args.start_number)
             _prefetch_input_files([input_frame])
-            lut_spec = _resolve_lut_after_sync([input_frame])
+            color_spec = _resolve_lut_after_sync([input_frame])
             _convert_single_frame_to_png(
                 input_path=input_frame,
                 output_path=Path(args.output_path),
@@ -2024,13 +2254,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                 display=args.display,
                 view=args.view,
                 ffmpeg_path=args.ffmpeg_path,
-                lut_spec=lut_spec,
+                color_spec=color_spec,
             )
             output_path = Path(args.output_path)
             if not output_path.exists() or output_path.stat().st_size <= 0:
                 raise RuntimeError(f"Single-frame PNG was not written: {output_path}")
             logging.info("Preview still successfully written to %s", output_path)
-            upload_headers = _upload_metadata_headers(lut_spec, output_path, args.ffmpeg_path)
+            upload_headers = _upload_metadata_headers(color_spec, output_path, args.ffmpeg_path)
             if not _maybe_upload_preview(output_path, extra_headers=upload_headers):
                 _handle_upload_failure()
             return 0
@@ -2047,7 +2277,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             if not available_input_files:
                 raise RuntimeError(f"No frames found matching pattern {args.input_pattern}")
             _prefetch_input_files(available_input_files)
-            lut_spec = _resolve_lut_after_sync(available_input_files)
+            color_spec = _resolve_lut_after_sync(available_input_files)
 
             reuse_inputs = list(available_input_files)
             sidecar_file = Path(args.input_pattern).parent / "preview_color.json"
@@ -2065,7 +2295,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     args.output_path,
                 )
                 upload_headers = _upload_metadata_headers(
-                    lut_spec, Path(args.output_path), args.ffmpeg_path
+                    color_spec, Path(args.output_path), args.ffmpeg_path
                 )
                 if not _maybe_upload_preview(
                     Path(args.output_path), extra_headers=upload_headers
@@ -2085,7 +2315,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 display=args.display,
                 view=args.view,
                 temp_dir=base_temp_dir,
-                lut_spec=lut_spec,
+                color_spec=color_spec,
             )
             ffmpeg_input_pattern = converted_pattern
             if cpu_temp_dir is not None:
@@ -2205,7 +2435,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         logging.info("Preview video successfully written to %s", args.output_path)
         upload_headers = _upload_metadata_headers(
-            lut_spec, Path(args.output_path), args.ffmpeg_path
+            color_spec, Path(args.output_path), args.ffmpeg_path
         )
         if not _maybe_upload_preview(Path(args.output_path), extra_headers=upload_headers):
             _handle_upload_failure()
