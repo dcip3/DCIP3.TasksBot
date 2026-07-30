@@ -748,13 +748,7 @@ def _extract_color_controls(sidecar: Optional[dict]) -> Optional[dict]:
     if abs(contrast) < 1e-6 and not curves:
         return None
 
-    spec = {"contrast": contrast, "curves": curves}
-    logging.info(
-        "Applying camera color controls (contrast=%s, curves=%s)",
-        contrast,
-        ",".join(sorted(curves)) or "none",
-    )
-    return spec
+    return {"contrast": contrast, "curves": curves}
 
 
 def _build_color_controls_transform(controls: dict, ocio):
@@ -822,20 +816,12 @@ def _extract_lut_spec(sidecar: Optional[dict]) -> Optional[dict]:
     # image. Older sidecars stored the same parm under the misleading key
     # "before_cm"; both keys carry the RS_campro_lutBeforeCM value.
     cm_before_lut_raw = lut.get("cm_before_lut", lut.get("before_cm"))
-    spec = {
+    return {
         "file": str(resolved),
         "strength": min(1.0, strength),
         "is_log": bool(lut.get("is_log")),
         "cm_before_lut": bool(cm_before_lut_raw),
     }
-    logging.info(
-        "Applying camera LUT %s (strength=%s, log=%s, cm_before_lut=%s)",
-        spec["file"],
-        spec["strength"],
-        spec["is_log"],
-        spec["cm_before_lut"],
-    )
-    return spec
 
 
 def _output_already_has_color(sidecar: Optional[dict], is_hdr_input: bool) -> bool:
@@ -2326,16 +2312,36 @@ def main(argv: Optional[list[str]] = None) -> int:
                 color_already_baked = True
                 return None
 
-            if args.no_camera_lut and args.no_color_controls:
-                return None
             spec = _extract_camera_color_spec(sidecar)
-            if not spec:
-                return None
-            if args.no_camera_lut:
-                spec["lut"] = None
-            if args.no_color_controls:
-                spec["controls"] = None
-            return spec if (spec["lut"] or spec["controls"]) else None
+            if spec:
+                if args.no_camera_lut:
+                    spec["lut"] = None
+                if args.no_color_controls:
+                    spec["controls"] = None
+                if not (spec["lut"] or spec["controls"]):
+                    spec = None
+
+            # Log what is actually applied, after the disable flags are honored.
+            lut_spec = (spec or {}).get("lut")
+            controls = (spec or {}).get("controls")
+            if lut_spec:
+                logging.info(
+                    "Applying camera LUT %s (strength=%s, log=%s, cm_before_lut=%s)",
+                    lut_spec["file"],
+                    lut_spec["strength"],
+                    lut_spec["is_log"],
+                    lut_spec["cm_before_lut"],
+                )
+            elif args.no_camera_lut:
+                logging.info("Camera LUT skipped (disabled in preview settings)")
+            if controls:
+                logging.info(
+                    "Applying camera color controls (%s)",
+                    _describe_color_controls(controls),
+                )
+            elif args.no_color_controls:
+                logging.info("Camera color controls skipped (disabled in preview settings)")
+            return spec
 
         if expected_frames == 1:
             input_frame = _resolve_single_frame_path(args.input_pattern, args.start_number)

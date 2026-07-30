@@ -107,6 +107,10 @@ async def init_db():
     await _ensure_user_session_column("preview_default_method", "TEXT")
     await _ensure_user_session_column("preview_auto_enabled", "INTEGER DEFAULT 0")
     await _ensure_user_session_column("preview_auto_scope", "TEXT")
+    # Per-user preview post effects; all enabled by default.
+    await _ensure_user_session_column("preview_apply_color_transform", "INTEGER DEFAULT 1")
+    await _ensure_user_session_column("preview_apply_lut", "INTEGER DEFAULT 1")
+    await _ensure_user_session_column("preview_apply_color_controls", "INTEGER DEFAULT 1")
 
     try:
         await tasks_db_conn.execute(

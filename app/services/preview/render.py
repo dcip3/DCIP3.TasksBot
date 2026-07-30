@@ -301,7 +301,11 @@ async def create_video_from_job(
             ocio_candidate = Path(settings.ocio_config_path)
             remote_config_path = str(ocio_candidate) if ocio_candidate.is_absolute() else None
 
-    apply_color = settings.preview_apply_color_transform
+    from app.storage.user_settings import get_preview_post_effects
+
+    post_effects = await get_preview_post_effects(telegram_user_id)
+
+    apply_color = settings.preview_apply_color_transform and post_effects["color_transform"]
     input_ext = Path(str(input_sequence_path)).suffix.lower()
     if input_ext in {".jpg", ".jpeg", ".png"} and apply_color:
         logger.info(
@@ -359,6 +363,11 @@ async def create_video_from_job(
                 settings.preview_view,
             ]
         )
+        # Camera post effects the user chose to skip (raw-render previews).
+        if not post_effects["lut"]:
+            script_args.append("--no-camera-lut")
+        if not post_effects["color_controls"]:
+            script_args.append("--no-color-controls")
     else:
         script_args.append("--disable-color")
 

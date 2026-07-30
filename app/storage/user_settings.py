@@ -17,6 +17,9 @@ __all__ = [
     "DEFAULT_NOTIFICATION_SCOPE",
     "VALID_NOTIFICATION_SCOPES",
     "PREVIEW_DEFAULT_WORKER_AUTO",
+    "PREVIEW_POST_EFFECTS",
+    "get_preview_post_effects",
+    "set_preview_post_effect",
     "_normalize_scope",
     "get_notification_settings",
     "set_notification_enabled",
@@ -277,6 +280,68 @@ async def set_preview_auto_enabled(telegram_user_id: int, enabled: bool) -> bool
         return True
     except Exception as e:
         logger.error("Failed to set preview auto flag for user %s: %s", telegram_user_id, e)
+        return False
+
+
+PREVIEW_POST_EFFECTS = {
+    "color_transform": "preview_apply_color_transform",
+    "lut": "preview_apply_lut",
+    "color_controls": "preview_apply_color_controls",
+}
+
+
+async def get_preview_post_effects(telegram_user_id: int) -> dict:
+    """Return which preview post effects are enabled for a user.
+
+    Everything defaults to enabled, so a missing row or a failed read still
+    produces the full-quality preview.
+    """
+    defaults = {key: True for key in PREVIEW_POST_EFFECTS}
+    conn = get_db_connection()
+    if conn is None:
+        return defaults
+
+    columns = ", ".join(PREVIEW_POST_EFFECTS.values())
+    try:
+        async with conn.execute(
+            f"SELECT {columns} FROM user_sessions WHERE telegram_user_id = ?",
+            (telegram_user_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return defaults
+            return {
+                key: True if row[index] is None else bool(row[index])
+                for index, key in enumerate(PREVIEW_POST_EFFECTS)
+            }
+    except Exception as e:
+        logger.error("Failed to fetch preview post effects for user %s: %s", telegram_user_id, e)
+        return defaults
+
+
+async def set_preview_post_effect(telegram_user_id: int, key: str, enabled: bool) -> bool:
+    """Enable or disable a single preview post effect."""
+    column = PREVIEW_POST_EFFECTS.get(key)
+    if column is None:
+        logger.error("Unknown preview post effect '%s'", key)
+        return False
+
+    conn = get_db_connection()
+    if conn is None:
+        return False
+
+    try:
+        await conn.execute(
+            f"UPDATE user_sessions SET {column} = ? WHERE telegram_user_id = ?",
+            (1 if enabled else 0, telegram_user_id),
+        )
+        await conn.commit()
+        logger.info("User %s preview post effect %s set to %s", telegram_user_id, key, enabled)
+        return True
+    except Exception as e:
+        logger.error(
+            "Failed to set preview post effect %s for user %s: %s", key, telegram_user_id, e
+        )
         return False
 
 

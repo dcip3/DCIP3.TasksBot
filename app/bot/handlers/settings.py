@@ -10,15 +10,18 @@ from app.auth import is_authorized
 from app.storage.user_settings import (
     NotificationScope,
     PREVIEW_DEFAULT_WORKER_AUTO,
+    PREVIEW_POST_EFFECTS,
     get_notification_settings,
     get_preview_default_worker,
     get_preview_auto_enabled,
     get_preview_auto_scope,
+    get_preview_post_effects,
     set_notification_enabled,
     set_notification_scope,
     set_preview_auto_enabled,
     set_preview_auto_scope,
     set_preview_default_worker,
+    set_preview_post_effect,
 )
 from app.core.ui_helpers import (
     authorized_only,
@@ -58,6 +61,25 @@ async def _edit_or_send(
 
 def _render_settings_root_text() -> str:
     return "Settings\nSelect a section to configure."
+
+
+_POST_EFFECT_LABELS = {
+    "color_transform": "Color transform",
+    "lut": "Camera LUT",
+    "color_controls": "Color Controls",
+}
+
+
+def _post_effects_summary(effects: dict) -> str:
+    """Describe the enabled preview post effects in one line."""
+    disabled = [
+        _POST_EFFECT_LABELS[key] for key in PREVIEW_POST_EFFECTS if not effects.get(key, True)
+    ]
+    if not disabled:
+        return "All on"
+    if len(disabled) == len(PREVIEW_POST_EFFECTS):
+        return "All off (raw render)"
+    return "Off: " + ", ".join(disabled)
 
 
 def _build_settings_root_keyboard() -> InlineKeyboardMarkup:
@@ -272,11 +294,14 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
         auto_scope = await get_preview_auto_scope(user_id)
         scope_label = "My jobs only" if auto_scope == "own" else "All jobs"
         auto_label = "On" if auto_enabled else "Off"
+        effects = await get_preview_post_effects(user_id)
+        effects_label = _post_effects_summary(effects)
         text_lines = [
             "🎬 Preview Settings",
             "",
             f"• Auto preview: {auto_label}",
             f"• Auto preview scope: {scope_label}",
+            f"• Post effects: {effects_label}",
             "",
             "Choose what to configure for previews.",
         ]
@@ -289,6 +314,12 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
             ],
             [
                 inline_button(
+                    text="🎨 Post Effects",
+                    callback_data="settings:preview:effects",
+                ),
+            ],
+            [
+                inline_button(
                     text="🖥️ Default Worker",
                     callback_data="settings:preview:worker",
                 ),
@@ -297,6 +328,60 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
                 back_inline_button(callback_data="settings:back:root"),
             ],
         ]
+        await _edit_or_send(
+            callback_query.message,
+            "\n".join(text_lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+        )
+
+    async def show_preview_effects() -> None:
+        effects = await get_preview_post_effects(user_id)
+
+        text_lines = [
+            "🎨 Preview Post Effects",
+            "",
+            f"• Status: {_post_effects_summary(effects)}",
+            "",
+            "What the preview reproduces from the render camera:",
+            "• 🌈 Color transform — ACES view transform (ACEScg → sRGB).",
+            "   Off gives the raw linear image: very dark, for inspection only.",
+            "• 🎨 Camera LUT — the LUT assigned on the Redshift camera.",
+            "• 🎛 Color Controls — camera contrast and RGB curves.",
+            "",
+            "Turn things off to see a rawer render. Effects Redshift already "
+            "bakes into the frames (exposure, bloom/glare) are always there.",
+        ]
+
+        keyboard_rows = [
+            [
+                selectable_inline_button(
+                    text="🌈 Color transform (ACES)",
+                    callback_data="settings:preview:effects:toggle:color_transform",
+                    selected=effects["color_transform"],
+                    prefix_unselected="◻ ",
+                )
+            ],
+            [
+                selectable_inline_button(
+                    text="🎨 Camera LUT",
+                    callback_data="settings:preview:effects:toggle:lut",
+                    selected=effects["lut"],
+                    prefix_unselected="◻ ",
+                )
+            ],
+            [
+                selectable_inline_button(
+                    text="🎛 Color Controls",
+                    callback_data="settings:preview:effects:toggle:color_controls",
+                    selected=effects["color_controls"],
+                    prefix_unselected="◻ ",
+                )
+            ],
+            [
+                back_inline_button(callback_data="settings:preview"),
+            ],
+        ]
+
         await _edit_or_send(
             callback_query.message,
             "\n".join(text_lines),
@@ -370,6 +455,10 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
                     await show_preview_worker()
                     await callback_query.answer("Updated")
                     return
+                if sub_target == "effects":
+                    await show_preview_effects()
+                    await callback_query.answer("Updated")
+                    return
             await show_preview_menu()
             await callback_query.answer("Updated")
             return
@@ -417,6 +506,25 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
                 await show_preview_menu()
                 await callback_query.answer()
                 return
+            if sub_action == "effects":
+                if len(parts) == 3:
+                    await show_preview_effects()
+                    await callback_query.answer()
+                    return
+                if len(parts) > 4 and parts[3] == "toggle":
+                    effect_key = parts[4]
+                    if effect_key not in PREVIEW_POST_EFFECTS:
+                        await callback_query.answer("Unsupported option.", show_alert=True)
+                        return
+                    effects = await get_preview_post_effects(user_id)
+                    new_value = not effects.get(effect_key, True)
+                    await set_preview_post_effect(user_id, effect_key, new_value)
+                    await show_preview_effects()
+                    label = _POST_EFFECT_LABELS[effect_key]
+                    await callback_query.answer(
+                        f"{label} {'enabled' if new_value else 'disabled'}"
+                    )
+                    return
             if sub_action == "auto":
                 if len(parts) == 3:
                     await show_preview_auto()
