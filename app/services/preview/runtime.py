@@ -29,6 +29,7 @@ preview_message_registry = preview_state.message_registry
 preview_animation_tasks = preview_state.animation_tasks
 preview_upload_wait_notice_jobs = preview_state.upload_wait_notice_jobs
 preview_tracked_jobs = preview_state.tracked_previews
+preview_missing_strikes = preview_state.missing_preview_strikes
 
 
 @dataclass(frozen=True)
@@ -48,23 +49,28 @@ def register_preview_message(preview_job_id: str, chat_id: int, message_id: int)
     )
 
 
-def track_preview_job(preview_job_id: str, telegram_user_id: int) -> None:
+def track_preview_job(
+    preview_job_id: str,
+    telegram_user_id: int,
+    source_job_id: Optional[str] = None,
+) -> None:
     """Follow a preview job that has no progress message in chat.
 
     Auto previews are silent until the video is ready, but the watcher still
     has to notice failures and deliver results for them.
     """
-    preview_tracked_jobs[preview_job_id] = telegram_user_id
+    preview_tracked_jobs[preview_job_id] = (telegram_user_id, source_job_id)
 
 
-def untrack_preview_job(preview_job_id: str) -> None:
-    preview_tracked_jobs.pop(preview_job_id, None)
+def untrack_preview_job(preview_job_id: str) -> Optional[tuple[int, Optional[str]]]:
+    preview_missing_strikes.pop(preview_job_id, None)
+    return preview_tracked_jobs.pop(preview_job_id, None)
 
 
 def pop_preview_message(preview_job_id: str) -> Optional[tuple[int, int]]:
     """Retrieve and remove stored progress message for a preview job."""
     preview_upload_wait_notice_jobs.discard(preview_job_id)
-    preview_tracked_jobs.pop(preview_job_id, None)
+    untrack_preview_job(preview_job_id)
     info = preview_message_registry.pop(preview_job_id, None)
     task = preview_animation_tasks.pop(preview_job_id, None)
     if task and not task.done():
@@ -718,7 +724,7 @@ async def _submit_auto_preview_deadline(
     # job so failures are reported and the result gets delivered.
     preview_id = result.get("preview_job_id")
     if preview_id:
-        track_preview_job(str(preview_id), telegram_user_id)
+        track_preview_job(str(preview_id), telegram_user_id, job_id)
     logger.info(
         "Auto preview %s queued for %s%s (%s)",
         preview_id,

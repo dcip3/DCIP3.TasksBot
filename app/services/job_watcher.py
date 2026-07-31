@@ -22,7 +22,9 @@ from app.services.preview.runtime import (
     _notify_preview_job_completion,
     _notify_preview_job_failure,
     _run_auto_preview_for_job,
+    pop_preview_message,
     preview_message_registry,
+    preview_missing_strikes,
     preview_tracked_jobs,
 )
 from app.storage.user_settings import _normalize_scope
@@ -44,6 +46,8 @@ _AUTO_PREVIEW_SCAN_INTERVAL_SECONDS = 30
 # render left paused releases it, and resuming re-queues a fresh one.
 _SUSPENDED_SOURCE_GRACE_SECONDS = 60 * 60
 _suspended_source_since: dict[str, float] = {}
+# Consecutive failed lookups before a preview job is treated as deleted.
+_MISSING_PREVIEW_STRIKES = 3
 _AUTO_PREVIEW_HISTORY_RETENTION_SECONDS = 14 * 24 * 60 * 60
 _AUTO_PREVIEW_HISTORY_CLEANUP_INTERVAL_SECONDS = 60 * 60
 _ERROR_REPORT_SCAN_INTERVAL_SECONDS = 10
@@ -746,38 +750,98 @@ async def _load_watcher_users() -> list[_WatcherUser]:
     return users
 
 
-def _collect_active_preview_targets(
+async def _collect_active_preview_targets(
     users: list[_WatcherUser],
 ) -> list[tuple[str, _WatcherUser]]:
-    """Preview jobs to check this tick: manual ones (with a progress message in
-    chat) plus silent auto previews the watcher follows in the background."""
-    if not users or not (preview_message_registry or preview_tracked_jobs):
+    """Preview jobs to check this tick.
+
+    The authoritative source is Deadline itself: every unfinished preview job
+    owned by a watched user is picked up, so a bot restart does not lose track
+    of previews it queued earlier. In-memory registries only add jobs that were
+    submitted moments ago and may not be in the cached job list yet.
+    """
+    if not users:
         return []
+
+    from app.services.deadline import get_jobs_by_credentials
 
     users_by_id = {user.telegram_user_id: user for user in users}
     targets: list[tuple[str, _WatcherUser]] = []
     seen: set[str] = set()
 
-    for preview_job_id, (chat_id, _message_id) in preview_message_registry.items():
-        try:
-            chat_id_int = int(chat_id)
-        except (TypeError, ValueError):
-            continue
-        user = users_by_id.get(chat_id_int)
-        if user is None:
-            continue
+    def _add(preview_job_id: str, user: _WatcherUser) -> None:
+        if not preview_job_id or preview_job_id in seen:
+            return
         seen.add(preview_job_id)
         targets.append((preview_job_id, user))
 
-    for preview_job_id, owner_id in preview_tracked_jobs.items():
-        if preview_job_id in seen:
+    for user in users:
+        try:
+            jobs = await get_jobs_by_credentials(user.login, user.password, use_cache=True)
+        except Exception as exc:
+            logger.warning(
+                "Watcher: could not list jobs while collecting previews for %s: %s",
+                user.telegram_user_id,
+                exc,
+            )
             continue
+        for job in jobs:
+            if not isinstance(job, dict):
+                continue
+            props = job.get("Props") or {}
+            if not isinstance(props, dict) or not _is_preview_job(props):
+                continue
+            if job.get("Stat", 0) == 3 and not _is_recently_completed(job, props):
+                continue  # long-finished previews were already handled
+            owner_id = _extract_preview_owner_id(props, user.telegram_user_id)
+            if owner_id != user.telegram_user_id:
+                continue
+            _add(str(job.get("_id") or "").strip(), user)
+
+    # Freshly submitted previews may not be in the cached listing yet.
+    for preview_job_id, (chat_id, _message_id) in preview_message_registry.items():
+        try:
+            user = users_by_id.get(int(chat_id))
+        except (TypeError, ValueError):
+            continue
+        if user is not None:
+            _add(preview_job_id, user)
+
+    for preview_job_id, (owner_id, _source_id) in preview_tracked_jobs.items():
         user = users_by_id.get(owner_id)
-        if user is None:
-            continue
-        targets.append((preview_job_id, user))
+        if user is not None:
+            _add(preview_job_id, user)
 
     return targets
+
+
+async def _handle_missing_preview_job(preview_job_id: str, user: _WatcherUser) -> None:
+    """Stop following a preview job that disappeared from Deadline.
+
+    Usually it was deleted by hand (or cleaned up by the farm). A few misses are
+    tolerated first, because a lookup can also fail transiently. Once it is
+    considered gone, the dedupe records are cleared so the render can get a new
+    preview instead of being skipped forever.
+    """
+    strikes = preview_missing_strikes.get(preview_job_id, 0) + 1
+    preview_missing_strikes[preview_job_id] = strikes
+    if strikes < _MISSING_PREVIEW_STRIKES:
+        return
+
+    from app.services.preview.runtime import untrack_preview_job
+
+    tracked = untrack_preview_job(preview_job_id)
+    pop_preview_message(preview_job_id)
+    preview_missing_strikes.pop(preview_job_id, None)
+
+    source_job_id = tracked[1] if tracked else None
+    logger.info(
+        "Watcher: preview job %s is gone from Deadline; no longer following it",
+        preview_job_id,
+    )
+    if source_job_id:
+        auto_preview_jobs.remove((source_job_id, user.telegram_user_id))
+        await _unregister_auto_preview_history(user.telegram_user_id, source_job_id)
 
 
 async def _process_active_preview_job(
@@ -798,7 +862,10 @@ async def _process_active_preview_job(
         return
 
     if not job:
+        await _handle_missing_preview_job(preview_job_id, user)
         return
+
+    preview_missing_strikes.pop(preview_job_id, None)
 
     props = job.get("Props", {})
     if not _is_preview_job(props):
@@ -1045,7 +1112,7 @@ async def _reconcile_presubmitted_previews(user: "_WatcherUser", jobs: list) -> 
     Manually requested previews are never touched.
     """
     from app.services.deadline import delete_job
-    from app.services.preview.runtime import _extract_preview_context, pop_preview_message
+    from app.services.preview.runtime import _extract_preview_context
 
     jobs_by_id: dict[str, dict] = {}
     previews: list[tuple[str, dict, dict]] = []
@@ -1306,7 +1373,7 @@ async def job_progress_watcher(bot) -> None:
             users = await _load_watcher_users()
             users = await _filter_suspended_auth_users(users)
 
-            active_targets = _collect_active_preview_targets(users)
+            active_targets = await _collect_active_preview_targets(users)
             if active_targets:
                 logger.debug(
                     "Watcher: processing %d active preview jobs",
