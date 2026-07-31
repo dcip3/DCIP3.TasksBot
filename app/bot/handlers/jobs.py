@@ -599,6 +599,81 @@ def _build_workers_overview(
     return text, InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
 
 
+_PROGRESS_RE = re.compile(r"^\s*(\d+)%\s+(\S+)\s*$")
+_ETA_RE = re.compile(r"^\s*(\d+):(\d{2}):(\d{2})\s*$")
+_JOB_STATUS_ICONS = {
+    "Active": "🟢",
+    "Completed": "✅",
+    "Failed": "🔴",
+    "Suspended": "⏸️",
+    "Pending": "⏳",
+    "Unknown": "❔",
+}
+
+
+def _progress_bar(percent: int, width: int = 12) -> str:
+    """Render a compact progress bar for a 0-100 percentage."""
+    percent = max(0, min(100, percent))
+    filled = round(percent / 100 * width)
+    return "█" * filled + "░" * (width - filled)
+
+
+def _humanize_eta(eta_str: str) -> str:
+    """Turn Deadline's H:MM:SS estimate into something readable at a glance."""
+    match = _ETA_RE.match(str(eta_str or ""))
+    if not match:
+        return str(eta_str or "").strip()
+    hours, minutes, seconds = (int(part) for part in match.groups())
+    if hours == 0 and minutes == 0:
+        return "less than a minute" if seconds else "finishing"
+    if hours == 0:
+        return f"{minutes} min"
+    if minutes == 0:
+        return f"{hours} h"
+    return f"{hours} h {minutes} min"
+
+
+def _build_job_info_text(
+    *,
+    batch_name: str,
+    name: str,
+    stat: int,
+    stat_name: str,
+    progress_str: str,
+    errors_count: int,
+    eta_str: str,
+) -> str:
+    """Job card: name first, then status, a progress bar and anything notable."""
+    icon = _JOB_STATUS_ICONS.get(str(stat_name), "❔")
+    lines = [
+        f"<b>{html.escape(str(name))}</b>",
+        f"🗂️ <code>{html.escape(str(batch_name))}</code>",
+        "",
+        f"{icon} {html.escape(str(stat_name))}",
+    ]
+
+    match = _PROGRESS_RE.match(str(progress_str or ""))
+    if match:
+        percent = int(match.group(1))
+        counts = match.group(2)
+        lines.append(
+            f"<code>{_progress_bar(percent)}</code> {percent}% · {html.escape(counts)}"
+        )
+    elif progress_str:
+        lines.append(f"⏳ {html.escape(str(progress_str))}")
+
+    if stat in {1, 6}:
+        eta_human = _humanize_eta(eta_str)
+        if eta_human and eta_human.upper() != "N/A":
+            lines.append(f"⏱️ {html.escape(eta_human)} left")
+
+    if errors_count:
+        suffix = "" if int(errors_count) == 1 else "s"
+        lines.append(f"❌ {errors_count} error{suffix}")
+
+    return "\n".join(lines)
+
+
 def _build_worker_info_text(worker_entry: dict) -> str:
     info = worker_entry.get("Info", {}) if isinstance(worker_entry, dict) else {}
     name = str(info.get("Name") or "Unknown")
@@ -1338,18 +1413,15 @@ async def job_info_callback(callback_query: CallbackQuery) -> None:
                     completed_chunks,
                 )
 
-            indent = ""
-            info_lines = [
-                "Job Info:",
-                f"{indent}🗂️ Batch: <code>{html.escape(str(batch_name))}</code>",
-                f"{indent}🏷️ Name: <code>{html.escape(str(name))}</code>",
-                f"{indent}⚙️ Status: <code>{html.escape(str(stat_name))}</code>",
-                f"{indent}⏳ Progress: <code>{html.escape(str(progress_str))}</code>",
-                f"{indent}❌ Errors: <code>{errors_count}</code>",
-            ]
-            if stat in {1, 6}:
-                info_lines.append(f"{indent}⏱️ ETA: <code>{html.escape(str(eta_str))}</code>")
-            info_text = "\n".join(info_lines)
+            info_text = _build_job_info_text(
+                batch_name=batch_name,
+                name=name,
+                stat=stat,
+                stat_name=stat_name,
+                progress_str=progress_str,
+                errors_count=errors_count,
+                eta_str=eta_str,
+            )
 
             is_preview_job, preview_source_id = _extract_preview_meta(props)
             buttons = _build_job_action_buttons(
@@ -1422,17 +1494,15 @@ async def job_update_callback(callback_query: CallbackQuery) -> None:
                 completed_chunks,
             )
 
-        info_lines = [
-            "Job Info:",
-            f"🗂️ Batch: <code>{html.escape(str(batch_name))}</code>",
-            f"🏷️ Name: <code>{html.escape(str(name))}</code>",
-            f"⚙️ Status: <code>{html.escape(str(stat_name))}</code>",
-            f"⏳ Progress: <code>{html.escape(str(progress_str))}</code>",
-            f"❌ Errors: <code>{errors_count}</code>",
-        ]
-        if stat in {1, 6}:
-            info_lines.append(f"⏱️ ETA: <code>{html.escape(str(eta_str))}</code>")
-        info_text = "\n".join(info_lines)
+        info_text = _build_job_info_text(
+            batch_name=batch_name,
+            name=name,
+            stat=stat,
+            stat_name=stat_name,
+            progress_str=progress_str,
+            errors_count=errors_count,
+            eta_str=eta_str,
+        )
 
         is_preview_job, preview_source_id = _extract_preview_meta(props)
         buttons = _build_job_action_buttons(
