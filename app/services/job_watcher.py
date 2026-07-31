@@ -39,6 +39,11 @@ _INPUT_FILE_RE = re.compile(
 )
 
 _AUTO_PREVIEW_SCAN_INTERVAL_SECONDS = 30
+# How long a suspended render may hold its pending preview before the preview is
+# dropped. Short pauses (fixing something and resuming) keep their preview; a
+# render left paused releases it, and resuming re-queues a fresh one.
+_SUSPENDED_SOURCE_GRACE_SECONDS = 60 * 60
+_suspended_source_since: dict[str, float] = {}
 _AUTO_PREVIEW_HISTORY_RETENTION_SECONDS = 14 * 24 * 60 * 60
 _AUTO_PREVIEW_HISTORY_CLEANUP_INTERVAL_SECONDS = 60 * 60
 _ERROR_REPORT_SCAN_INTERVAL_SECONDS = 10
@@ -1071,31 +1076,50 @@ async def _reconcile_presubmitted_previews(user: "_WatcherUser", jobs: list) -> 
             continue
 
         source = jobs_by_id.get(source_job_id)
-        if source is None or source.get("Stat", 0) == 4:
-            reason = "source render failed" if source is not None else "source render was deleted"
-            try:
-                deleted = await delete_job(user.login, user.password, preview_id)
-            except Exception as exc:
-                logger.warning("Watcher: failed to delete stale preview %s: %s", preview_id, exc)
-                continue
-            if deleted:
-                logger.info(
-                    "Watcher: removed preview %s because its %s", preview_id, reason
-                )
-                auto_preview_jobs.remove((source_job_id, target_user_id))
-                await _unregister_auto_preview_history(target_user_id, source_job_id)
-                stored_message = pop_preview_message(preview_id)
-                if stored_message:
-                    with contextlib.suppress(Exception):
-                        await bot.edit_message_text(
-                            f"⏹️ Auto preview cancelled: {reason}.",
-                            chat_id=stored_message[0],
-                            message_id=stored_message[1],
-                        )
+        source_stat = source.get("Stat", 0) if source is not None else None
+
+        reason: Optional[str] = None
+        if source is None:
+            reason = "source render was deleted"
+        elif source_stat == 4:
+            reason = "source render failed"
+        elif source_stat == 2:
+            # Paused render: keep the preview for a while (the user may just be
+            # fixing something), then release it so it does not sit in the queue
+            # forever holding its upload token.
+            paused_since = _suspended_source_since.setdefault(
+                source_job_id, time.monotonic()
+            )
+            if (time.monotonic() - paused_since) >= _SUSPENDED_SOURCE_GRACE_SECONDS:
+                reason = "source render stayed paused"
+        else:
+            _suspended_source_since.pop(source_job_id, None)
+
+        if reason is None:
+            # Deadline holds the preview Pending until the render completes and
+            # the farm event plugin releases it immediately.
             continue
 
-        # Nothing else to do: Deadline holds the preview Pending until the
-        # render completes and the farm event plugin releases it immediately.
+        try:
+            deleted = await delete_job(user.login, user.password, preview_id)
+        except Exception as exc:
+            logger.warning("Watcher: failed to delete stale preview %s: %s", preview_id, exc)
+            continue
+        if deleted:
+            logger.info("Watcher: removed preview %s because its %s", preview_id, reason)
+            _suspended_source_since.pop(source_job_id, None)
+            # Forget the dedupe records so resuming the render queues a new
+            # preview instead of silently skipping it.
+            auto_preview_jobs.remove((source_job_id, target_user_id))
+            await _unregister_auto_preview_history(target_user_id, source_job_id)
+            stored_message = pop_preview_message(preview_id)
+            if stored_message:
+                with contextlib.suppress(Exception):
+                    await bot.edit_message_text(
+                        f"⏹️ Auto preview cancelled: {reason}.",
+                        chat_id=stored_message[0],
+                        message_id=stored_message[1],
+                    )
 
 
 async def _scan_auto_preview_candidates(users: list[_WatcherUser]) -> int:

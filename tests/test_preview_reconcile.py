@@ -124,6 +124,39 @@ class ReconcileScopeTests(unittest.IsolatedAsyncioTestCase):
         delete_mock = await self._reconcile(self._jobs(presubmitted=False, source_stat=4))
         delete_mock.assert_not_awaited()
 
+    async def test_deleted_render_removes_preview(self) -> None:
+        preview = {
+            "_id": "prev1",
+            "Stat": 6,
+            "Props": preview_props(presubmitted=True),
+        }
+        delete_mock = await self._reconcile([preview])  # source job is gone
+        delete_mock.assert_awaited_once()
+
+    async def test_briefly_paused_render_keeps_preview(self) -> None:
+        job_watcher._suspended_source_since.clear()
+        delete_mock = await self._reconcile(self._jobs(presubmitted=True, source_stat=2))
+        delete_mock.assert_not_awaited()
+        self.assertIn("src1", job_watcher._suspended_source_since)
+
+    async def test_long_paused_render_releases_preview(self) -> None:
+        job_watcher._suspended_source_since.clear()
+        await self._reconcile(self._jobs(presubmitted=True, source_stat=2))
+        # Pretend the pause started long ago.
+        job_watcher._suspended_source_since["src1"] -= (
+            job_watcher._SUSPENDED_SOURCE_GRACE_SECONDS + 1
+        )
+        delete_mock = await self._reconcile(self._jobs(presubmitted=True, source_stat=2))
+        delete_mock.assert_awaited_once()
+        self.assertNotIn("src1", job_watcher._suspended_source_since)
+
+    async def test_resumed_render_clears_pause_timer(self) -> None:
+        job_watcher._suspended_source_since.clear()
+        await self._reconcile(self._jobs(presubmitted=True, source_stat=2))
+        self.assertIn("src1", job_watcher._suspended_source_since)
+        await self._reconcile(self._jobs(presubmitted=True, source_stat=1))
+        self.assertNotIn("src1", job_watcher._suspended_source_since)
+
 
 if __name__ == "__main__":
     unittest.main()
