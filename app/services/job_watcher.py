@@ -23,6 +23,7 @@ from app.services.preview.runtime import (
     _notify_preview_job_failure,
     _run_auto_preview_for_job,
     preview_message_registry,
+    preview_tracked_jobs,
 )
 from app.storage.user_settings import _normalize_scope
 
@@ -743,11 +744,15 @@ async def _load_watcher_users() -> list[_WatcherUser]:
 def _collect_active_preview_targets(
     users: list[_WatcherUser],
 ) -> list[tuple[str, _WatcherUser]]:
-    if not users or not preview_message_registry:
+    """Preview jobs to check this tick: manual ones (with a progress message in
+    chat) plus silent auto previews the watcher follows in the background."""
+    if not users or not (preview_message_registry or preview_tracked_jobs):
         return []
 
     users_by_id = {user.telegram_user_id: user for user in users}
     targets: list[tuple[str, _WatcherUser]] = []
+    seen: set[str] = set()
+
     for preview_job_id, (chat_id, _message_id) in preview_message_registry.items():
         try:
             chat_id_int = int(chat_id)
@@ -756,7 +761,17 @@ def _collect_active_preview_targets(
         user = users_by_id.get(chat_id_int)
         if user is None:
             continue
+        seen.add(preview_job_id)
         targets.append((preview_job_id, user))
+
+    for preview_job_id, owner_id in preview_tracked_jobs.items():
+        if preview_job_id in seen:
+            continue
+        user = users_by_id.get(owner_id)
+        if user is None:
+            continue
+        targets.append((preview_job_id, user))
+
     return targets
 
 

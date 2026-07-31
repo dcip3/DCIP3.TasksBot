@@ -37,6 +37,9 @@ def _peek_message(preview_job_id: Optional[str]) -> Optional[tuple[int, int]]:
 def _pop_message(preview_job_id: Optional[str]) -> Optional[tuple[int, int]]:
     if not preview_job_id:
         return None
+    # Silent auto previews are followed without a message; stop following them
+    # here too, otherwise the watcher would keep polling a delivered job.
+    preview_state.tracked_previews.pop(preview_job_id, None)
     return preview_state.message_registry.pop(preview_job_id, None)
 
 

@@ -28,6 +28,7 @@ _LOCAL_FILE_RETRY_DELAYS = (0, 1, 2, 4, 8, 12)
 preview_message_registry = preview_state.message_registry
 preview_animation_tasks = preview_state.animation_tasks
 preview_upload_wait_notice_jobs = preview_state.upload_wait_notice_jobs
+preview_tracked_jobs = preview_state.tracked_previews
 
 
 @dataclass(frozen=True)
@@ -37,7 +38,7 @@ class PreviewCompletionResult:
 
 
 def register_preview_message(preview_job_id: str, chat_id: int, message_id: int) -> None:
-    """Store the progress message info for a preview job."""
+    """Store the progress message info for a manually requested preview."""
     preview_message_registry[preview_job_id] = (chat_id, message_id)
     existing = preview_animation_tasks.get(preview_job_id)
     if existing and not existing.done():
@@ -47,9 +48,23 @@ def register_preview_message(preview_job_id: str, chat_id: int, message_id: int)
     )
 
 
+def track_preview_job(preview_job_id: str, telegram_user_id: int) -> None:
+    """Follow a preview job that has no progress message in chat.
+
+    Auto previews are silent until the video is ready, but the watcher still
+    has to notice failures and deliver results for them.
+    """
+    preview_tracked_jobs[preview_job_id] = telegram_user_id
+
+
+def untrack_preview_job(preview_job_id: str) -> None:
+    preview_tracked_jobs.pop(preview_job_id, None)
+
+
 def pop_preview_message(preview_job_id: str) -> Optional[tuple[int, int]]:
     """Retrieve and remove stored progress message for a preview job."""
     preview_upload_wait_notice_jobs.discard(preview_job_id)
+    preview_tracked_jobs.pop(preview_job_id, None)
     info = preview_message_registry.pop(preview_job_id, None)
     task = preview_animation_tasks.pop(preview_job_id, None)
     if task and not task.done():
@@ -697,32 +712,20 @@ async def _submit_auto_preview_deadline(
             )
         return False
 
+    # Auto previews stay silent until the video is ready: the user did not ask
+    # for anything, so a progress message would just sit in the chat (for the
+    # whole render, in the pre-submitted case). The watcher still follows the
+    # job so failures are reported and the result gets delivered.
     preview_id = result.get("preview_job_id")
-    if waiting_for_render:
-        header = f"🧾 Auto preview queued for {job_name} (starts right after render)"
-    else:
-        header = f"🧾 Auto preview queued for {job_name}"
-    if fallback_used:
-        header += " (any worker)"
-    message_text = f"{header}\n□ □ □"
-    cancel_keyboard = (
-        InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    cancel_inline_button(callback_data=f"preview_job_cancel:{preview_id}")
-                ]
-            ]
-        )
-        if preview_id
-        else None
-    )
-    progress_msg = await bot.send_message(
-        telegram_user_id,
-        message_text,
-        reply_markup=cancel_keyboard,
-    )
     if preview_id:
-        register_preview_message(preview_id, progress_msg.chat.id, progress_msg.message_id)
+        track_preview_job(str(preview_id), telegram_user_id)
+    logger.info(
+        "Auto preview %s queued for %s%s (%s)",
+        preview_id,
+        job_name,
+        " on any worker" if fallback_used else "",
+        "waiting for render" if waiting_for_render else "render finished",
+    )
     return True
 
 
