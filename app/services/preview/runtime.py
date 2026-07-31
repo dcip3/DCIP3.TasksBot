@@ -652,6 +652,7 @@ async def _submit_auto_preview_deadline(
             specific_worker=default_worker,
             skip_worker_validation=True,
             input_wait_seconds=input_wait_seconds,
+            presubmitted=waiting_for_render,
         )
     except PreviewSubmissionError as exc:
         if not notify_on_failure:
@@ -676,6 +677,7 @@ async def _submit_auto_preview_deadline(
                 use_any_machine=True,
                 skip_worker_validation=True,
                 input_wait_seconds=input_wait_seconds,
+                presubmitted=waiting_for_render,
             )
         except Exception as exc:
             logger.error("Auto preview fallback submission failed for job %s: %s", job_id, exc)

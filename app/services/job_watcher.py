@@ -1001,8 +1001,37 @@ async def _run_auto_preview_presubmit(
         await _unregister_auto_preview_history(telegram_user_id, job_id)
 
 
+def _is_presubmitted_preview(props: dict) -> bool:
+    """True only for previews the watcher queued before the render finished.
+
+    Manually requested previews must never be suspended or deleted by the
+    reconciler — the user asked for them and is waiting.
+    """
+    extra_dict = props.get("ExDic") or {}
+    if isinstance(extra_dict, dict) and str(extra_dict.get("PreviewPresubmit") or "").strip() == "1":
+        return True
+    for key in (
+        "ExtraInfoKeyValue0",
+        "ExtraInfoKeyValue1",
+        "ExtraInfoKeyValue2",
+        "ExtraInfoKeyValue3",
+        "ExtraInfoKeyValue4",
+        "ExtraInfoKeyValue5",
+        "ExtraInfoKeyValue6",
+    ):
+        value = props.get(key)
+        if not value or "=" not in str(value):
+            continue
+        prefix, payload = str(value).split("=", 1)
+        if prefix == "PreviewPresubmit" and payload.strip() == "1":
+            return True
+    return False
+
+
 async def _reconcile_presubmitted_previews(user: "_WatcherUser", jobs: list) -> None:
-    """Keep waiting preview jobs consistent with their source renders.
+    """Keep pre-submitted preview jobs consistent with their source renders.
+
+    Only previews queued automatically ahead of render completion are touched:
 
     - source failed or was deleted -> delete the preview, update the owner's message
     - source has queued tasks again (requeue/suspend) -> suspend the preview so it
@@ -1022,7 +1051,11 @@ async def _reconcile_presubmitted_previews(user: "_WatcherUser", jobs: list) -> 
             continue
         jobs_by_id[entry_id] = entry
         props = entry.get("Props") or {}
-        if isinstance(props, dict) and _is_preview_job(props):
+        if (
+            isinstance(props, dict)
+            and _is_preview_job(props)
+            and _is_presubmitted_preview(props)
+        ):
             previews.append((entry_id, entry, props))
 
     for preview_id, preview, props in previews:

@@ -154,6 +154,7 @@ async def create_video_from_job(
     use_any_machine: bool = False,
     specific_worker: Optional[str] = None,
     input_wait_seconds: Optional[int] = None,
+    presubmitted: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """
     Submit a Deadline CommandLine job that generates a preview video using ffmpeg.
@@ -457,6 +458,11 @@ async def create_video_from_job(
         "ExtraInfoKeyValue4": f"PreviewSource={job_id}",
         "ExtraInfoKeyValue5": f"PreviewRenderPath={expected_render_path}",
     }
+    if presubmitted:
+        # Marks previews queued automatically while the render is still
+        # finishing; only these are reconciled (suspended/resumed/removed)
+        # against the source job. Manual previews always run as requested.
+        preview_job_info["ExtraInfoKeyValue6"] = "PreviewPresubmit=1"
     if props.get("Pool"):
         preview_job_info["Pool"] = props["Pool"]
     if props.get("SecPool"):
