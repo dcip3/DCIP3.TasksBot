@@ -155,6 +155,7 @@ async def create_video_from_job(
     specific_worker: Optional[str] = None,
     input_wait_seconds: Optional[int] = None,
     presubmitted: bool = False,
+    depends_on: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Submit a Deadline CommandLine job that generates a preview video using ffmpeg.
@@ -460,9 +461,18 @@ async def create_video_from_job(
     }
     if presubmitted:
         # Marks previews queued automatically while the render is still
-        # finishing; only these are reconciled (suspended/resumed/removed)
-        # against the source job. Manual previews always run as requested.
+        # finishing; only these are reconciled against the source job.
+        # Manual previews always run as requested.
         preview_job_info["ExtraInfoKeyValue6"] = "PreviewPresubmit=1"
+    if depends_on:
+        # Deadline holds the job in Pending until the render completes, so the
+        # preview can be queued early without ever competing with the render
+        # for machines. The farm event plugin releases it the moment the render
+        # finishes; Deadline's own pending scan is the fallback.
+        preview_job_info["JobDependencies"] = depends_on
+        preview_job_info["ResumeOnCompleteDependencies"] = "true"
+        preview_job_info["ResumeOnDeletedDependencies"] = "false"
+        preview_job_info["ResumeOnFailedDependencies"] = "false"
     if props.get("Pool"):
         preview_job_info["Pool"] = props["Pool"]
     if props.get("SecPool"):

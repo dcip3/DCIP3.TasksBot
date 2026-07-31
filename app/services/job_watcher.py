@@ -941,34 +941,21 @@ def _job_chunk_count(job: dict, key: str) -> int:
 
 
 def _presubmit_ready(job: dict, props: dict) -> bool:
-    """True when a rendering job is on its last tasks and safe to pre-submit a preview for.
+    """True when a running render should already have its preview queued.
 
-    The preview outranks render jobs by priority, so it must only enter the queue
-    once the source render has nothing left to dequeue (all tasks completed or
-    currently rendering). Otherwise a worker would babysit the waiting preview
-    instead of taking the render's own remaining tasks.
+    The preview is submitted as a Deadline dependency (Pending) of the render,
+    so it costs nothing while it waits and cannot compete with the render for
+    machines. That means it can be queued as soon as the render is really
+    running, instead of trying to catch the moment its task queue drains.
     """
-    try:
-        total_tasks = int(props.get("Tasks", 0) or 0)
-    except (TypeError, ValueError):
-        total_tasks = 0
-    if total_tasks < 2:
-        return False  # single-task jobs (incl. stills) keep the completion-time flow
-
-    # The preview whitelist derives from the render's allow list; without one the
-    # presubmitted preview could camp on an unrelated free machine while waiting.
-    from app.services.preview.render import _resolve_machine_restrictions
-
-    listed_workers, whitelist_flag = _resolve_machine_restrictions(props)
-    if not listed_workers or whitelist_flag is False:
-        return False
-
+    del props  # queueing no longer depends on the render's machine list
     if _job_chunk_count(job, "FailedChunks") > 0:
         return False
-    queued = _job_chunk_count(job, "QueuedChunks") + _job_chunk_count(job, "PendingChunks")
-    if queued > 0:
-        return False
-    return _job_chunk_count(job, "RenderingChunks") > 0
+    # Rendering or already producing frames: the job is genuinely underway.
+    return (
+        _job_chunk_count(job, "RenderingChunks") > 0
+        or _job_chunk_count(job, "CompletedChunks") > 0
+    )
 
 
 async def _run_auto_preview_presubmit(
@@ -977,7 +964,7 @@ async def _run_auto_preview_presubmit(
     job_name: str,
     default_worker: Optional[str],
 ) -> None:
-    """Submit the auto preview while the render finishes its last tasks."""
+    """Queue the auto preview as a Pending dependency of the running render."""
     from app.services.preview.runtime import _submit_auto_preview_deadline
 
     try:
@@ -989,6 +976,7 @@ async def _run_auto_preview_presubmit(
             input_wait_seconds=settings.preview_presubmit_input_wait,
             notify_on_failure=False,
             waiting_for_render=True,
+            depends_on=job_id,
         )
     except Exception as exc:
         logger.error("Auto preview presubmission failed for job %s: %s", job_id, exc)
@@ -997,7 +985,7 @@ async def _run_auto_preview_presubmit(
     if not submitted:
         # Fall back to the completion-time flow: clear the dedupe records so the
         # regular scan picks this job up once it completes.
-        auto_preview_jobs.discard((job_id, telegram_user_id))
+        auto_preview_jobs.remove((job_id, telegram_user_id))
         await _unregister_auto_preview_history(telegram_user_id, job_id)
 
 
@@ -1029,16 +1017,14 @@ def _is_presubmitted_preview(props: dict) -> bool:
 
 
 async def _reconcile_presubmitted_previews(user: "_WatcherUser", jobs: list) -> None:
-    """Keep pre-submitted preview jobs consistent with their source renders.
+    """Clean up pre-submitted previews whose render will never complete.
 
-    Only previews queued automatically ahead of render completion are touched:
-
-    - source failed or was deleted -> delete the preview, update the owner's message
-    - source has queued tasks again (requeue/suspend) -> suspend the preview so it
-      stops outranking the render's own tasks
-    - source back on its last tasks or completed -> resume a suspended preview
+    Deadline keeps these previews Pending until their dependency finishes, so
+    the only case left to handle is a render that failed or was deleted: its
+    preview would wait forever (ResumeOnFailed/DeletedDependencies are off).
+    Manually requested previews are never touched.
     """
-    from app.services.deadline import delete_job, resume_job, suspend_job
+    from app.services.deadline import delete_job
     from app.services.preview.runtime import _extract_preview_context, pop_preview_message
 
     jobs_by_id: dict[str, dict] = {}
@@ -1059,8 +1045,8 @@ async def _reconcile_presubmitted_previews(user: "_WatcherUser", jobs: list) -> 
             previews.append((entry_id, entry, props))
 
     for preview_id, preview, props in previews:
-        preview_stat = preview.get("Stat", 0)
-        if preview_stat not in {1, 2}:  # queued/rendering or suspended
+        # 1=queued/rendering, 2=suspended, 6=pending on a dependency
+        if preview.get("Stat", 0) not in {1, 2, 6}:
             continue
 
         _, _, _, target_user_id, _, source_job_id = _extract_preview_context(
@@ -1081,7 +1067,7 @@ async def _reconcile_presubmitted_previews(user: "_WatcherUser", jobs: list) -> 
                 logger.info(
                     "Watcher: removed preview %s because its %s", preview_id, reason
                 )
-                auto_preview_jobs.discard((source_job_id, target_user_id))
+                auto_preview_jobs.remove((source_job_id, target_user_id))
                 await _unregister_auto_preview_history(target_user_id, source_job_id)
                 stored_message = pop_preview_message(preview_id)
                 if stored_message:
@@ -1093,28 +1079,8 @@ async def _reconcile_presubmitted_previews(user: "_WatcherUser", jobs: list) -> 
                         )
             continue
 
-        source_stat = source.get("Stat", 0)
-        source_queued = _job_chunk_count(source, "QueuedChunks") + _job_chunk_count(
-            source, "PendingChunks"
-        )
-        if preview_stat == 1 and (source_stat == 2 or (source_stat == 1 and source_queued > 0)):
-            with contextlib.suppress(Exception):
-                if await suspend_job(user.login, user.password, preview_id):
-                    logger.info(
-                        "Watcher: suspended preview %s while source %s has queued tasks",
-                        preview_id,
-                        source_job_id,
-                    )
-        elif preview_stat == 2 and (
-            source_stat == 3 or (source_stat == 1 and source_queued == 0)
-        ):
-            with contextlib.suppress(Exception):
-                if await resume_job(user.login, user.password, preview_id):
-                    logger.info(
-                        "Watcher: resumed preview %s for source %s",
-                        preview_id,
-                        source_job_id,
-                    )
+        # Nothing else to do: Deadline holds the preview Pending until the
+        # render completes and the farm event plugin releases it immediately.
 
 
 async def _scan_auto_preview_candidates(users: list[_WatcherUser]) -> int:

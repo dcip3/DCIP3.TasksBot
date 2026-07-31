@@ -634,6 +634,7 @@ async def _submit_auto_preview_deadline(
     input_wait_seconds: Optional[int] = None,
     notify_on_failure: bool = True,
     waiting_for_render: bool = False,
+    depends_on: Optional[str] = None,
 ) -> bool:
     """Submit a Deadline preview job and register progress tracking."""
     from app.services.deadline import WorkerStatusError
@@ -653,6 +654,7 @@ async def _submit_auto_preview_deadline(
             skip_worker_validation=True,
             input_wait_seconds=input_wait_seconds,
             presubmitted=waiting_for_render,
+            depends_on=depends_on,
         )
     except PreviewSubmissionError as exc:
         if not notify_on_failure:
@@ -678,6 +680,7 @@ async def _submit_auto_preview_deadline(
                 skip_worker_validation=True,
                 input_wait_seconds=input_wait_seconds,
                 presubmitted=waiting_for_render,
+                depends_on=depends_on,
             )
         except Exception as exc:
             logger.error("Auto preview fallback submission failed for job %s: %s", job_id, exc)
@@ -696,7 +699,7 @@ async def _submit_auto_preview_deadline(
 
     preview_id = result.get("preview_job_id")
     if waiting_for_render:
-        header = f"🧾 Auto preview scheduled for {job_name} (starts right after render)"
+        header = f"🧾 Auto preview queued for {job_name} (starts right after render)"
     else:
         header = f"🧾 Auto preview queued for {job_name}"
     if fallback_used:

@@ -52,47 +52,77 @@ class PresubmitDetectionTests(unittest.TestCase):
         self.assertFalse(job_watcher._is_presubmitted_preview({}))
 
 
-class ReconcileScopeTests(unittest.IsolatedAsyncioTestCase):
-    """A rendering job with queued tasks must not suspend a manual preview."""
+class PresubmitReadyTests(unittest.TestCase):
+    """Previews are queued as soon as the render is genuinely running."""
 
-    def _jobs(self, presubmitted: bool) -> list:
+    def test_running_render_is_ready(self) -> None:
+        job = {"RenderingChunks": 2, "QueuedChunks": 34, "CompletedChunks": 0}
+        self.assertTrue(job_watcher._presubmit_ready(job, {"Tasks": 40}))
+
+    def test_render_with_finished_frames_is_ready(self) -> None:
+        job = {"RenderingChunks": 0, "QueuedChunks": 10, "CompletedChunks": 5}
+        self.assertTrue(job_watcher._presubmit_ready(job, {"Tasks": 40}))
+
+    def test_idle_or_failing_render_is_not_ready(self) -> None:
+        self.assertFalse(
+            job_watcher._presubmit_ready({"QueuedChunks": 40}, {"Tasks": 40})
+        )
+        self.assertFalse(
+            job_watcher._presubmit_ready(
+                {"RenderingChunks": 1, "FailedChunks": 1}, {"Tasks": 40}
+            )
+        )
+
+    def test_single_task_render_is_ready(self) -> None:
+        # Stills used to be excluded; with a Pending dependency they are fine.
+        job = {"RenderingChunks": 1}
+        self.assertTrue(job_watcher._presubmit_ready(job, {"Tasks": 1}))
+
+
+class ReconcileScopeTests(unittest.IsolatedAsyncioTestCase):
+    """Only pre-submitted previews of dead renders get cleaned up."""
+
+    def _jobs(self, presubmitted: bool, source_stat: int, preview_stat: int = 6) -> list:
         source = {
             "_id": "src1",
-            "Stat": 1,  # active render
+            "Stat": source_stat,
             "QueuedChunks": 34,
             "RenderingChunks": 2,
             "Props": {"Name": "Shot"},
         }
         preview = {
             "_id": "prev1",
-            "Stat": 1,  # queued preview
+            "Stat": preview_stat,  # 6 = pending on the dependency
             "Props": preview_props(presubmitted=presubmitted),
         }
         return [source, preview]
 
-    async def _reconcile(self, presubmitted: bool):
+    async def _reconcile(self, jobs: list):
         user = mock.Mock(telegram_user_id=42, login="tester", password="pw")
         with mock.patch(
             "app.services.preview.runtime._extract_preview_context",
             return_value=("", "", "", 42, {}, "src1"),
         ), mock.patch(
-            "app.services.deadline.suspend_job", new=mock.AsyncMock(return_value=True)
-        ) as suspend_mock, mock.patch(
-            "app.services.deadline.resume_job", new=mock.AsyncMock(return_value=True)
+            "app.services.preview.runtime.pop_preview_message", return_value=None
         ), mock.patch(
             "app.services.deadline.delete_job", new=mock.AsyncMock(return_value=True)
-        ) as delete_mock:
-            await job_watcher._reconcile_presubmitted_previews(user, self._jobs(presubmitted))
-        return suspend_mock, delete_mock
+        ) as delete_mock, mock.patch.object(
+            job_watcher, "_unregister_auto_preview_history", new=mock.AsyncMock()
+        ):
+            await job_watcher._reconcile_presubmitted_previews(user, jobs)
+        return delete_mock
 
-    async def test_manual_preview_untouched(self) -> None:
-        suspend_mock, delete_mock = await self._reconcile(presubmitted=False)
-        suspend_mock.assert_not_awaited()
+    async def test_pending_preview_of_running_render_untouched(self) -> None:
+        delete_mock = await self._reconcile(self._jobs(presubmitted=True, source_stat=1))
         delete_mock.assert_not_awaited()
 
-    async def test_presubmitted_preview_suspended(self) -> None:
-        suspend_mock, _ = await self._reconcile(presubmitted=True)
-        suspend_mock.assert_awaited_once()
+    async def test_pending_preview_of_failed_render_removed(self) -> None:
+        delete_mock = await self._reconcile(self._jobs(presubmitted=True, source_stat=4))
+        delete_mock.assert_awaited_once()
+
+    async def test_manual_preview_never_removed(self) -> None:
+        delete_mock = await self._reconcile(self._jobs(presubmitted=False, source_stat=4))
+        delete_mock.assert_not_awaited()
 
 
 if __name__ == "__main__":
