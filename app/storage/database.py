@@ -96,9 +96,31 @@ async def init_db():
         """
     )
 
+    # Probe scheduling state. This one MUST survive a restart: while a job is
+    # being probed most of its tasks sit suspended, and only this table tells
+    # the bot which tasks are its own to release again.
+    await tasks_db_conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS render_probe_state (
+            job_id TEXT PRIMARY KEY,
+            telegram_user_id INTEGER NOT NULL,
+            probe_task_ids TEXT NOT NULL,
+            held_task_ids TEXT NOT NULL,
+            started_at INTEGER NOT NULL,
+            released_at INTEGER
+        )
+        """
+    )
+    await tasks_db_conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_render_probe_state_released
+        ON render_probe_state(released_at)
+        """
+    )
+
     # Create indexes for better performance
     await tasks_db_conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_user_sessions_telegram_id 
+        CREATE INDEX IF NOT EXISTS idx_user_sessions_telegram_id
         ON user_sessions(telegram_user_id)
     """)
 

@@ -16,6 +16,7 @@ from app.auth import _decrypt_password
 from app.core.bot_core import bot
 from app.core.config import settings
 from app.core.ttl_cache import TTLCache
+from app.storage import probe_state
 from app.storage.database import get_db_connection
 from app.services.job_state import auto_preview_jobs, notified_jobs
 from app.services.preview.runtime import (
@@ -51,6 +52,9 @@ _MISSING_PREVIEW_STRIKES = 3
 _AUTO_PREVIEW_HISTORY_RETENTION_SECONDS = 14 * 24 * 60 * 60
 _AUTO_PREVIEW_HISTORY_CLEANUP_INTERVAL_SECONDS = 60 * 60
 _ERROR_REPORT_SCAN_INTERVAL_SECONDS = 10
+# Probing only acts at the very start of a render and once its probes land, so
+# it does not need to run as often as the preview scans.
+_PROBE_SCAN_INTERVAL_SECONDS = 30
 _ERROR_REPORT_MAX_AGE_SECONDS = 24 * 60 * 60
 _ERROR_ALERT_CACHE_TTL_SECONDS = 14 * 24 * 60 * 60
 _last_auto_preview_history_cleanup_monotonic = 0.0
@@ -1341,6 +1345,66 @@ async def _scan_auto_preview_candidates(users: list[_WatcherUser]) -> int:
     return total_scheduled
 
 
+def _job_belongs_to(job: dict, props: dict, user: "_WatcherUser") -> bool:
+    """Only the job's own submitter probes it, so two users never both hold it."""
+    return _job_matches_scope("own", user.login, props, job)
+
+
+async def _scan_render_probes(users: list[_WatcherUser]) -> None:
+    """Drive the probe phase of active renders, so the ETA has a cost curve.
+
+    Cheap by design: it only touches Active render jobs the user submitted, and
+    only fetches a task list for those.
+    """
+    from app.services import probe_scheduler
+    from app.services.deadline import get_job_tasks_by_user_id, get_jobs_by_credentials
+
+    # Backstop first - this must run even if every user below fails.
+    try:
+        await probe_scheduler.release_stale_probes()
+    except Exception as exc:
+        logger.warning("Watcher: stale probe sweep failed: %s", exc)
+
+    for user in users:
+        try:
+            jobs = await get_jobs_by_credentials(user.login, user.password, use_cache=True)
+        except Exception as exc:
+            logger.warning(
+                "Watcher: failed to load jobs for probing (user %s): %s",
+                user.telegram_user_id,
+                exc,
+            )
+            continue
+
+        for job in jobs:
+            if not isinstance(job, dict):
+                continue
+            job_id = str(job.get("_id") or "").strip()
+            if not job_id or job.get("Stat") != 1 or not job.get("OutDir"):
+                continue
+            props = job.get("Props") or {}
+            if not isinstance(props, dict):
+                props = {}
+            if _is_preview_job(props) or not _job_belongs_to(job, props, user):
+                continue
+
+            try:
+                state = await probe_state.get_probe_state(job_id)
+                if state is not None and state.released_at is not None:
+                    continue
+                tasks = await get_job_tasks_by_user_id(user.telegram_user_id, job_id)
+                if not tasks:
+                    continue
+                if state is None:
+                    await probe_scheduler.start_probing(
+                        user.telegram_user_id, job_id, tasks
+                    )
+                else:
+                    await probe_scheduler.release_if_ready(job_id, tasks)
+            except Exception as exc:
+                logger.warning("Watcher: probe handling failed for %s: %s", job_id, exc)
+
+
 async def _filter_suspended_auth_users(users: list[_WatcherUser]) -> list[_WatcherUser]:
     """Drop users whose stored Deadline credentials are rejected (401 loop).
 
@@ -1383,6 +1447,7 @@ async def job_progress_watcher(bot) -> None:
     next_interval = settings.job_watcher_interval_normal
     next_auto_scan_at = 0.0
     next_error_scan_at = 0.0
+    next_probe_scan_at = 0.0
     try:
         while True:
             loop_started = time.monotonic()
@@ -1414,6 +1479,12 @@ async def job_progress_watcher(bot) -> None:
             elif not auto_enabled_users:
                 next_auto_scan_at = 0.0
 
+            if users and loop_started >= next_probe_scan_at:
+                await _scan_render_probes(users)
+                next_probe_scan_at = loop_started + _PROBE_SCAN_INTERVAL_SECONDS
+            elif not users:
+                next_probe_scan_at = 0.0
+
             notification_users = [user for user in users if user.notifications_enabled]
             if notification_users and loop_started >= next_error_scan_at:
                 alerts_sent = await _scan_error_reports_candidates(notification_users)
@@ -1440,5 +1511,6 @@ async def job_progress_watcher(bot) -> None:
                 logger.info("Watcher woken by farm event; scanning immediately")
                 next_auto_scan_at = 0.0
                 next_error_scan_at = 0.0
+                next_probe_scan_at = 0.0
     except asyncio.CancelledError:
         logger.info("Job progress watcher cancelled")

@@ -19,6 +19,7 @@ from app.bot.job_helpers import (
 )
 from app.core.config import settings
 from app.core.ui_helpers import authorized_only, back_inline_button, inline_button
+from app.services import render_cost
 from app.services.deadline import (
     delete_job_by_user_id,
     get_job_tasks_by_user_id,
@@ -342,6 +343,9 @@ def _count_active_renderers(tasks: list[dict]) -> int:
         active_workers.add(_task_worker_key(task, idx))
     return len(active_workers)
 
+_in_flight_frames = render_cost.in_flight_frames
+
+
 def _get_frame_progress_metrics(tasks: list[dict]) -> tuple[float, float] | None:
     if not tasks:
         return None
@@ -361,11 +365,17 @@ def _get_frame_progress_metrics(tasks: list[dict]) -> tuple[float, float] | None
         if stat == 5:
             completed_frames += frames
             continue
-        prog_ratio = _parse_progress_ratio(task.get("Prog"))
-        if prog_ratio is None:
+        if stat not in {3, 4}:
             continue
-        if stat in {3, 4}:
-            completed_frames += frames * prog_ratio
+        prog_ratio = _parse_progress_ratio(task.get("Prog"))
+        done = frames * prog_ratio if prog_ratio is not None else 0.0
+        # Deadline's task progress only ticks over on whole frames (1 of 5 =
+        # 20%), so the bar would jump 20/40/60. The plugin status carries the
+        # frame in flight and how far into it we are - fold that in.
+        in_flight = _in_flight_frames(task)
+        if in_flight is not None:
+            done = max(done, in_flight)
+        completed_frames += min(done, float(frames))
 
     if completed_frames > total_frames:
         completed_frames = total_frames
@@ -377,11 +387,10 @@ def _compute_progress_from_tasks(tasks: list[dict], total_tasks: int) -> str | N
         return None
     total_frames, completed = metrics
     percent = int((completed / total_frames) * 100) if total_frames else 0
-    done_str = (
-        str(int(round(completed)))
-        if abs(completed - round(completed)) < 0.05
-        else f"{completed:.1f}"
-    )
+    # The percentage carries the partially rendered frame so the bar creeps
+    # instead of jumping a whole chunk at a time; the frame counter stays whole,
+    # since "156.9/290 frames" reads as noise rather than detail.
+    done_str = str(int(completed))
     total_str = (
         str(int(round(total_frames)))
         if abs(total_frames - round(total_frames)) < 0.05
@@ -821,6 +830,43 @@ def _extract_preview_meta(props: dict) -> tuple[bool, str | None]:
     return is_preview_job, source_id
 
 
+# How much of the frame range the samples must span before the cost curve is
+# allowed to speak. Below this it is interpolating over stretches it has never
+# seen, which is exactly the guesswork the curve exists to avoid.
+_COST_MODEL_MIN_COVERAGE = 0.60
+
+
+def _format_eta_clock(seconds: float) -> str:
+    """H:MM:SS, with hours running past 24 instead of rolling into days.
+
+    str(timedelta) renders a day and a half as "1 day, 12:00:00", which the
+    display formatter cannot parse - and long renders are exactly the case this
+    estimator exists for.
+    """
+    total = max(int(seconds), 0)
+    return f"{total // 3600}:{(total % 3600) // 60:02d}:{total % 60:02d}"
+
+
+def _cost_model_eta(
+    tasks: list[dict],
+    active_renderers: int,
+    now_utc: datetime,
+) -> float | None:
+    """ETA from the frame-cost curve, or None if the samples don't support one."""
+    if active_renderers <= 0:
+        return None
+    try:
+        samples = render_cost.collect_samples(tasks, now_utc)
+        if not samples:
+            return None
+        if render_cost.coverage(samples) < _COST_MODEL_MIN_COVERAGE:
+            return None
+        return render_cost.estimate_remaining_seconds(samples, active_renderers)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Cost-model ETA failed, falling back: %s", exc)
+        return None
+
+
 def _calculate_eta(
     job_id: str | None,
     tasks: list[dict],
@@ -835,6 +881,15 @@ def _calculate_eta(
             return eta_str
 
         active_renderers = _count_active_renderers(tasks)
+
+        # Preferred path: model cost as a curve over the frame range. Only
+        # trustworthy once the observations span most of the range, which is
+        # what the probe scheduler arranges; otherwise fall through to the
+        # throughput estimate below.
+        cost_eta = _cost_model_eta(tasks, active_renderers, now_utc)
+        if cost_eta is not None:
+            return _format_eta_clock(cost_eta)
+
         metrics = _get_frame_progress_metrics(tasks)
         if metrics is not None:
             total_frames, completed_frames = metrics

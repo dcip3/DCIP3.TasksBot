@@ -6,7 +6,18 @@ import asyncio
 import json
 import logging
 import time
-from typing import Optional, List, Dict, Any, Tuple, Union, Callable, Awaitable, TypeVar
+from typing import (
+    Optional,
+    List,
+    Dict,
+    Any,
+    Sequence,
+    Tuple,
+    Union,
+    Callable,
+    Awaitable,
+    TypeVar,
+)
 from pathlib import Path
 
 import aiohttp
@@ -1131,6 +1142,84 @@ async def _put_job_command(login: str, password: str, command: str, job_id: str)
     except Exception as exc:
         logger.error("Error during %s job: %s", command, exc)
         return False
+
+
+_PUT_TASK_COMMANDS = ("suspend", "resume", "requeue")
+
+
+async def _put_task_command(
+    login: str,
+    password: str,
+    command: str,
+    job_id: str,
+    task_ids: Sequence[int | str],
+) -> bool:
+    """Send a PUT /tasks command for specific tasks of a job.
+
+    The payload key MUST be "TaskList". Deadline accepts other spellings
+    (e.g. "TaskIDs") but silently ignores the selection and applies the
+    command to *every* task of the job, which would suspend a whole render.
+    """
+    if command not in _PUT_TASK_COMMANDS:
+        raise ValueError(f"Unsupported task command: {command}")
+    ids = [str(task_id) for task_id in task_ids]
+    if not ids:
+        # An empty selection is never a no-op on Deadline's side - refuse it.
+        logger.warning("Refusing to %s tasks of %s: empty task list", command, job_id)
+        return False
+    try:
+        session = await get_aiosession()
+        auth = aiohttp.BasicAuth(login, password)
+        async with session.put(
+            f"{settings.deadline_api_url}/tasks",
+            json={"Command": command, "JobID": job_id, "TaskList": ids},
+            auth=auth,
+            ssl=settings.deadline_tls_verify,
+        ) as resp:
+            body = (await resp.text()).strip()
+            if resp.status != 200 or body.lower().startswith("error"):
+                logger.error(
+                    "Failed to %s tasks %s of %s: %s %s",
+                    command,
+                    ids,
+                    job_id,
+                    resp.status,
+                    body[:120],
+                )
+                return False
+            _invalidate_jobs_cache(login)
+            return True
+    except Exception as exc:
+        logger.error("Error during %s tasks of %s: %s", command, job_id, exc)
+        return False
+
+
+async def suspend_tasks_by_user_id(
+    telegram_user_id: int, job_id: str, task_ids: Sequence[int | str]
+) -> bool:
+    """Suspend the given tasks of a job (used to hold back non-probe tasks)."""
+    return await _with_user_credentials(
+        telegram_user_id,
+        default=False,
+        operation_name=f"suspend tasks of {job_id}",
+        call=lambda login, password: _put_task_command(
+            login, password, "suspend", job_id, task_ids
+        ),
+    )
+
+
+async def resume_tasks_by_user_id(
+    telegram_user_id: int, job_id: str, task_ids: Sequence[int | str]
+) -> bool:
+    """Resume previously suspended tasks of a job."""
+    return await _with_user_credentials(
+        telegram_user_id,
+        default=False,
+        operation_name=f"resume tasks of {job_id}",
+        call=lambda login, password: _put_task_command(
+            login, password, "resume", job_id, task_ids
+        ),
+    )
 
 
 async def _job_command_by_user_id(
