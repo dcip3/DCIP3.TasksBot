@@ -85,13 +85,20 @@ class SilentAutoPreviewTests(unittest.IsolatedAsyncioTestCase):
                 "Stat": 6,  # pending on its render
                 "Props": {
                     "Name": "Shot - Preview",
-                    "ExDic": {"PreviewJob": "1", "PreviewTelegram": "42"},
+                    "ExDic": {
+                        "PreviewJob": "1",
+                        "PreviewTelegram": "42",
+                        "PreviewSource": "render1",
+                    },
                 },
             },
             {"_id": "render1", "Stat": 1, "Props": {"Name": "Shot"}},
         ]
         targets = await self._targets(user, farm_jobs)
         self.assertEqual(targets, [("prevA", user)])
+        # The link back to the render is re-learned, so the bot can release the
+        # preview itself when that render finishes.
+        self.assertEqual(runtime.preview_tracked_jobs.get("prevA"), (42, "render1"))
 
     async def test_other_users_previews_are_ignored(self) -> None:
         user = mock.Mock(telegram_user_id=42, login="tester", password="pw")

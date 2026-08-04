@@ -75,5 +75,40 @@ async def handle_deadline_event(request: web.Request) -> web.Response:
     except Exception as exc:
         logger.warning("Could not invalidate jobs cache on farm event: %s", exc)
 
+    if event == "job_finished" and job_id:
+        # Do not make the farm wait for the HTTP response.
+        asyncio.create_task(release_previews_waiting_on(job_id))
+
     request_watcher_wakeup(f"{event} {job_id}")
     return web.Response(status=200, text="ok")
+
+
+async def release_previews_waiting_on(source_job_id: str) -> int:
+    """Release preview jobs held Pending by the render that just finished.
+
+    The worker asks for its next task within seconds of finishing, so a preview
+    still sitting in Pending loses the machine to an unrelated job. The farm
+    event plugin does this locally too; doing it here as well keeps the timing
+    right even if the plugin on the farm is outdated or was not reloaded.
+    """
+    from app.services.deadline import release_pending_job_by_user_id
+    from app.services.preview.runtime import preview_tracked_jobs
+
+    waiting = [
+        (preview_id, owner_id)
+        for preview_id, (owner_id, tracked_source) in preview_tracked_jobs.items()
+        if tracked_source == source_job_id
+    ]
+    released = 0
+    for preview_id, owner_id in waiting:
+        try:
+            if await release_pending_job_by_user_id(owner_id, preview_id):
+                released += 1
+                logger.info(
+                    "Released preview %s waiting on finished render %s",
+                    preview_id,
+                    source_job_id,
+                )
+        except Exception as exc:
+            logger.warning("Could not release preview %s: %s", preview_id, exc)
+    return released

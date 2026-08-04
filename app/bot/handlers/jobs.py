@@ -656,9 +656,10 @@ def _build_job_info_text(
     if match:
         percent = int(match.group(1))
         counts = match.group(2)
-        lines.append(
-            f"<code>{_progress_bar(percent)}</code> {percent}% · {html.escape(counts)}"
-        )
+        # Bar and percentage read as one thing; the frame counter gets its own
+        # line so neither has to be hunted for inside a long row.
+        lines.append(f"<code>{_progress_bar(percent)}</code> {percent}%")
+        lines.append(f"🎞️ {html.escape(counts)}")
     elif progress_str:
         lines.append(f"⏳ {html.escape(str(progress_str))}")
 

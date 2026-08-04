@@ -63,7 +63,10 @@ class JobCardTests(unittest.TestCase):
         self.assertIn("SHB_city_ID_v019", lines[1])
         self.assertEqual(lines[2], "")  # blank line separates identity from state
         self.assertIn("🟢 Active", lines[3])
-        self.assertIn("53% · 156/290", lines[4])
+        # Bar+percent and the counter live on separate lines.
+        self.assertTrue(lines[4].endswith("53%"))
+        self.assertIn("░", lines[4])
+        self.assertEqual(lines[5], "🎞️ 156/290")
         self.assertIn("1 h 47 min left", text)
 
     def test_zero_errors_are_not_shown(self) -> None:

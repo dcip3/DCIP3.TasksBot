@@ -1106,7 +1106,7 @@ async def submit_deadline_job(
     return submission_response
 
 
-_PUT_JOB_COMMANDS = ("requeue", "resume", "suspend")
+_PUT_JOB_COMMANDS = ("requeue", "resume", "suspend", "releasepending")
 
 
 async def _put_job_command(login: str, password: str, command: str, job_id: str) -> bool:
@@ -1162,6 +1162,16 @@ async def resume_job(login: str, password: str, job_id: str) -> bool:
 async def resume_job_by_user_id(telegram_user_id: int, job_id: str) -> bool:
     """Resume a suspended job using telegram user ID."""
     return await _job_command_by_user_id(telegram_user_id, "resume", job_id)
+
+
+async def release_pending_job_by_user_id(telegram_user_id: int, job_id: str) -> bool:
+    """Release a job waiting on a dependency (Pending -> Queued).
+
+    Deadline's own pending scan runs only every few minutes, which is far too
+    slow for previews: the worker that just finished the render would pick up
+    an unrelated task in the meantime.
+    """
+    return await _job_command_by_user_id(telegram_user_id, "releasepending", job_id)
 
 
 async def suspend_job(login: str, password: str, job_id: str) -> bool:

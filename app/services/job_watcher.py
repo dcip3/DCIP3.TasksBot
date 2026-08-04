@@ -796,7 +796,23 @@ async def _collect_active_preview_targets(
             owner_id = _extract_preview_owner_id(props, user.telegram_user_id)
             if owner_id != user.telegram_user_id:
                 continue
-            _add(str(job.get("_id") or "").strip(), user)
+            preview_job_id = str(job.get("_id") or "").strip()
+            _add(preview_job_id, user)
+
+            # Re-learn which render each preview waits on, so a restarted bot
+            # can still release them the moment that render finishes.
+            if preview_job_id and preview_job_id not in preview_tracked_jobs:
+                from app.services.preview.runtime import (
+                    _extract_preview_context,
+                    track_preview_job,
+                )
+
+                try:
+                    *_, source_job_id = _extract_preview_context(props, owner_id)
+                except Exception:
+                    source_job_id = None
+                if source_job_id and preview_job_id not in preview_message_registry:
+                    track_preview_job(preview_job_id, owner_id, source_job_id)
 
     # Freshly submitted previews may not be in the cached listing yet.
     for preview_job_id, (chat_id, _message_id) in preview_message_registry.items():
