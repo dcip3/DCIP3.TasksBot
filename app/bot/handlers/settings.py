@@ -27,6 +27,7 @@ from app.core.ui_helpers import (
     authorized_only,
     back_inline_button,
     close_inline_button,
+    close_menu,
     inline_button,
     selectable_inline_button,
 )
@@ -438,8 +439,9 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
         )
 
     if action == "close":
-        await _edit_or_send(callback_query.message, "Settings closed.")
-        await callback_query.answer()
+        # Closing should leave nothing behind; "Settings closed." only shows up
+        # when Telegram refuses to delete the message.
+        await close_menu(callback_query, "Settings closed.")
         return
 
     if action == "update":

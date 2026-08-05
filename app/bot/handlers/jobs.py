@@ -18,15 +18,23 @@ from app.bot.job_helpers import (
     truncate_cell,
 )
 from app.core.config import settings
-from app.core.ui_helpers import authorized_only, back_inline_button, inline_button
+from app.core.ui_helpers import (
+    authorized_only,
+    back_inline_button,
+    close_inline_button,
+    close_menu,
+    inline_button,
+)
 from app.services import render_cost
 from app.services.deadline import (
     delete_job_by_user_id,
+    get_job_info_by_user_id,
     get_job_tasks_by_user_id,
     get_jobs_list,
     get_worker_infosettings_by_user_id,
     get_workers_list,
     requeue_job_by_user_id,
+    resume_failed_job_by_user_id,
     resume_job_by_user_id,
     save_worker_settings_by_user_id,
     suspend_job_by_user_id,
@@ -592,11 +600,12 @@ def _build_workers_overview(
 
     inline_keyboard.append(
         [
+            close_inline_button(callback_data="workers_close"),
             inline_button(
                 text="🔄 Update",
                 callback_data=f"workers_update:{page}",
                 style="primary",
-            )
+            ),
         ]
     )
 
@@ -642,6 +651,35 @@ def _humanize_eta(eta_str: str) -> str:
     return f"{hours} h {minutes} min"
 
 
+def _job_render_seconds(job: dict, now_utc: datetime | None = None) -> float | None:
+    """Wall time the render has taken: start of rendering to finish, or to now.
+
+    Deliberately measured from DateStart rather than submission - a job can sit
+    queued for hours, and that waiting is not render time.
+    """
+    if not isinstance(job, dict):
+        return None
+    started = render_cost._parse_datetime(job.get("DateStart"))
+    if started is None:
+        return None
+    finished = render_cost._parse_datetime(job.get("DateComp"))
+    end = finished or (now_utc or datetime.now(timezone.utc))
+    seconds = (end - started).total_seconds()
+    return seconds if seconds > 0 else None
+
+
+def _humanize_duration(seconds: float) -> str:
+    """Short, readable duration: "8 h 21 min", "47 min", "38 s"."""
+    total = int(seconds)
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours} h {minutes:02d} min"
+    if minutes:
+        return f"{minutes} min"
+    return f"{secs} s"
+
+
 def _build_job_info_text(
     *,
     batch_name: str,
@@ -651,6 +689,7 @@ def _build_job_info_text(
     progress_str: str,
     errors_count: int,
     eta_str: str,
+    render_seconds: float | None = None,
 ) -> str:
     """Job card: name first, then status, a progress bar and anything notable."""
     icon = _JOB_STATUS_ICONS.get(str(stat_name), "❔")
@@ -672,10 +711,18 @@ def _build_job_info_text(
     elif progress_str:
         lines.append(f"⏳ {html.escape(str(progress_str))}")
 
+    # One clock, read left to right: time already spent, then time still to go.
+    # Two separate clock lines looked like two unrelated metrics. The elapsed
+    # half stays after the render ends, when the ETA half has nothing to say.
+    time_parts: list[str] = []
+    if render_seconds:
+        time_parts.append(html.escape(_humanize_duration(render_seconds)))
     if stat in {1, 6}:
         eta_human = _humanize_eta(eta_str)
         if eta_human and eta_human.upper() != "N/A":
-            lines.append(f"⏱️ {html.escape(eta_human)} left")
+            time_parts.append(f"{html.escape(eta_human)} left")
+    if time_parts:
+        lines.append("⏱️ " + " · ".join(time_parts))
 
     if errors_count:
         suffix = "" if int(errors_count) == 1 else "s"
@@ -1045,7 +1092,16 @@ def _build_job_action_buttons(
     buttons: list[InlineKeyboardButton] = []
     if not job_id:
         return buttons
-    if stat != 3:
+    if stat == 4:
+        # A failed job takes its own command - Requeue and Suspend answer
+        # Success on it but leave it Failed, so they are not offered here.
+        buttons.append(
+            InlineKeyboardButton(
+                text="▶️ Resume failed",
+                callback_data=f"resume_failed_job:{job_id}",
+            )
+        )
+    elif stat != 3:
         if stat == 2:
             buttons.append(
                 InlineKeyboardButton(text="▶️ Resume", callback_data=f"resume_job:{job_id}")
@@ -1108,7 +1164,7 @@ def _build_job_info_keyboard(
     if job_id:
         inline_keyboard.append(
             [
-                back_inline_button(callback_data="jobs_back"),
+                close_inline_button(callback_data="job_close"),
                 inline_button(
                     text="🔄 Update",
                     callback_data=f"job_update:{job_id}",
@@ -1118,7 +1174,7 @@ def _build_job_info_keyboard(
         )
     else:
         inline_keyboard.append(
-            [back_inline_button(callback_data="jobs_back")]
+            [close_inline_button(callback_data="job_close")]
         )
 
     return InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
@@ -1329,7 +1385,12 @@ async def jobs_page_callback(callback_query: CallbackQuery) -> None:
 
 @router.callback_query(lambda c: c.data == "jobs_back")
 async def jobs_back_callback(callback_query: CallbackQuery) -> None:
-    """Return from job info view back to the first jobs page."""
+    """Return from job info view back to the first jobs page.
+
+    No current keyboard emits this any more - the job card closes instead - but
+    job cards already sitting in chats still carry the old Back button, and a
+    button that does nothing is worse than one that still works.
+    """
     await callback_query.answer()
 
     if callback_query.from_user is None or callback_query.message is None:
@@ -1351,6 +1412,18 @@ async def jobs_back_callback(callback_query: CallbackQuery) -> None:
             "Error occurred while fetching jobs.",
             parse_mode=None,
         )
+
+
+@router.callback_query(lambda c: c.data == "job_close")
+async def job_close_callback(callback_query: CallbackQuery) -> None:
+    """Dismiss a job card, removing it from the chat."""
+    await close_menu(callback_query, "Job info closed.")
+
+
+@router.callback_query(lambda c: c.data == "workers_close")
+async def workers_close_callback(callback_query: CallbackQuery) -> None:
+    """Dismiss the workers list, removing it from the chat."""
+    await close_menu(callback_query, "Workers closed.")
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("jobs_update:"))
@@ -1477,6 +1550,7 @@ async def job_info_callback(callback_query: CallbackQuery) -> None:
                 progress_str=progress_str,
                 errors_count=errors_count,
                 eta_str=eta_str,
+                render_seconds=_job_render_seconds(job),
             )
 
             is_preview_job, preview_source_id = _extract_preview_meta(props)
@@ -1558,6 +1632,7 @@ async def job_update_callback(callback_query: CallbackQuery) -> None:
             progress_str=progress_str,
             errors_count=errors_count,
             eta_str=eta_str,
+            render_seconds=_job_render_seconds(selected_job),
         )
 
         is_preview_job, preview_source_id = _extract_preview_meta(props)
@@ -1849,6 +1924,20 @@ async def requeue_job_callback(callback_query: CallbackQuery) -> None:
     job_id = callback_query.data.split(":", 1)[1]
 
     try:
+        # Job cards already sitting in chats still offer Requeue on failed jobs,
+        # where Deadline reports Success and changes nothing. Route those to the
+        # command that actually works.
+        job_info = await get_job_info_by_user_id(callback_query.from_user.id, job_id)
+        if isinstance(job_info, dict) and job_info.get("Stat") == 4:
+            success = await resume_failed_job_by_user_id(
+                callback_query.from_user.id, job_id
+            )
+            await callback_query.answer(
+                "Failed tasks requeued!" if success else "Failed to resume job.",
+                show_alert=not success,
+            )
+            return
+
         success = await requeue_job_by_user_id(callback_query.from_user.id, job_id)
         if success:
             await callback_query.answer("Job requeued successfully!")
@@ -1859,6 +1948,28 @@ async def requeue_job_callback(callback_query: CallbackQuery) -> None:
             "Error requeuing job for user %s", callback_query.from_user.id
         )
         await callback_query.answer("Error occurred while requeuing job.", show_alert=True)
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("resume_failed_job:"))
+async def resume_failed_job_callback(callback_query: CallbackQuery) -> None:
+    """Put a failed job back to work by requeueing its failed tasks."""
+    if callback_query.from_user is None or callback_query.data is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+
+    job_id = callback_query.data.split(":", 1)[1]
+
+    try:
+        success = await resume_failed_job_by_user_id(callback_query.from_user.id, job_id)
+        if success:
+            await callback_query.answer("Failed tasks requeued!")
+        else:
+            await callback_query.answer("Failed to resume job.", show_alert=True)
+    except Exception:
+        logger.exception(
+            "Error resuming failed job for user %s", callback_query.from_user.id
+        )
+        await callback_query.answer("Error occurred while resuming job.", show_alert=True)
 
 
 @router.callback_query(lambda c: c.data and c.data.startswith("resume_job:"))

@@ -78,6 +78,28 @@ def cancel_inline_button(callback_data: str, text: str = "✖️ Cancel") -> Inl
     return inline_button(text=text, callback_data=callback_data, style="danger")
 
 
+async def close_menu(callback_query: Any, fallback_text: str = "Closed.") -> None:
+    """Close a menu by deleting its message, leaving no trace in the chat.
+
+    Telegram refuses to delete messages older than 48 hours (and in a few other
+    cases), so when the delete fails we fall back to replacing the menu with a
+    short line - better than leaving a dead keyboard behind.
+    """
+    message = getattr(callback_query, "message", None)
+    if message is None:
+        await callback_query.answer()
+        return
+
+    try:
+        await message.delete()
+    except Exception:
+        try:
+            await message.edit_text(fallback_text, reply_markup=None)
+        except Exception:
+            pass
+    await callback_query.answer()
+
+
 def selectable_inline_button(
     *,
     text: str,

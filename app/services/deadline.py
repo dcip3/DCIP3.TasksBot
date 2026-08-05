@@ -1117,7 +1117,13 @@ async def submit_deadline_job(
     return submission_response
 
 
-_PUT_JOB_COMMANDS = ("requeue", "resume", "suspend", "releasepending")
+_PUT_JOB_COMMANDS = (
+    "requeue",
+    "resume",
+    "suspend",
+    "releasepending",
+    "resumefailed",
+)
 
 
 async def _put_job_command(login: str, password: str, command: str, job_id: str) -> bool:
@@ -1241,6 +1247,17 @@ async def requeue_job(login: str, password: str, job_id: str) -> bool:
 async def requeue_job_by_user_id(telegram_user_id: int, job_id: str) -> bool:
     """Requeue a job using telegram user ID."""
     return await _job_command_by_user_id(telegram_user_id, "requeue", job_id)
+
+
+async def resume_failed_job_by_user_id(telegram_user_id: int, job_id: str) -> bool:
+    """Put a Failed job back to work by requeueing its failed tasks.
+
+    A failed job needs its own command. Sending "resume" or "requeue" to one is
+    not an error - Deadline answers Success - but the job stays Failed, which is
+    exactly how this looked like a working button for so long. Verified against
+    the live farm; harmless on jobs that are not failed.
+    """
+    return await _job_command_by_user_id(telegram_user_id, "resumefailed", job_id)
 
 
 async def resume_job(login: str, password: str, job_id: str) -> bool:
