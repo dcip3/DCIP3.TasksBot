@@ -7,11 +7,13 @@ from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 
 from app.auth import (
     authenticate_user,
+    get_deadline_credentials,
     is_authorized,
     logout_user,
     save_deadline_credentials,
 )
 from app.core.ui_helpers import cancel_inline_button, get_main_keyboard
+from app.services.deadline import is_auth_suspended
 
 logger = logging.getLogger(__name__)
 
@@ -39,16 +41,27 @@ async def cmd_login_start(message: Message, state: FSMContext) -> None:
         await message.answer("Error: User information not available.")
         return
 
-    if await is_authorized(message.from_user.id):
-        await message.answer("You are already authorized.")
-        return
+    # Never refuse to start. When the farm rejects stored credentials the bot
+    # tells the user to /login, and answering "You are already authorized."
+    # left them with no way to replace a password Deadline no longer accepts.
+    intro = "Enter your Deadline login:"
+    credentials = await get_deadline_credentials(message.from_user.id)
+    if credentials:
+        stored_login = credentials[0]
+        if is_auth_suspended(stored_login):
+            intro = (
+                f"Deadline is rejecting the stored credentials for {stored_login}.\n\n"
+                "Enter your Deadline login:"
+            )
+        else:
+            intro = (
+                f"Signed in as {stored_login}. New credentials will replace them.\n\n"
+                "Enter your Deadline login:"
+            )
 
     await state.clear()
     await state.set_state(LoginStates.USERNAME)
-    await message.answer(
-        "Enter your Deadline login:",
-        reply_markup=build_login_cancel_keyboard(),
-    )
+    await message.answer(intro, reply_markup=build_login_cancel_keyboard())
 
 
 @router.message(StateFilter(LoginStates.USERNAME))

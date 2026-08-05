@@ -69,8 +69,12 @@ def back_inline_button(callback_data: str, text: str = "⬅️ Back") -> InlineK
 
 
 def close_inline_button(callback_data: str, text: str = "✖️ Close") -> InlineKeyboardButton:
-    """Create a red-styled close button."""
-    return inline_button(text=text, callback_data=callback_data, style="danger")
+    """Create a blue-styled close button.
+
+    Closing a menu destroys nothing, so it does not warrant the red reserved for
+    destructive actions like Delete.
+    """
+    return inline_button(text=text, callback_data=callback_data, style="primary")
 
 
 def cancel_inline_button(callback_data: str, text: str = "✖️ Cancel") -> InlineKeyboardButton:
