@@ -44,6 +44,43 @@ class ProbePlanningTests(unittest.TestCase):
         samples = render_cost.collect_samples(job_tasks(3))
         self.assertEqual(probe_scheduler.plan_initial_probes(samples), [])
 
+    def test_adaptive_probe_avoids_a_task_already_being_measured(self) -> None:
+        """The real slip on SHB_city_main_v004.
+
+        Task 0 was done, 28 was rendering far enough along to count, and 14 was
+        rendering but below the confidence threshold, so it was not a curve
+        point. The gap 0..28 therefore looked unsampled and the probe landed on
+        task 15 - right next to a measurement already on its way.
+        """
+        tasks = job_tasks(58)
+        tasks[0].update(
+            {
+                "Stat": render_cost.TASK_COMPLETED,
+                "StartRen": "2026-08-05T21:53:30+00:00",
+                "Comp": "2026-08-05T21:56:30+00:00",
+            }
+        )
+        tasks[14].update(
+            {
+                "Stat": render_cost.TASK_RENDERING,
+                "StartRen": "2026-08-05T21:53:29+00:00",
+                "Prog": "5 %",  # too early to trust as a sample
+            }
+        )
+        tasks[28].update(
+            {
+                "Stat": render_cost.TASK_RENDERING,
+                "StartRen": "2026-08-05T21:54:17+00:00",
+                "Prog": "60 %",
+            }
+        )
+        samples = render_cost.collect_samples(tasks)
+        picked = probe_scheduler.pick_adaptive_probe(samples)
+
+        self.assertIsNotNone(picked)
+        self.assertNotIn(picked, (13, 15), "probe placed next to task 14, which is mid-render")
+        self.assertNotEqual(picked, 14)
+
     def test_adaptive_probe_targets_the_steepest_gap(self) -> None:
         tasks = job_tasks(20)
         # Cheap at both ends, one huge jump between task 10 and 15.
@@ -291,6 +328,70 @@ class ProbeLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 patch.stop()
         self.assertTrue(released)
         self.assertEqual(self.resumed, [[1, 2, 3, 5, 6, 7, 8]])
+
+    async def test_a_queued_probe_is_never_overtaken(self) -> None:
+        """The failure seen on SHB_city_main_v004.
+
+        This is the exact state at 22:00 that day: both refining probes spent,
+        two workers busy (7 and 28), and exactly two dispatchable tasks left -
+        probes 43 and 57. The old rule compared dispatchable tasks against busy
+        workers, saw 2 against 2, found the refinement budget exhausted and
+        released all 51 held tasks. Deadline then handed the next free worker
+        task 1, because it dispatches the lowest available id, so probes 43 and
+        57 were left for hours and the far half of the range went unmeasured.
+        """
+        probes = [0, 14, 28, 43, 57, 15, 7]  # five spread, two refining
+        tasks = job_tasks(58)
+        for i in (0, 14, 15):
+            tasks[i]["Stat"] = render_cost.TASK_COMPLETED
+        for i in (7, 28):
+            tasks[i]["Stat"] = render_cost.TASK_RENDERING
+        state = probe_state.ProbeState(
+            job_id="job1",
+            telegram_user_id=42,
+            probe_task_ids=probes,
+            held_task_ids=[i for i in range(58) if i not in probes],
+            started_at=int(time.time()),
+            released_at=None,
+        )
+        patches = self._patches(state)
+        for patch in patches:
+            patch.start()
+        try:
+            released = await probe_scheduler.release_if_ready("job1", tasks)
+        finally:
+            for patch in patches:
+                patch.stop()
+
+        self.assertFalse(released, "probes 43/57 still queued - nothing may be released")
+        self.assertEqual(self.resumed, [])
+
+    async def test_moves_on_once_every_probe_has_started(self) -> None:
+        """No probe left waiting means a freeing worker needs something else."""
+        tasks = job_tasks(58)
+        for i in (0, 14, 28, 43):
+            tasks[i]["Stat"] = render_cost.TASK_COMPLETED
+        tasks[57]["Stat"] = render_cost.TASK_RENDERING
+        state = probe_state.ProbeState(
+            job_id="job1",
+            telegram_user_id=42,
+            probe_task_ids=[0, 14, 28, 43, 57],
+            held_task_ids=[i for i in range(58) if i not in (0, 14, 28, 43, 57)],
+            started_at=int(time.time()),
+            released_at=None,
+        )
+        patches = self._patches(state)
+        for patch in patches:
+            patch.start()
+        try:
+            released = await probe_scheduler.release_if_ready("job1", tasks)
+        finally:
+            for patch in patches:
+                patch.stop()
+
+        # Either a refining probe went out, or the remainder did - but the
+        # scheduler did not just sit there.
+        self.assertTrue(released or self.resumed, "a free worker would have idled")
 
     async def test_spare_slot_goes_to_a_refining_probe_first(self) -> None:
         """When the queue needs topping up, spend it on the least-certain gap."""

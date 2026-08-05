@@ -54,7 +54,7 @@ _AUTO_PREVIEW_HISTORY_CLEANUP_INTERVAL_SECONDS = 60 * 60
 _ERROR_REPORT_SCAN_INTERVAL_SECONDS = 10
 # Probing only acts at the very start of a render and once its probes land, so
 # it does not need to run as often as the preview scans.
-_PROBE_SCAN_INTERVAL_SECONDS = 30
+_PROBE_SCAN_INTERVAL_SECONDS = 10
 _ERROR_REPORT_MAX_AGE_SECONDS = 24 * 60 * 60
 _ERROR_ALERT_CACHE_TTL_SECONDS = 14 * 24 * 60 * 60
 _last_auto_preview_history_cleanup_monotonic = 0.0

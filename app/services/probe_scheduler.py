@@ -35,6 +35,7 @@ from app.services.render_cost import (
     TASK_SUSPENDED,
     TaskSample,
     build_curve,
+    cost_at,
     collect_samples,
 )
 from app.storage import probe_state
@@ -99,9 +100,24 @@ def pick_adaptive_probe(samples: list[TaskSample]) -> int | None:
         return None
     by_frame = sorted(samples, key=lambda s: s.midpoint)
 
-    best_score = 0.0
+    # Split the range at every position already measured *or being measured*.
+    # A task that is rendering will deliver its sample shortly, so a probe next
+    # to it buys nothing - going by curve points alone once put a probe on task
+    # 15 while task 14 was mid-render, learning almost nothing.
+    covered = sorted(
+        {x for x, _ in curve}
+        | {
+            s.midpoint
+            for s in samples
+            if s.stat in (TASK_COMPLETED, TASK_RENDERING)
+        }
+    )
+    if len(covered) < 2:
+        return None
+
+    best_key: tuple[float, float] = (0.0, 0.0)
     best_task: int | None = None
-    for (x0, y0), (x1, y1) in zip(curve, curve[1:]):
+    for x0, x1 in zip(covered, covered[1:]):
         inner = [
             s
             for s in by_frame
@@ -109,9 +125,14 @@ def pick_adaptive_probe(samples: list[TaskSample]) -> int | None:
         ]
         if not inner:
             continue
-        score = abs(y1 - y0) * (x1 - x0)
-        if score > best_score:
-            best_score = score
+        y0 = cost_at(curve, x0)
+        y1 = cost_at(curve, x1)
+        span = x1 - x0
+        # Prefer the stretch where cost moves most; when nothing is known about
+        # the cost yet, fall back to simply the widest unmeasured stretch.
+        key = (abs((y1 or 0.0) - (y0 or 0.0)) * span, span)
+        if key > best_key:
+            best_key = key
             best_task = inner[len(inner) // 2].task_id
     return best_task
 
@@ -181,18 +202,22 @@ async def _release(state: probe_state.ProbeState, reason: str) -> bool:
 
 
 async def release_if_ready(job_id: str, tasks: list[dict]) -> bool:
-    """Keep the render fed, spending spare capacity on probes while we can.
+    """Release the held tasks once our probes have all been handed out.
 
-    Waiting for every probe to *finish* before releasing would idle machines:
-    with three workers and five probes, the third worker has nothing left to
-    pick up once the last two probes are claimed. So the rule is not "probes
-    done" but "never let the queue run dry" - as soon as there are no longer
-    more dispatchable tasks than busy workers, we hand something over.
+    The rule is about probes, not about tasks in general. Deadline gives a free
+    worker the lowest-numbered *available* task, so while everything but the
+    probes is suspended, a worker that finishes always picks up the next probe -
+    no machine idles and no probe gets overtaken.
 
-    That spare slot goes to a refining probe while the budget lasts (this is
-    what lifts the estimate from ~0.8x to ~0.95x), and after that the whole
-    remainder is released. A failed task can then send a worker back to the
-    start of the range, which is a fair trade against machines sitting idle.
+    Waiting for probes to *finish* would idle machines; releasing the whole
+    remainder to avoid that (the first attempt at this) is worse still, because
+    tasks 1, 2, 3... immediately outrank the probes further along and those end
+    up running hours later. Handing out exactly one probe at a time is what
+    satisfies both.
+
+    Once no probe is left waiting, spare capacity goes to a refining probe while
+    the budget lasts - that is what lifts the estimate from ~0.8x to ~0.95x -
+    and after that the whole remainder is released.
     """
     state = await probe_state.get_probe_state(job_id)
     if state is None or state.released_at is not None or not state.held_task_ids:
@@ -203,13 +228,20 @@ async def release_if_ready(job_id: str, tasks: list[dict]) -> bool:
 
     samples = collect_samples(tasks)
     held = set(state.held_task_ids)
-    busy_workers = sum(1 for s in samples if s.stat == TASK_RENDERING)
-    dispatchable = [
-        s for s in samples if s.stat == TASK_QUEUED and s.task_id not in held
+    by_id = {s.task_id: s for s in samples}
+
+    # Hold while any probe of ours is still waiting to start. Deadline hands a
+    # free worker the lowest-numbered *available* task, so as long as everything
+    # else stays suspended, that task is a probe - nobody idles and the probes
+    # keep their head start. Releasing the whole remainder instead (as this used
+    # to) instantly demotes the later probes behind tasks 1, 2, 3... and they end
+    # up running hours later, which defeats the point of probing at all.
+    pending_probes = [
+        task_id
+        for task_id in state.probe_task_ids
+        if task_id in by_id and by_id[task_id].stat == TASK_QUEUED
     ]
-    # Strictly more than busy workers means the next one to free up has a task
-    # waiting for it. At equality the queue is one worker away from running dry.
-    if len(dispatchable) > busy_workers:
+    if pending_probes:
         return False
 
     if len(state.probe_task_ids) < INITIAL_PROBES + ADAPTIVE_PROBES:
