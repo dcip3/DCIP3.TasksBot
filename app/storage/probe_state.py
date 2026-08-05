@@ -40,6 +40,21 @@ class ProbeState:
         return max(int(time.time()) - self.started_at, 0)
 
 
+def _require_connection():
+    """The shared aiosqlite connection.
+
+    `get_db_connection()` is a plain function returning an already-connected
+    handle - it must NOT be awaited. Awaiting an aiosqlite Connection runs its
+    startup again, which raises "threads can only be started once" on a live
+    one. That is how every probe-state call failed in production while the
+    surrounding try/except turned it into a log line nobody read.
+    """
+    conn = get_db_connection()
+    if conn is None:
+        raise RuntimeError("Database is not initialised")
+    return conn
+
+
 def _encode(task_ids: list[int]) -> str:
     return ",".join(str(int(task_id)) for task_id in task_ids)
 
@@ -74,7 +89,7 @@ async def save_probe_state(
     probe_task_ids: list[int],
     held_task_ids: list[int],
 ) -> None:
-    conn = await get_db_connection()
+    conn = _require_connection()
     await conn.execute(
         """
         INSERT INTO render_probe_state
@@ -97,7 +112,7 @@ async def save_probe_state(
 
 
 async def get_probe_state(job_id: str) -> ProbeState | None:
-    conn = await get_db_connection()
+    conn = _require_connection()
     async with conn.execute(
         """
         SELECT job_id, telegram_user_id, probe_task_ids, held_task_ids, started_at, released_at
@@ -111,7 +126,7 @@ async def get_probe_state(job_id: str) -> ProbeState | None:
 
 async def list_unreleased_probes() -> list[ProbeState]:
     """Every job that still has tasks the bot is holding back."""
-    conn = await get_db_connection()
+    conn = _require_connection()
     async with conn.execute(
         """
         SELECT job_id, telegram_user_id, probe_task_ids, held_task_ids, started_at, released_at
@@ -123,7 +138,7 @@ async def list_unreleased_probes() -> list[ProbeState]:
 
 
 async def mark_probe_released(job_id: str) -> None:
-    conn = await get_db_connection()
+    conn = _require_connection()
     await conn.execute(
         "UPDATE render_probe_state SET released_at = ?, held_task_ids = '' WHERE job_id = ?",
         (int(time.time()), job_id),
@@ -132,13 +147,13 @@ async def mark_probe_released(job_id: str) -> None:
 
 
 async def delete_probe_state(job_id: str) -> None:
-    conn = await get_db_connection()
+    conn = _require_connection()
     await conn.execute("DELETE FROM render_probe_state WHERE job_id = ?", (job_id,))
     await conn.commit()
 
 
 async def cleanup_probe_state(max_age_seconds: int = 7 * 24 * 60 * 60) -> None:
-    conn = await get_db_connection()
+    conn = _require_connection()
     await conn.execute(
         "DELETE FROM render_probe_state WHERE released_at IS NOT NULL AND released_at < ?",
         (int(time.time()) - max_age_seconds,),
