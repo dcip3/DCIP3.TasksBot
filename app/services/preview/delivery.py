@@ -9,6 +9,8 @@ extracts that common tail so both call sites share one implementation.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
@@ -16,12 +18,57 @@ from typing import Awaitable, Callable, Optional
 from aiogram.types import FSInputFile, InlineKeyboardMarkup
 
 from app.core.bot_core import bot
-from app.integrations.video_helpers import VideoDeliveryPreparation
+from app.integrations.video_helpers import (
+    VideoDeliveryPreparation,
+    make_video_thumbnail,
+    probe_video_metadata,
+)
 from app.services.job_state import notified_jobs
 from app.services.preview.state import preview_state
 
 logger = logging.getLogger(__name__)
 PREVIEW_IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
+
+
+async def _send_video_with_shape(chat_id: int, video_path: Path, caption: str) -> None:
+    """Send a preview, telling Telegram what shape it is.
+
+    Without explicit width/height and a matching thumbnail, Telegram clients
+    guess the player geometry - and phones in particular guess square, which
+    squashes a 3:2 render. Desktop usually gets it right, which is why this only
+    showed up on mobile. Both the dimensions and the poster frame are read from
+    the file actually being sent, so a video the bot re-compressed still reports
+    its real size.
+    """
+    metadata = await asyncio.to_thread(probe_video_metadata, video_path)
+    thumb_path = await asyncio.to_thread(make_video_thumbnail, video_path)
+
+    kwargs: dict = {}
+    if metadata:
+        kwargs.update(
+            width=metadata.width,
+            height=metadata.height,
+            supports_streaming=True,
+        )
+        if metadata.duration:
+            kwargs["duration"] = metadata.duration
+    else:
+        logger.warning("No video metadata for %s; Telegram will guess", video_path)
+    if thumb_path:
+        kwargs["thumbnail"] = FSInputFile(str(thumb_path))
+
+    try:
+        await bot.send_video(
+            chat_id,
+            FSInputFile(str(video_path)),
+            caption=caption,
+            parse_mode="HTML",
+            **kwargs,
+        )
+    finally:
+        if thumb_path:
+            with contextlib.suppress(Exception):
+                thumb_path.unlink()
 
 
 def is_preview_image_path(path: str | Path) -> bool:
@@ -116,12 +163,7 @@ async def send_ready_preview_video(
             parse_mode="HTML",
         )
     else:
-        await bot.send_video(
-            chat_id,
-            FSInputFile(str(preparation.video_path)),
-            caption=caption,
-            parse_mode="HTML",
-        )
+        await _send_video_with_shape(chat_id, preparation.video_path, caption)
 
     await _delete_message(chat_id, ready_message_id)
 

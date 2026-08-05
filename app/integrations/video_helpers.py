@@ -197,6 +197,127 @@ async def prepare_video_for_delivery(
         was_compressed=was_compressed,
     )
 
+@dataclass
+class VideoMetadata:
+    """What Telegram needs in order to lay a video out correctly."""
+
+    width: int
+    height: int
+    duration: int
+
+
+def probe_video_metadata(video_path: Path) -> Optional[VideoMetadata]:
+    """Read display dimensions and duration straight from the file being sent.
+
+    Uses the *display* aspect ratio, not the coded one: a stream stored with a
+    non-square pixel aspect would otherwise report dimensions that make Telegram
+    lay the player out wrong.
+    """
+    ffprobe_bin = "ffprobe"
+    if settings.ffmpeg_path and settings.ffmpeg_path != "ffmpeg":
+        candidate = Path(settings.ffmpeg_path).with_name("ffprobe")
+        if candidate.exists():
+            ffprobe_bin = str(candidate)
+    try:
+        probe = subprocess.run(
+            [
+                ffprobe_bin,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height,sample_aspect_ratio:format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=0",
+                str(video_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except Exception as exc:
+        logger.warning("ffprobe unavailable for %s: %s", video_path, exc)
+        return None
+    if probe.returncode != 0:
+        logger.warning("ffprobe failed for %s: %s", video_path, (probe.stderr or "")[:200])
+        return None
+
+    values: dict[str, str] = {}
+    for line in (probe.stdout or "").splitlines():
+        key, _, value = line.partition("=")
+        if key:
+            values[key.strip()] = value.strip()
+
+    try:
+        width = int(values["width"])
+        height = int(values["height"])
+    except (KeyError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+
+    sar = values.get("sample_aspect_ratio") or ""
+    if ":" in sar and sar not in ("0:1", "1:1", "N/A"):
+        try:
+            sar_num, sar_den = (int(part) for part in sar.split(":", 1))
+            if sar_num > 0 and sar_den > 0:
+                width = max(1, round(width * sar_num / sar_den))
+        except ValueError:
+            pass
+
+    duration = 0
+    try:
+        duration = max(0, round(float(values.get("duration") or 0)))
+    except ValueError:
+        duration = 0
+
+    return VideoMetadata(width=width, height=height, duration=duration)
+
+
+def make_video_thumbnail(video_path: Path) -> Optional[Path]:
+    """Grab a poster frame for the video, matching its aspect ratio.
+
+    Telegram clients size the player from the thumbnail. Without one they pick
+    a shape themselves, which is how a 3:2 preview ends up square on phones.
+    Telegram requires JPEG, at most 320px on a side and under 200 kB.
+    """
+    ffmpeg_bin = settings.ffmpeg_path or "ffmpeg"
+    thumb_path = video_path.parent / f"{video_path.stem}_thumb.jpg"
+    try:
+        subprocess.run(
+            [
+                ffmpeg_bin,
+                "-y",
+                "-i",
+                str(video_path),
+                "-frames:v",
+                "1",
+                # Fit inside 320x320 without padding, keeping square pixels.
+                "-vf",
+                "scale='if(gt(a,1),320,-2)':'if(gt(a,1),-2,320)',setsar=1",
+                "-q:v",
+                "4",
+                str(thumb_path),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=120,
+        )
+    except Exception as exc:
+        logger.warning("Could not build thumbnail for %s: %s", video_path, exc)
+        return None
+
+    if not thumb_path.exists() or thumb_path.stat().st_size == 0:
+        return None
+    if thumb_path.stat().st_size > 200 * 1024:
+        with contextlib.suppress(Exception):
+            thumb_path.unlink()
+        return None
+    return thumb_path
+
+
 def cleanup_job_files(job_id: str):
     """
     Clean up temporary files for a specific job.
