@@ -403,6 +403,46 @@ class ProbeLifecycleTests(unittest.IsolatedAsyncioTestCase):
         # scheduler did not just sit there.
         self.assertTrue(released or self.resumed, "a free worker would have idled")
 
+    async def test_a_burst_of_machines_is_fed_in_one_go(self) -> None:
+        """Machines can join mid-render; one probe per scan would strand them.
+
+        Six workers are busy on probes and none is left queued. Handing out a
+        single refining probe per 10-second scan would leave several machines
+        with nothing for the better part of a minute.
+        """
+        tasks = job_tasks(58)
+        probes = [0, 14, 28, 43, 57]
+        for i in probes[:1]:
+            tasks[i]["Stat"] = render_cost.TASK_COMPLETED
+            tasks[i]["StartRen"] = "2026-08-05T10:00:00+00:00"
+            tasks[i]["Comp"] = "2026-08-05T10:05:00+00:00"
+        for i in probes[1:]:
+            tasks[i]["Stat"] = render_cost.TASK_RENDERING
+            tasks[i]["StartRen"] = "2026-08-05T10:00:00+00:00"
+            tasks[i]["Prog"] = "60 %"
+        state = probe_state.ProbeState(
+            job_id="job1",
+            telegram_user_id=42,
+            probe_task_ids=probes,
+            held_task_ids=[i for i in range(58) if i not in probes],
+            started_at=int(time.time()),
+            released_at=None,
+        )
+        patches = self._patches(state)
+        for patch in patches:
+            patch.start()
+        try:
+            released = await probe_scheduler.release_if_ready("job1", tasks)
+        finally:
+            for patch in patches:
+                patch.stop()
+
+        self.assertFalse(released)
+        self.assertEqual(len(self.resumed), 1, "should be a single batched call")
+        batch = self.resumed[0]
+        self.assertGreater(len(batch), 1, "one probe per scan strands the rest")
+        self.assertEqual(len(batch), len(set(batch)), "same task handed out twice")
+
     async def test_spare_slot_goes_to_a_refining_probe_first(self) -> None:
         """When the queue needs topping up, spend it on the least-certain gap."""
         tasks = job_tasks(20)

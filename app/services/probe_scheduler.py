@@ -97,7 +97,10 @@ def plan_initial_probes(samples: list[TaskSample]) -> list[int]:
     return picked
 
 
-def pick_adaptive_probe(samples: list[TaskSample]) -> int | None:
+def pick_adaptive_probe(
+    samples: list[TaskSample],
+    exclude: frozenset[int] = frozenset(),
+) -> int | None:
     """The unrendered chunk that would tell us the most.
 
     Straight interpolation between evenly spaced probes flattens narrow peaks -
@@ -138,7 +141,9 @@ def pick_adaptive_probe(samples: list[TaskSample]) -> int | None:
         inner = [
             s
             for s in by_frame
-            if x0 < s.midpoint < x1 and s.stat in (TASK_QUEUED, TASK_SUSPENDED)
+            if x0 < s.midpoint < x1
+            and s.stat in (TASK_QUEUED, TASK_SUSPENDED)
+            and s.task_id not in exclude
         ]
         if not inner:
             continue
@@ -262,22 +267,34 @@ async def release_if_ready(job_id: str, tasks: list[dict]) -> bool:
     if pending_probes:
         return False
 
-    if len(state.probe_task_ids) < INITIAL_PROBES + ADAPTIVE_PROBES:
-        extra = pick_adaptive_probe(samples)
-        if extra is not None and extra in held:
-            ok = await deadline.resume_tasks_by_user_id(
-                state.telegram_user_id, job_id, [extra]
-            )
-            if ok:
-                await probe_state.save_probe_state(
-                    job_id,
-                    state.telegram_user_id,
-                    list(state.probe_task_ids) + [extra],
-                    [t for t in state.held_task_ids if t != extra],
-                )
-                logger.info("Refining cost curve of %s with probe task %s", job_id, extra)
-                return False
+    # More capacity than probes - machines that just joined would sit idle while
+    # we handed out one probe per scan - so top up for everyone at once.
+    busy_workers = sum(1 for s in samples if s.stat == TASK_RENDERING)
+    budget = INITIAL_PROBES + ADAPTIVE_PROBES - len(state.probe_task_ids)
+    wanted = min(budget, max(1, busy_workers))
 
+    extras: list[int] = []
+    while len(extras) < wanted:
+        extra = pick_adaptive_probe(samples, exclude=frozenset(extras))
+        if extra is None or extra not in held:
+            break
+        extras.append(extra)
+
+    if extras:
+        ok = await deadline.resume_tasks_by_user_id(
+            state.telegram_user_id, job_id, extras
+        )
+        if ok:
+            await probe_state.save_probe_state(
+                job_id,
+                state.telegram_user_id,
+                list(state.probe_task_ids) + extras,
+                [t for t in state.held_task_ids if t not in extras],
+            )
+            logger.info("Refining cost curve of %s with probe tasks %s", job_id, extras)
+            return False
+
+    # Budget spent, or nothing left worth measuring: everyone gets fed.
     return await _release(state, "queue would otherwise run dry")
 
 
