@@ -82,6 +82,48 @@ class ProbePlanningTests(unittest.TestCase):
         self.assertNotIn(picked, (13, 15), "probe placed next to task 14, which is mid-render")
         self.assertNotEqual(picked, 14)
 
+    def test_a_batch_of_probes_spreads_out(self) -> None:
+        """Seen on SHB_city_main_v005: both refining probes went to 35 and 36.
+
+        Excluding the first pick from the candidate list was not enough - the
+        span it sat in stayed whole, so the second pick landed in the middle of
+        it again, one task away. Two adjacent chunks measure the same thing.
+        """
+        tasks = [
+            {
+                "TaskID": i,
+                "Frames": f"{921 + i * 5}-{925 + i * 5}",
+                "Stat": render_cost.TASK_QUEUED,
+            }
+            for i in range(58)
+        ]
+        # The real curve from that job: cheap ends, expensive middle.
+        for task_id, minutes in ((0, 4), (14, 4), (28, 15), (43, 16), (57, 4)):
+            tasks[task_id].update(
+                {
+                    "Stat": render_cost.TASK_COMPLETED,
+                    "StartRen": "2026-08-06T22:00:00+00:00",
+                    "Comp": (
+                        datetime(2026, 8, 6, 22, 0, tzinfo=timezone.utc)
+                        + timedelta(minutes=minutes)
+                    ).isoformat(),
+                }
+            )
+        samples = render_cost.collect_samples(tasks)
+
+        picks: list[int] = []
+        for _ in range(2):
+            pick = probe_scheduler.pick_adaptive_probe(
+                samples, exclude=frozenset(picks)
+            )
+            self.assertIsNotNone(pick)
+            picks.append(pick)
+
+        self.assertEqual(len(set(picks)), 2)
+        self.assertGreater(
+            abs(picks[0] - picks[1]), 3, f"probes {picks} measure the same stretch"
+        )
+
     def test_adaptive_probe_targets_the_stretch_holding_the_render_time(self) -> None:
         """Where being wrong costs the most, not where the curve is steepest.
 

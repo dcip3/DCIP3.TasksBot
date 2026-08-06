@@ -120,16 +120,18 @@ def pick_adaptive_probe(
         return None
     by_frame = sorted(samples, key=lambda s: s.midpoint)
 
-    # Split the range at every position already measured *or being measured*.
-    # A task that is rendering will deliver its sample shortly, so a probe next
-    # to it buys nothing - going by curve points alone once put a probe on task
-    # 15 while task 14 was mid-render, learning almost nothing.
+    # Split the range at every position already measured, being measured, or
+    # just handed out in this same batch. A task that is rendering will deliver
+    # its sample shortly, so a probe next to it buys nothing - going by curve
+    # points alone once put a probe on task 15 while task 14 was mid-render, and
+    # ignoring `exclude` here once sent a pair of probes to tasks 35 and 36,
+    # which between them measured the same thing twice.
     covered = sorted(
         {x for x, _ in curve}
         | {
             s.midpoint
             for s in samples
-            if s.stat in (TASK_COMPLETED, TASK_RENDERING)
+            if s.stat in (TASK_COMPLETED, TASK_RENDERING) or s.task_id in exclude
         }
     )
     if len(covered) < 2:
