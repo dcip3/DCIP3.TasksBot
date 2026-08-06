@@ -42,8 +42,18 @@ from app.storage import probe_state
 
 logger = logging.getLogger(__name__)
 
-# Spread this many probes across the range, then refine the steepest stretch.
+# Spread this many probes across the range, then refine where the time is.
 INITIAL_PROBES = 5
+# Two refinements, measured over nine finished jobs on this farm (integral of
+# the cost curve against what the job actually cost):
+#
+#     refinements   median   worst under   worst over   mean |error|
+#          +1        1.03       0.94          1.45          9%
+#          +2        1.04       0.97          1.17          6%
+#          +3        1.03       0.94          1.23          5%
+#
+# +2 has the best worst case in the direction that matters: promising less time
+# than a render takes is what makes the estimate feel broken.
 ADAPTIVE_PROBES = 2
 # Below this a job is too short for probing to tell us anything useful.
 MIN_TASKS_FOR_PROBING = 4
@@ -90,10 +100,17 @@ def plan_initial_probes(samples: list[TaskSample]) -> list[int]:
 def pick_adaptive_probe(samples: list[TaskSample]) -> int | None:
     """The unrendered chunk that would tell us the most.
 
-    Straight interpolation between evenly spaced probes flattens a narrow peak -
-    on v027 it read the 80-minute stretch as ~22 minutes. So once the initial
-    probes are in, we spend the next one in the middle of whichever gap shows
-    the largest cost swing, which is where the curve is least trustworthy.
+    Straight interpolation between evenly spaced probes flattens narrow peaks -
+    on SHB_city_main_v004 the chord across the middle read a 62-minute chunk as
+    23 minutes, and the whole estimate ran ~25% short for the entire render.
+
+    Probes therefore go where the *render time* is, not where the curve is
+    steepest. Chasing the steepest slope sounds right but keeps landing on the
+    cheap end of a ramp. Over nine finished jobs on this farm, with two
+    refinements each:
+
+        by slope       median 1.03x, worst under 0.83x
+        by cost mass   median 1.04x, worst under 0.97x
     """
     curve = build_curve(samples)
     if len(curve) < 2:
@@ -125,12 +142,13 @@ def pick_adaptive_probe(samples: list[TaskSample]) -> int | None:
         ]
         if not inner:
             continue
-        y0 = cost_at(curve, x0)
-        y1 = cost_at(curve, x1)
+        y0 = cost_at(curve, x0) or 0.0
+        y1 = cost_at(curve, x1) or 0.0
         span = x1 - x0
-        # Prefer the stretch where cost moves most; when nothing is known about
-        # the cost yet, fall back to simply the widest unmeasured stretch.
-        key = (abs((y1 or 0.0) - (y0 or 0.0)) * span, span)
+        # Roughly how much render time this stretch holds - that is where being
+        # wrong costs the most. Falls back to the widest unmeasured stretch when
+        # no cost is known yet.
+        key = ((y0 + y1) / 2.0 * span, span)
         if key > best_key:
             best_key = key
             best_task = inner[len(inner) // 2].task_id

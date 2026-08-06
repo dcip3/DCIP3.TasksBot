@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -81,23 +82,32 @@ class ProbePlanningTests(unittest.TestCase):
         self.assertNotIn(picked, (13, 15), "probe placed next to task 14, which is mid-render")
         self.assertNotEqual(picked, 14)
 
-    def test_adaptive_probe_targets_the_steepest_gap(self) -> None:
+    def test_adaptive_probe_targets_the_stretch_holding_the_render_time(self) -> None:
+        """Where being wrong costs the most, not where the curve is steepest.
+
+        Tasks 0-10 ramp steeply from 1 to 50 minutes; tasks 10-19 sit flat but
+        expensive at ~50 minutes. Chasing the steepest slope lands in the ramp,
+        which is mostly cheap frames. Chasing render time lands in the plateau -
+        and on real jobs that was the difference between an integral of 0.82x
+        and 0.94x.
+        """
         tasks = job_tasks(20)
-        # Cheap at both ends, one huge jump between task 10 and 15.
-        for task_id, seconds in ((0, 50), (10, 50), (15, 5000), (19, 5200)):
+        for task_id, minutes in ((0, 1), (10, 50), (19, 53)):
             tasks[task_id] = {
                 "TaskID": task_id,
                 "Frames": f"{1 + task_id * 5}-{5 + task_id * 5}",
                 "Stat": render_cost.TASK_COMPLETED,
                 "StartRen": "2026-08-05T10:00:00+00:00",
-                "Comp": f"2026-08-05T10:00:{seconds % 60:02d}+00:00"
-                if seconds < 60
-                else "2026-08-05T11:23:20+00:00",
+                "Comp": (
+                    datetime(2026, 8, 5, 10, 0, tzinfo=timezone.utc)
+                    + timedelta(minutes=minutes)
+                ).isoformat(),
             }
         samples = render_cost.collect_samples(tasks)
         picked = probe_scheduler.pick_adaptive_probe(samples)
+
         self.assertIsNotNone(picked)
-        self.assertTrue(10 < picked < 15, picked)
+        self.assertTrue(10 < picked < 19, f"picked {picked}, expected the costly plateau")
 
 
 class ProbeSuspensionSafetyTests(unittest.IsolatedAsyncioTestCase):
