@@ -410,6 +410,18 @@ def _compute_progress_from_tasks(tasks: list[dict], total_tasks: int) -> str | N
     )
     return f"{percent}% {done_str}/{total_str}"
 
+def _jobs_action_row(page: int) -> list[InlineKeyboardButton]:
+    """Close and Update, kept on their own row away from the paging arrows."""
+    return [
+        close_inline_button(callback_data="jobs_close"),
+        inline_button(
+            text="🔄 Update",
+            callback_data=f"jobs_update:{page}",
+            style="primary",
+        ),
+    ]
+
+
 def _build_jobs_overview(
     combined_jobs: list[dict],
     page: int,
@@ -471,16 +483,13 @@ def _build_jobs_overview(
 
         total_items = len(combined_jobs)
         total_pages = (total_items + JOBS_PAGE_SIZE - 1) // JOBS_PAGE_SIZE
+
+        # Paging on its own row, then the actions. Update used to sit between
+        # Back and Next, so the two halves of one control were split apart by a
+        # button that does something else entirely.
         nav_buttons = []
         if page > 0:
             nav_buttons.append(back_inline_button(callback_data=f"jobs_page:{page-1}"))
-        nav_buttons.append(
-            inline_button(
-                text="🔄 Update",
-                callback_data=f"jobs_update:{page}",
-                style="primary",
-            )
-        )
         if (page + 1) < total_pages:
             nav_buttons.append(
                 back_inline_button(
@@ -490,13 +499,18 @@ def _build_jobs_overview(
             )
         if nav_buttons:
             inline_keyboard.append(nav_buttons)
+        inline_keyboard.append(_jobs_action_row(page))
 
         keyboard = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
         page_info = f"Page {page+1} of {total_pages}"
         text = f"<pre>{header}\n{batch_text}\n{page_info}</pre>\n\nSelect a job for details:"
         return text, keyboard
 
-    return f"<pre>{header}\n{batch_text}</pre>", None
+    # No jobs to pick from, but the message still deserves a way out.
+    return (
+        f"<pre>{header}\n{batch_text}</pre>",
+        InlineKeyboardMarkup(inline_keyboard=[_jobs_action_row(page)]),
+    )
 
 
 def _worker_name(worker: dict) -> str:
@@ -1422,6 +1436,12 @@ async def jobs_back_callback(callback_query: CallbackQuery) -> None:
 async def job_close_callback(callback_query: CallbackQuery) -> None:
     """Dismiss a job card, removing it from the chat."""
     await close_menu(callback_query, "Job info closed.")
+
+
+@router.callback_query(lambda c: c.data == "jobs_close")
+async def jobs_close_callback(callback_query: CallbackQuery) -> None:
+    """Dismiss the jobs list, removing it from the chat."""
+    await close_menu(callback_query, "Jobs closed.")
 
 
 @router.callback_query(lambda c: c.data == "workers_close")

@@ -74,10 +74,42 @@ class CloseButtonWiringTests(unittest.TestCase):
             self.assertIn("job_close", payloads, job_id)
             self.assertNotIn("jobs_back", payloads, job_id)
 
+    def _jobs_rows(self, count: int, page: int) -> list[list[str]]:
+        from app.bot.handlers import jobs
+
+        combined = [
+            {
+                "_id": f"j{i}",
+                "Stat": 3,
+                "CompletedChunks": 58,
+                "Props": {"Name": f"batch_{i}", "Tasks": 58, "BatchName": f"batch_{i}"},
+            }
+            for i in range(count)
+        ]
+        _, keyboard = jobs._build_jobs_overview(combined, page)
+        self.assertIsNotNone(keyboard, "every jobs message needs a way out")
+        return [[b.text for b in row] for row in keyboard.inline_keyboard]
+
+    def test_paging_and_actions_are_on_separate_rows(self) -> None:
+        """Update used to sit between Back and Next, splitting one control."""
+        rows = self._jobs_rows(18, 1)
+        self.assertEqual(rows[-1], ["✖️ Close", "🔄 Update"])
+        nav = rows[-2]
+        self.assertIn("⬅️ Back", nav)
+        self.assertIn("Next ➡️", nav)
+        self.assertNotIn("🔄 Update", nav)
+
+    def test_actions_present_without_paging(self) -> None:
+        for count in (4, 0):
+            with self.subTest(jobs=count):
+                self.assertEqual(
+                    self._jobs_rows(count, 0)[-1], ["✖️ Close", "🔄 Update"]
+                )
+
     def test_close_handlers_are_registered(self) -> None:
         from app.bot.handlers import jobs
 
-        for data in ("job_close", "workers_close"):
+        for data in ("job_close", "jobs_close", "workers_close", "tasks_close"):
             matched = any(
                 any(f.callback(mock.Mock(data=data)) for f in handler.filters or [])
                 for handler in jobs.router.callback_query.handlers
