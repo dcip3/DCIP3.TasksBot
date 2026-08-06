@@ -46,6 +46,10 @@ router = Router()
 
 _PROGRESS_RE = re.compile(r"(\d+(?:\.\d+)?)")
 _FRAMES_RE = re.compile(r"^\s*(-?\d+)(?:\s*-\s*(-?\d+)(?:\s*x\s*(\d+))?)?\s*$")
+# Rows per page in the task breakdown. Sized so a typical 58-chunk job stays on
+# one page while a job chunked frame-by-frame still fits Telegram's 4096-char
+# message limit with room to spare.
+TASKS_PAGE_SIZE = 60
 _ETA_HISTORY_TTL_SECONDS = 3 * 60 * 60
 _ETA_SHORT_WINDOW_SECONDS = 7 * 60
 _ETA_LONG_WINDOW_SECONDS = 25 * 60
@@ -2088,6 +2092,178 @@ async def delete_job_cancel_callback(callback_query: CallbackQuery) -> None:
     await callback_query.answer("Deletion cancelled.", show_alert=False)
 
 
+def _task_icon(stat: int) -> str:
+    if stat == 5:
+        return "✅"
+    if stat == 4:
+        return "▶️"
+    if stat == 3:
+        return "⏸️"
+    if stat == 6:
+        return "❌"
+    if stat in (2, 8):
+        return "⏳"
+    return "❓"
+
+
+def _task_duration(task: dict, now_utc: datetime) -> str:
+    """How long the task ran, compact: "3:45", or "1:04:12" past the hour."""
+    stat = task.get("Stat", 1)
+    start_str = task.get("StartRen")
+    if not start_str or str(start_str).startswith("0001-01-01"):
+        return ""
+    try:
+        start_time = datetime.fromisoformat(str(start_str)).astimezone(timezone.utc)
+        if stat == 5:
+            comp_str = task.get("Comp")
+            if not comp_str or str(comp_str).startswith("0001-01-01"):
+                return ""
+            end = datetime.fromisoformat(str(comp_str)).astimezone(timezone.utc)
+        elif stat == 4:
+            end = now_utc
+        else:
+            return ""
+    except Exception:  # pragma: no cover - defensive
+        return ""
+
+    total = int((end - start_time).total_seconds())
+    if total < 0:
+        return ""
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def _build_tasks_view(
+    tasks: list[dict],
+    job_id: str,
+    page: int,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Task breakdown, sized to fit a phone and split into pages.
+
+    Columns are measured from the data rather than fixed: the old layout was 43
+    characters wide, which wrapped by a single character on mobile. Paging keeps
+    the message well inside Telegram's 4096-character limit even for a job
+    chunked one frame at a time.
+    """
+    now_utc = datetime.now(timezone.utc)
+    total_pages = max(1, (len(tasks) + TASKS_PAGE_SIZE - 1) // TASKS_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    page_tasks = tasks[page * TASKS_PAGE_SIZE : (page + 1) * TASKS_PAGE_SIZE]
+
+    rows: list[tuple[str, str, str, str]] = []
+    for task in page_tasks:
+        frames = str(task.get("Frames") or "")
+        progress = re.sub(r"\s+", "", str(task.get("Prog") or "")) or "-"
+        rows.append(
+            (
+                _task_icon(task.get("Stat", 1)),
+                frames,
+                progress,
+                _task_duration(task, now_utc),
+            )
+        )
+
+    frame_width = max([len("Frames")] + [len(r[1]) for r in rows])
+    prog_width = max([len("Prog")] + [len(r[2]) for r in rows])
+    time_width = max([len("Time")] + [len(r[3]) for r in rows])
+
+    # Rows are prefixed with a status icon, so the header shifts by that much
+    # to keep the columns lined up underneath it.
+    label_width = frame_width + 2
+    total_width = label_width + prog_width + time_width + 4
+    lines = [
+        f"{'Frames':<{label_width}}  {'Prog':>{prog_width}}  {'Time':>{time_width}}".rstrip(),
+        "-" * total_width,
+    ]
+    for icon, frames, progress, duration in rows:
+        lines.append(
+            (
+                f"{icon} {_escape_pre(frames):<{frame_width}}  "
+                f"{_escape_pre(progress):>{prog_width}}  "
+                f"{_escape_pre(duration):>{time_width}}"
+            ).rstrip()
+        )
+
+    text = "<pre>" + "\n".join(lines) + "</pre>"
+    if total_pages > 1:
+        text += f"\nPage {page+1} of {total_pages}"
+
+    keyboard: list[list[InlineKeyboardButton]] = []
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(back_inline_button(callback_data=f"tasks_page:{job_id}:{page-1}"))
+    if page + 1 < total_pages:
+        nav.append(
+            back_inline_button(
+                callback_data=f"tasks_page:{job_id}:{page+1}",
+                text="Next ➡️",
+            )
+        )
+    if nav:
+        keyboard.append(nav)
+    keyboard.append(
+        [
+            close_inline_button(callback_data="tasks_close"),
+            inline_button(
+                text="🔄 Update",
+                callback_data=f"tasks_page:{job_id}:{page}",
+                style="primary",
+            ),
+        ]
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+def _parse_tasks_callback(data: str) -> tuple[str, int]:
+    """"tasks_job:<id>" and "tasks_page:<id>:<page>" both land here."""
+    parts = data.split(":")
+    job_id = parts[1] if len(parts) > 1 else ""
+    page = 0
+    if len(parts) > 2:
+        try:
+            page = max(0, int(parts[2]))
+        except ValueError:
+            page = 0
+    return job_id, page
+
+
+@router.callback_query(lambda c: c.data == "tasks_close")
+async def tasks_close_callback(callback_query: CallbackQuery) -> None:
+    """Dismiss the task list, removing it from the chat."""
+    await close_menu(callback_query, "Tasks closed.")
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith("tasks_page:"))
+async def tasks_page_callback(callback_query: CallbackQuery) -> None:
+    """Paging and refresh both re-render in place."""
+    if callback_query.from_user is None or callback_query.data is None:
+        await callback_query.answer("Invalid request.", show_alert=True)
+        return
+
+    job_id, page = _parse_tasks_callback(callback_query.data)
+    try:
+        tasks = await get_job_tasks_by_user_id(callback_query.from_user.id, job_id)
+        if not tasks:
+            await callback_query.answer("No tasks found for this job.", show_alert=True)
+            return
+        text, keyboard = _build_tasks_view(tasks, job_id, page)
+        if callback_query.message:
+            try:
+                await callback_query.message.edit_text(
+                    text, parse_mode="HTML", reply_markup=keyboard
+                )
+            except Exception as edit_error:
+                # Telegram rejects an edit that changes nothing.
+                logger.debug("Tasks view unchanged for %s: %s", job_id, edit_error)
+        await callback_query.answer()
+    except Exception:
+        logger.exception("Error paging tasks for job %s", job_id)
+        await callback_query.answer("Error occurred while fetching tasks.", show_alert=True)
+
+
 @router.callback_query(lambda c: c.data and c.data.startswith("tasks_job:"))
 async def tasks_job_callback(callback_query: CallbackQuery) -> None:
     """Show task breakdown for a job."""
@@ -2095,7 +2271,7 @@ async def tasks_job_callback(callback_query: CallbackQuery) -> None:
         await callback_query.answer("Invalid request.", show_alert=True)
         return
 
-    job_id = callback_query.data.split(":", 1)[1]
+    job_id, page = _parse_tasks_callback(callback_query.data)
 
     try:
         tasks = await get_job_tasks_by_user_id(callback_query.from_user.id, job_id)
@@ -2105,55 +2281,11 @@ async def tasks_job_callback(callback_query: CallbackQuery) -> None:
             await callback_query.answer()
             return
 
-        lines = []
-        header = f"{'Frames':<18} {'Prog':^10} {'Time':^12}"
-        header += f"\n{'-'*42}"
-        lines.append(header)
-
-        def get_task_icon(stat: int) -> str:
-            if stat == 5:
-                return "✅"
-            if stat == 4:
-                return "▶️"
-            if stat == 3:
-                return "⏸️"
-            if stat == 6:
-                return "❌"
-            if stat in (2, 8):
-                return "⏳"
-            return "❓"
-
-        for task in tasks:
-            frames = _escape_pre(task.get("Frames", ""))
-            prog = _escape_pre(task.get("Prog", ""))
-            stat = task.get("Stat", 1)
-            icon = get_task_icon(stat)
-            rendertime_str = ""
-            start_str = task.get("StartRen")
-            if start_str and start_str != "0001-01-01T00:00:00Z":
-                try:
-                    start_time = datetime.fromisoformat(start_str)
-                    if stat == 5:
-                        comp_str = task.get("Comp")
-                        if comp_str and comp_str != "0001-01-01T00:00:00Z":
-                            comp_time = datetime.fromisoformat(comp_str)
-                            duration = comp_time.astimezone(timezone.utc) - start_time.astimezone(
-                                timezone.utc
-                            )
-                            rendertime_str = str(duration).split(".")[0]
-                    elif stat == 4:
-                        now_utc = datetime.now(timezone.utc)
-                        duration = now_utc - start_time.astimezone(timezone.utc)
-                        rendertime_str = str(duration).split(".")[0]
-                except Exception:  # pragma: no cover - defensive
-                    pass
-            safe_rendertime = _escape_pre(rendertime_str)
-            line = f"{icon} {frames:<16} {prog:^10} {safe_rendertime:^12}"
-            lines.append(line)
-
-        message_text = "<pre>" + "\n".join(lines) + "</pre>"
+        text, keyboard = _build_tasks_view(tasks, job_id, page)
         if callback_query.message:
-            await callback_query.message.answer(message_text, parse_mode="HTML")
+            await callback_query.message.answer(
+                text, parse_mode="HTML", reply_markup=keyboard
+            )
         await callback_query.answer()
 
     except Exception as exc:
