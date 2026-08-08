@@ -1,9 +1,15 @@
 """Helpers for preview captions and user-facing text."""
 
 import html
+import re
 from typing import Optional
 
 from app.core.path_utils import normalize_preview_path
+
+
+def _pretty_dimensions(value: object) -> str:
+    """Turn "2260x1540" into "2260 × 1540", leaving words like "px" alone."""
+    return re.sub(r"(?<=\d)\s*x\s*(?=\d)", " × ", str(value).strip())
 
 
 def _normalize_title(title: Optional[str]) -> str:
@@ -21,18 +27,22 @@ def build_preview_caption(
     lut: Optional[str] = None,
     resolution: Optional[str] = None,
     color_controls: Optional[str] = None,
+    overscan: Optional[str] = None,
 ) -> str:
     """Build a consistent caption for preview media.
 
-    Layout: title, blank line, optional render details (resolution, camera LUT,
-    camera color controls), blank line, source path.
+    Layout: title, blank line, optional render details (resolution, overscan,
+    camera LUT, camera color controls), blank line, source path.
     """
     parts = [f"{icon} {_normalize_title(title)}"]
 
     details = []
     if resolution:
-        display_resolution = str(resolution).strip().replace("x", " × ")
-        details.append(f"📐 <code>{html.escape(display_resolution)}</code>")
+        details.append(f"📐 <code>{html.escape(_pretty_dimensions(resolution))}</code>")
+    if overscan:
+        # The preview is wider than the delivered frame; say so, because
+        # otherwise the extra margin reads as part of the shot.
+        details.append(f"🖼 <code>{html.escape(_pretty_dimensions(overscan))}</code>")
     if lut:
         details.append(f"🎨 <code>{html.escape(str(lut))}</code>")
     if color_controls:

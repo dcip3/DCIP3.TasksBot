@@ -2077,10 +2077,33 @@ def _describe_color_controls(controls: Optional[dict]) -> str:
     return ", ".join(parts)
 
 
+def _describe_overscan(sidecar: Optional[dict]) -> Optional[str]:
+    """Overscan exactly as the ROP states it, so the caption can be cross-checked.
+
+    Redshift's "Pixels" value is the total added to each axis, split across both
+    sides: 100 on a 2160x1440 camera renders 2260x1540, so the margin really is
+    50 px all round. The caption still reports 100, because that is the number
+    someone typed into the ROP - halving it would leave a figure that appears
+    nowhere in Houdini and makes any mismatch impossible to trace.
+    """
+    overscan = (sidecar or {}).get("overscan")
+    if not overscan or not overscan.get("mode"):
+        return None
+
+    unit = "%" if int(overscan.get("mode") or 0) == 2 else "px"
+    x = float(overscan.get("x") or 0.0)
+    y = float(overscan.get("y") or 0.0)
+    if x <= 0 and y <= 0:
+        return None
+    amount = f"{x:g} {unit}" if abs(x - y) < 1e-6 else f"{x:g}x{y:g} {unit}"
+    return f"Overscan {amount}"
+
+
 def _upload_metadata_headers(
     color_spec: Optional[dict],
     output_path: Path,
     ffmpeg_path: str,
+    sidecar: Optional[dict] = None,
 ) -> dict:
     """Describe the preview for the bot's caption (LUT, color controls, resolution)."""
     headers: dict = {}
@@ -2096,6 +2119,9 @@ def _upload_metadata_headers(
     resolution = _probe_output_resolution(output_path, ffmpeg_path)
     if resolution:
         headers["X-Preview-Resolution"] = resolution
+    overscan_summary = _describe_overscan(sidecar)
+    if overscan_summary:
+        headers["X-Preview-Overscan"] = urllib.parse.quote(overscan_summary, safe="")
     return headers
 
 
@@ -2364,7 +2390,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             if not output_path.exists() or output_path.stat().st_size <= 0:
                 raise RuntimeError(f"Single-frame PNG was not written: {output_path}")
             logging.info("Preview still successfully written to %s", output_path)
-            upload_headers = _upload_metadata_headers(color_spec, output_path, args.ffmpeg_path)
+            upload_headers = _upload_metadata_headers(
+                color_spec,
+                output_path,
+                args.ffmpeg_path,
+                sidecar=_load_color_sidecar(args.input_pattern),
+            )
             if not _maybe_upload_preview(output_path, extra_headers=upload_headers):
                 _handle_upload_failure()
             return 0
@@ -2402,7 +2433,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                     args.output_path,
                 )
                 upload_headers = _upload_metadata_headers(
-                    color_spec, Path(args.output_path), args.ffmpeg_path
+                    color_spec,
+                    Path(args.output_path),
+                    args.ffmpeg_path,
+                    sidecar=_load_color_sidecar(args.input_pattern),
                 )
                 if not _maybe_upload_preview(
                     Path(args.output_path), extra_headers=upload_headers
@@ -2544,7 +2578,10 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         logging.info("Preview video successfully written to %s", args.output_path)
         upload_headers = _upload_metadata_headers(
-            color_spec, Path(args.output_path), args.ffmpeg_path
+            color_spec,
+            Path(args.output_path),
+            args.ffmpeg_path,
+            sidecar=_load_color_sidecar(args.input_pattern),
         )
         if not _maybe_upload_preview(Path(args.output_path), extra_headers=upload_headers):
             _handle_upload_failure()
