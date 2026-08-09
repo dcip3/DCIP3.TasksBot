@@ -2099,6 +2099,38 @@ def _describe_overscan(sidecar: Optional[dict]) -> Optional[str]:
     return f"Overscan {amount}"
 
 
+def _frame_resolution(sidecar: Optional[dict]) -> Optional[str]:
+    """The size the shot is delivered at, before overscan is added."""
+    res = (sidecar or {}).get("resolution") or {}
+    base = res.get("override") if res.get("override_enabled") else res.get("camera")
+    if not base or len(base) < 2:
+        return None
+    try:
+        width, height = int(base[0]), int(base[1])
+    except (TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return "%dx%d" % (width, height)
+
+
+def _resolution_fits_inside(frame: str, rendered: Optional[str]) -> bool:
+    """Does the recorded frame sit within the image that was produced?
+
+    Guards against a sidecar left behind by a different render: if the frame is
+    not smaller than the output, the two do not belong together and the probed
+    size is the only figure that can be trusted.
+    """
+    if not rendered:
+        return True
+    try:
+        fw, fh = (int(part) for part in frame.split("x", 1))
+        rw, rh = (int(part) for part in str(rendered).split("x", 1))
+    except (TypeError, ValueError):
+        return False
+    return 0 < fw <= rw and 0 < fh <= rh
+
+
 def _upload_metadata_headers(
     color_spec: Optional[dict],
     output_path: Path,
@@ -2117,9 +2149,18 @@ def _upload_metadata_headers(
             controls_summary, safe=""
         )
     resolution = _probe_output_resolution(output_path, ffmpeg_path)
+    overscan_summary = _describe_overscan(sidecar)
+    if overscan_summary:
+        # The rendered image carries the overscan margin, but the resolution
+        # worth reporting is the one the shot is delivered at - that is what
+        # people check against, and it does not move when overscan is toggled.
+        # Only trust the recorded frame if it is actually smaller than what was
+        # rendered; otherwise the sidecar does not match this output.
+        frame = _frame_resolution(sidecar)
+        if frame and _resolution_fits_inside(frame, resolution):
+            resolution = frame
     if resolution:
         headers["X-Preview-Resolution"] = resolution
-    overscan_summary = _describe_overscan(sidecar)
     if overscan_summary:
         headers["X-Preview-Overscan"] = urllib.parse.quote(overscan_summary, safe="")
     return headers

@@ -43,9 +43,41 @@ def _worker():
 WORKER = _worker()
 
 
-def sidecar(mode=1, x=100.0, y=100.0) -> dict:
+def sidecar(mode=1, x=100.0, y=100.0, camera=(2160, 1440), override=None) -> dict:
     label = {0: "Disabled", 1: "Pixels", 2: "Percentage"}[mode]
-    return {"overscan": {"mode": mode, "mode_label": label, "x": x, "y": y}}
+    return {
+        "overscan": {"mode": mode, "mode_label": label, "x": x, "y": y},
+        "resolution": {
+            "camera": list(camera),
+            "override_enabled": override is not None,
+            "override": list(override) if override else None,
+        },
+    }
+
+
+class FrameResolutionTests(unittest.TestCase):
+    """With overscan on, the reported resolution is the delivered frame."""
+
+    def test_camera_resolution(self) -> None:
+        self.assertEqual(WORKER._frame_resolution(sidecar()), "2160x1440")
+
+    def test_rop_override_wins(self) -> None:
+        self.assertEqual(
+            WORKER._frame_resolution(sidecar(override=(1280, 720))), "1280x720"
+        )
+
+    def test_older_sidecars_have_nothing_to_offer(self) -> None:
+        self.assertIsNone(WORKER._frame_resolution({"version": 2}))
+        self.assertIsNone(WORKER._frame_resolution(None))
+
+    def test_frame_must_fit_inside_the_rendered_image(self) -> None:
+        """A sidecar from a different render must not overwrite the real size."""
+        self.assertTrue(WORKER._resolution_fits_inside("2160x1440", "2260x1540"))
+        self.assertFalse(WORKER._resolution_fits_inside("4096x2160", "2260x1540"))
+        self.assertFalse(WORKER._resolution_fits_inside("2160x1440", "nonsense"))
+
+    def test_unprobeable_output_is_no_reason_to_distrust_it(self) -> None:
+        self.assertTrue(WORKER._resolution_fits_inside("2160x1440", None))
 
 
 class DescribeOverscanTests(unittest.TestCase):
