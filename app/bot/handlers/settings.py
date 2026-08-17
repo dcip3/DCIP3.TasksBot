@@ -191,47 +191,53 @@ _PROBE_SCOPE_LABELS = {
 
 
 def _render_probe_settings_text(scope: str) -> str:
-    scope_label = _PROBE_SCOPE_LABELS.get(scope, _PROBE_SCOPE_LABELS["own"])
-    return "\n".join(
+    details = [
+        "⏱ ETA Probing",
+        "",
+        f"• Status: {'Off' if scope == 'off' else 'On'}",
+    ]
+    if scope != "off":
+        details.append(f"• Scope: {_PROBE_SCOPE_LABELS.get(scope, 'My jobs only')}")
+    details.extend(
         [
-            "⏱ ETA Probing",
             "",
-            f"• Scope: {scope_label}",
+            "Renders compute front to back, so for the first hours the ETA is "
+            "only a guess. Probing lets a few chunks from across the whole range "
+            "render first — same work, just a different order — and the ETA "
+            "lands within ~10%.",
             "",
-            "A render is normally computed front to back, so for the first hours "
-            "the bot only sees one end of the shot and the ETA is a guess. "
-            "Probing briefly holds back most chunks and lets a few spread across "
-            "the whole range render first - no extra work, just a different "
-            "order - after which the ETA is usually within ~10%.",
-            "",
-            "• Off — never hold back tasks",
-            "• My jobs only — probe the renders you submitted",
-            "• All jobs — also probe other people's renders, so they get a real "
-            "ETA too. Needs the Deadline rights to suspend their tasks.",
+            "• My jobs only — the renders you submitted",
+            "• All jobs — other people's renders too, so they get a real ETA. "
+            "Needs the Deadline rights to suspend their tasks.",
         ]
     )
+    return "\n".join(details)
 
 
 def _build_probe_keyboard(scope: str) -> InlineKeyboardMarkup:
+    # Same shape as the other scope screens: the on/off choice on its own row,
+    # the two scopes side by side. Three buttons in one row got truncated.
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 selectable_inline_button(
-                    text="Off",
+                    text="Probing off",
                     callback_data="settings:probe:scope:off",
                     selected=scope == "off",
+                    prefix_unselected="◻ ",
+                )
+            ],
+            [
+                selectable_inline_button(
+                    text="All jobs",
+                    callback_data="settings:probe:scope:all",
+                    selected=scope == "all",
                     prefix_unselected="◻ ",
                 ),
                 selectable_inline_button(
                     text="My jobs only",
                     callback_data="settings:probe:scope:own",
                     selected=scope == "own",
-                    prefix_unselected="◻ ",
-                ),
-                selectable_inline_button(
-                    text="All jobs",
-                    callback_data="settings:probe:scope:all",
-                    selected=scope == "all",
                     prefix_unselected="◻ ",
                 ),
             ],

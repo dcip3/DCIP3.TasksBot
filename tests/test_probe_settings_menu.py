@@ -14,6 +14,7 @@ os.environ.setdefault(
 )
 
 from app.bot.handlers.settings import (
+    _build_notification_keyboard,
     _build_probe_keyboard,
     _build_settings_root_keyboard,
     _render_probe_settings_text,
@@ -51,13 +52,47 @@ class ProbeSettingsMenuTests(unittest.TestCase):
                 )
 
     def test_text_names_the_current_scope(self) -> None:
+        self.assertIn("Status: On", _render_probe_settings_text("all"))
         self.assertIn("Scope: All jobs", _render_probe_settings_text("all"))
         self.assertIn("Scope: My jobs only", _render_probe_settings_text("own"))
-        self.assertIn("Scope: Off", _render_probe_settings_text("off"))
 
     def test_text_warns_that_all_jobs_needs_rights(self) -> None:
         """The setting can silently do nothing without the Deadline permission."""
         self.assertIn("rights", _render_probe_settings_text("own"))
+
+    def test_scope_line_is_dropped_when_probing_is_off(self) -> None:
+        """Nothing is being probed, so a scope would be noise."""
+        text = _render_probe_settings_text("off")
+        self.assertIn("Status: Off", text)
+        self.assertNotIn("Scope:", text)
+
+
+class SettingsScreenLayoutTests(unittest.TestCase):
+    """House style, learned the hard way: three buttons in a row get truncated.
+
+    Every settings screen in the bot puts at most two buttons on a row, and the
+    two only when both labels are short - "All jobs" / "My jobs only".
+    """
+
+    def _keyboards(self) -> list:
+        return [
+            _build_settings_root_keyboard(),
+            _build_notification_keyboard(True, "own"),
+            *[_build_probe_keyboard(scope) for scope in VALID_PROBE_SCOPES],
+        ]
+
+    def test_no_row_holds_more_than_two_buttons(self) -> None:
+        for keyboard in self._keyboards():
+            for row in keyboard.inline_keyboard:
+                self.assertLessEqual(len(row), 2, [b.text for b in row])
+
+    def test_paired_buttons_stay_short_enough_to_read(self) -> None:
+        for keyboard in self._keyboards():
+            for row in keyboard.inline_keyboard:
+                if len(row) < 2:
+                    continue
+                for button in row:
+                    self.assertLessEqual(len(button.text), 16, button.text)
 
 
 if __name__ == "__main__":
