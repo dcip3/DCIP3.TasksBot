@@ -48,6 +48,7 @@ class ErrorAlertsMenuTests(unittest.TestCase):
         text = _render_notification_settings_text(True, "all")
         self.assertIn("Redshift activation", text)
         self.assertIn("local C: path", text)
+        self.assertIn("plugin sandbox", text)
 
     def test_toggle_is_about_errors(self) -> None:
         toggle = [

@@ -257,6 +257,34 @@ def _extract_report_path(report: dict) -> Optional[str]:
     return None
 
 
+def _matches_plugin_sandbox_error(report: dict) -> bool:
+    """The worker cannot start the sandbox process its plugins run in.
+
+    Seen on NodeC during SHA_0070_DS_v019: 100 tasks failed in 23 minutes, every
+    one of them on that machine while the rest of the farm rendered the same job
+    fine. The sandbox child process could not connect back to the worker's own
+    command listener on loopback:
+
+        SocketException (10013): An attempt was made to access a socket in a way
+        forbidden by its access permissions. [::1]:29293
+
+    Nothing about the job is wrong, so a resubmit changes nothing and the machine
+    keeps eating tasks and failing them - which is what makes this worth an alert
+    rather than a line in the log.
+    """
+    search_text = _report_search_text(report).lower()
+    if not search_text:
+        return False
+    # Deliberately narrow. "Failed to load the plugin because:" alone also covers
+    # a missing DCC version or a bad plugin config, and this alert's advice - the
+    # loopback port - would be wrong for those. Across the 65 jobs currently on
+    # the farm these two phrases caught all 119 sandbox failures and nothing else.
+    return (
+        "could not initialize the plugin sandbox" in search_text
+        or "sandbox process exited unexpectedly" in search_text
+    )
+
+
 def _matches_local_c_drive_open_error(report: dict) -> bool:
     search_text = _report_search_text(report)
     if not search_text:
@@ -289,6 +317,15 @@ _ERROR_ALERT_RULES: tuple[_ErrorAlertRule, ...] = (
         recipient_mode=_ERROR_ALERT_RECIPIENT_MODE_JOB_USER,
         severity=_ERROR_ALERT_SEVERITY_WARNING,
     ),
+    # Both recipients: only the machine's owner can fix it, but the job's user
+    # is the one watching their frames fail.
+    _ErrorAlertRule(
+        key="plugin_sandbox_error",
+        label="Worker cannot start the plugin sandbox",
+        matcher=_matches_plugin_sandbox_error,
+        recipient_mode=_ERROR_ALERT_RECIPIENT_MODE_BOTH,
+        severity=_ERROR_ALERT_SEVERITY_CRITICAL,
+    ),
 )
 
 
@@ -314,6 +351,14 @@ def _is_recent_error_report(report: dict) -> bool:
 def _report_dedupe_id(job_id: str, report: dict, rule_key: str) -> str:
     if rule_key == "local_c_drive_open_error":
         return f"{rule_key}:{str(job_id or '').strip()}"
+
+    if rule_key == "plugin_sandbox_error":
+        # A worker in this state fails every task it is handed - SHA_0070_DS_v019
+        # collected 100 reports from one machine in 23 minutes. Alert once per
+        # machine per job; per report would be a flood, and the message would say
+        # the same thing every time.
+        slave = _normalize_identity(report.get("Slave")) or "unknown"
+        return f"{rule_key}:{str(job_id or '').strip()}:{slave}"
 
     report_id = str(report.get("_id") or "").strip()
     if report_id:
@@ -370,6 +415,26 @@ def _build_error_alert_text(report: dict, rule: _ErrorAlertRule) -> str:
             ]
         )
         return "\n".join(details)
+
+    if rule.key == "plugin_sandbox_error":
+        return "\n".join(
+            header_lines
+            + [
+                "",
+                f"📝 <b>Message</b>: <code>{error_text}</code>",
+                "",
+                "💡 <b>What To Do</b>:",
+                f"• The job is fine - <code>{worker_name}</code> is failing every task "
+                "it takes. Resubmitting will not help.",
+                "• On that machine the plugin sandbox cannot reach the worker's own "
+                "loopback port, usually because the port sits in a reserved range "
+                "(Hyper-V/WSL/Docker) or a security tool blocks it.",
+                "• Check with <code>netsh int ipv4 show excludedportrange protocol=tcp</code>, "
+                "then restart the worker; <code>net stop winnat</code> / "
+                "<code>net start winnat</code> frees a Hyper-V reservation.",
+                "• Until it is fixed, take the machine offline so it stops eating tasks.",
+            ]
+        )
 
     return "\n".join(
         header_lines

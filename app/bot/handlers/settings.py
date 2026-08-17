@@ -141,6 +141,7 @@ def _render_notification_settings_text(enabled: bool, scope: str) -> str:
         "Alerts when Deadline reports a render error:",
         "• Redshift activation failures",
         "• Scenes pointing at a local C: path",
+        "• A worker that cannot start the plugin sandbox",
     ]
     if not enabled:
         details.append("")
