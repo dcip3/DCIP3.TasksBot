@@ -44,6 +44,13 @@ _INPUT_FILE_RE = re.compile(
     r"input file:\s*([a-z]:[^\r\n]+)",
     re.IGNORECASE,
 )
+# Houdini reports a scene it cannot load either way, depending on where it gave
+# up: "Unable to open file: Y:/...hip" from hou.hipFile.load, "Error loading:
+# Y:/...hip" from the plugin around it. Same failure, same file, same advice.
+_ERROR_LOADING_RE = re.compile(
+    r"error loading:\s*([a-z]:[^\r\n]+)",
+    re.IGNORECASE,
+)
 
 _AUTO_PREVIEW_SCAN_INTERVAL_SECONDS = 30
 # How long a suspended render may hold its pending preview before the preview is
@@ -104,6 +111,9 @@ class _ErrorAlertRule:
     matcher: Callable[[dict], bool]
     recipient_mode: _ErrorAlertRecipientMode
     severity: _ErrorAlertSeverity
+    # How many matching reports a job needs before this is worth a message.
+    # Above 1 for failures whose first few occurrences are business as usual.
+    min_occurrences: int = 1
 
 
 def _normalize_identity(value: object) -> str:
@@ -248,13 +258,48 @@ def _clean_report_path(raw_path: str) -> str:
 
 def _extract_report_path(report: dict) -> Optional[str]:
     search_text = _report_search_text(report)
-    for pattern in (_UNABLE_TO_OPEN_FILE_RE, _INPUT_FILE_RE):
+    for pattern in (_UNABLE_TO_OPEN_FILE_RE, _ERROR_LOADING_RE, _INPUT_FILE_RE):
         match = pattern.search(search_text)
         if match:
             candidate = _clean_report_path(match.group(1))
             if candidate:
                 return candidate
     return None
+
+
+# A render that starts before Dropbox has finished syncing the scene fails a few
+# tasks and then picks up as the file lands. That is normal here and must not
+# raise an alarm - only a job that keeps failing has a real problem, which is
+# either the rendering machine not syncing or the scene never finishing its
+# upload from the machine that submitted it.
+_SCENE_NOT_READY_MIN_OCCURRENCES = 10
+
+
+_SCENE_LOAD_FAILURE_PHRASES = ("unable to open file:", "error loading:")
+
+
+def _scene_load_failure_path(report: dict) -> Optional[str]:
+    """The file a failed scene load names, whichever wording Deadline used.
+
+    Deadline puts nothing useful in the report title for these - it reads
+    "Caught exception: The attempted operation failed." - so a match only
+    happens once the watcher has fetched the full report contents, where the
+    real line lives.
+    """
+    search_text = _report_search_text(report).lower()
+    if not any(phrase in search_text for phrase in _SCENE_LOAD_FAILURE_PHRASES):
+        return None
+    return _extract_report_path(report)
+
+
+def _matches_scene_not_ready_error(report: dict) -> bool:
+    """Houdini could not load the scene from shared storage."""
+    path = _scene_load_failure_path(report)
+    if not path:
+        return False
+    # A local C: path is somebody submitting from their own workstation, which
+    # is a different problem with different advice - see the rule below.
+    return not path.lower().startswith("c:")
 
 
 def _matches_plugin_sandbox_error(report: dict) -> bool:
@@ -286,19 +331,8 @@ def _matches_plugin_sandbox_error(report: dict) -> bool:
 
 
 def _matches_local_c_drive_open_error(report: dict) -> bool:
-    search_text = _report_search_text(report)
-    if not search_text:
-        return False
-
-    normalized = search_text.lower()
-    if "unable to open file:" not in normalized:
-        return False
-
-    path = _extract_report_path(report)
-    if not path or not path.lower().startswith("c:"):
-        return False
-
-    return True
+    path = _scene_load_failure_path(report)
+    return bool(path) and path.lower().startswith("c:")
 
 
 # Add new report alert types here: key + display label + predicate.
@@ -316,6 +350,14 @@ _ERROR_ALERT_RULES: tuple[_ErrorAlertRule, ...] = (
         matcher=_matches_local_c_drive_open_error,
         recipient_mode=_ERROR_ALERT_RECIPIENT_MODE_JOB_USER,
         severity=_ERROR_ALERT_SEVERITY_WARNING,
+    ),
+    _ErrorAlertRule(
+        key="scene_not_ready",
+        label="Scene file cannot be opened on the farm",
+        matcher=_matches_scene_not_ready_error,
+        recipient_mode=_ERROR_ALERT_RECIPIENT_MODE_BOTH,
+        severity=_ERROR_ALERT_SEVERITY_WARNING,
+        min_occurrences=_SCENE_NOT_READY_MIN_OCCURRENCES,
     ),
     # Both recipients: only the machine's owner can fix it, but the job's user
     # is the one watching their frames fail.
@@ -349,7 +391,8 @@ def _is_recent_error_report(report: dict) -> bool:
 
 
 def _report_dedupe_id(job_id: str, report: dict, rule_key: str) -> str:
-    if rule_key == "local_c_drive_open_error":
+    if rule_key in ("local_c_drive_open_error", "scene_not_ready"):
+        # One message about the job, however many of its tasks tripped over it.
         return f"{rule_key}:{str(job_id or '').strip()}"
 
     if rule_key == "plugin_sandbox_error":
@@ -376,7 +419,11 @@ def _report_dedupe_id(job_id: str, report: dict, rule_key: str) -> str:
     return fallback
 
 
-def _build_error_alert_text(report: dict, rule: _ErrorAlertRule) -> str:
+def _build_error_alert_text(
+    report: dict,
+    rule: _ErrorAlertRule,
+    occurrences: int = 1,
+) -> str:
     worker_name = html.escape(str(report.get("Slave") or "Unknown"))
     job_name = html.escape(str(report.get("JobName") or report.get("Job") or "Unknown job"))
     title_raw = str(report.get("Title") or report.get("LogErr") or "Unknown error").strip()
@@ -412,6 +459,32 @@ def _build_error_alert_text(report: dict, rule: _ErrorAlertRule) -> str:
                 "💡 <b>What To Do</b>:",
                 "• Submit the scene from a shared or network path.",
                 "• Do not submit from a local <code>C:</code> path that exists only on your workstation.",
+            ]
+        )
+        return "\n".join(details)
+
+    if rule.key == "scene_not_ready":
+        scene_path = _extract_report_path(report)
+        details = list(header_lines)
+        details.append(f"📉 <b>Failed tasks</b>: {occurrences}")
+        if scene_path:
+            details.extend(
+                [
+                    "",
+                    "📁 <b>File</b>:",
+                    f"<code>{html.escape(scene_path)}</code>",
+                ]
+            )
+        details.extend(
+            [
+                "",
+                "💡 <b>What To Do</b>:",
+                "• A few of these at the start of a render are normal - the file "
+                "is still syncing. This many means it is not arriving.",
+                "• On the machine that submitted it: check Dropbox finished "
+                "uploading the scene and everything it references.",
+                f"• On <code>{worker_name}</code>: check Dropbox is running and "
+                "the file is downloaded, not just a placeholder.",
             ]
         )
         return "\n".join(details)
@@ -601,6 +674,11 @@ async def _scan_error_reports_candidates(users: list[_WatcherUser]) -> int:
                     len(reports),
                 )
 
+                # How many of this job's reports each alert has matched so far.
+                # A rule with min_occurrences above 1 stays quiet until its count
+                # gets there; the dedupe cache then keeps it to one message.
+                occurrences: dict[str, int] = {}
+
                 for report in reports:
                     if not isinstance(report, dict):
                         continue
@@ -685,6 +763,19 @@ async def _scan_error_reports_candidates(users: list[_WatcherUser]) -> int:
                             matched_rule.key,
                         )
                         continue
+                    seen_so_far = occurrences.get(dedupe_id, 0) + 1
+                    occurrences[dedupe_id] = seen_so_far
+                    if seen_so_far < matched_rule.min_occurrences:
+                        logger.info(
+                            "Watcher: below alert threshold user_id=%s job_id=%s rule=%s %s/%s",
+                            user.telegram_user_id,
+                            job_id,
+                            matched_rule.key,
+                            seen_so_far,
+                            matched_rule.min_occurrences,
+                        )
+                        continue
+
                     recipient_ids = _resolve_error_alert_recipient_ids(
                         report_payload,
                         matched_rule.recipient_mode,
@@ -701,7 +792,9 @@ async def _scan_error_reports_candidates(users: list[_WatcherUser]) -> int:
                     if not recipient_ids:
                         continue
 
-                    alert_text = _build_error_alert_text(report_payload, matched_rule)
+                    alert_text = _build_error_alert_text(
+                        report_payload, matched_rule, seen_so_far
+                    )
                     for recipient_user_id in recipient_ids:
                         dedupe_key = (dedupe_id, recipient_user_id)
                         if dedupe_key in _error_alert_cache:
