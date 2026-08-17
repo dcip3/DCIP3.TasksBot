@@ -11,17 +11,21 @@ from app.storage.user_settings import (
     NotificationScope,
     PREVIEW_DEFAULT_WORKER_AUTO,
     PREVIEW_POST_EFFECTS,
+    ProbeScope,
+    VALID_PROBE_SCOPES,
     get_notification_settings,
     get_preview_default_worker,
     get_preview_auto_enabled,
     get_preview_auto_scope,
     get_preview_post_effects,
+    get_probe_scope,
     set_notification_enabled,
     set_notification_scope,
     set_preview_auto_enabled,
     set_preview_auto_scope,
     set_preview_default_worker,
     set_preview_post_effect,
+    set_probe_scope,
 )
 from app.core.ui_helpers import (
     authorized_only,
@@ -100,6 +104,12 @@ def _build_settings_root_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 inline_button(
+                    text="⏱ ETA Probing",
+                    callback_data="settings:probe",
+                )
+            ],
+            [
+                inline_button(
                     text="🛠️ Worker Setup",
                     callback_data="settings:setup_script",
                 )
@@ -153,6 +163,65 @@ def _build_notification_keyboard(enabled: bool, scope: str) -> InlineKeyboardMar
                     text="My jobs only",
                     callback_data="settings:notif:scope:own",
                     selected=scope_normalized == "own",
+                    prefix_unselected="◻ ",
+                ),
+            ],
+            [
+                back_inline_button(callback_data="settings:back:root"),
+            ],
+        ]
+    )
+
+
+_PROBE_SCOPE_LABELS = {
+    "off": "Off",
+    "own": "My jobs only",
+    "all": "All jobs",
+}
+
+
+def _render_probe_settings_text(scope: str) -> str:
+    scope_label = _PROBE_SCOPE_LABELS.get(scope, _PROBE_SCOPE_LABELS["own"])
+    return "\n".join(
+        [
+            "⏱ ETA Probing",
+            "",
+            f"• Scope: {scope_label}",
+            "",
+            "A render is normally computed front to back, so for the first hours "
+            "the bot only sees one end of the shot and the ETA is a guess. "
+            "Probing briefly holds back most chunks and lets a few spread across "
+            "the whole range render first - no extra work, just a different "
+            "order - after which the ETA is usually within ~10%.",
+            "",
+            "• Off — never hold back tasks",
+            "• My jobs only — probe the renders you submitted",
+            "• All jobs — also probe other people's renders, so they get a real "
+            "ETA too. Needs the Deadline rights to suspend their tasks.",
+        ]
+    )
+
+
+def _build_probe_keyboard(scope: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                selectable_inline_button(
+                    text="Off",
+                    callback_data="settings:probe:scope:off",
+                    selected=scope == "off",
+                    prefix_unselected="◻ ",
+                ),
+                selectable_inline_button(
+                    text="My jobs only",
+                    callback_data="settings:probe:scope:own",
+                    selected=scope == "own",
+                    prefix_unselected="◻ ",
+                ),
+                selectable_inline_button(
+                    text="All jobs",
+                    callback_data="settings:probe:scope:all",
+                    selected=scope == "all",
                     prefix_unselected="◻ ",
                 ),
             ],
@@ -438,6 +507,14 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
             reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
         )
 
+    async def show_probe() -> None:
+        scope = await get_probe_scope(user_id)
+        await _edit_or_send(
+            callback_query.message,
+            _render_probe_settings_text(scope),
+            reply_markup=_build_probe_keyboard(scope),
+        )
+
     if action == "close":
         # Closing should leave nothing behind; "Settings closed." only shows up
         # when Telegram refuses to delete the message.
@@ -464,6 +541,10 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
             await show_preview_menu()
             await callback_query.answer("Updated")
             return
+        if target == "probe":
+            await show_probe()
+            await callback_query.answer("Updated")
+            return
         if target == "root":
             await show_root()
             await callback_query.answer("Updated")
@@ -475,6 +556,21 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
         await show_notifications()
         await callback_query.answer()
         return
+
+    if action == "probe":
+        if len(parts) == 2:
+            await show_probe()
+            await callback_query.answer()
+            return
+        if len(parts) > 3 and parts[2] == "scope":
+            scope_value = parts[3]
+            if scope_value not in VALID_PROBE_SCOPES:
+                await callback_query.answer("Unsupported option.", show_alert=True)
+                return
+            scope = await set_probe_scope(user_id, cast(ProbeScope, scope_value))
+            await show_probe()
+            await callback_query.answer(f"Probing: {_PROBE_SCOPE_LABELS[scope]}")
+            return
 
     if action == "preview":
         if len(parts) == 2:

@@ -20,7 +20,12 @@ just show up as a few already-finished chunks further along.
 
 Safety: the held tasks are recorded in the database before they are suspended,
 and released again on bot startup, on job completion, or when the probe phase
-runs over time. See release_if_ready() and recover_orphaned_probes().
+runs over time. See release_if_ready() and release_stale_probes(). If the
+account that suspended them can no longer resume them, any other logged-in
+account is tried - see _resume_held().
+
+Who probes what is a per-account setting ("off"/"own"/"all", default "own"),
+because probing reorders somebody's render; see _may_probe() in job_watcher.
 """
 
 from __future__ import annotations
@@ -206,13 +211,48 @@ async def start_probing(telegram_user_id: int, job_id: str, tasks: list[dict]) -
     return True
 
 
+async def _resume_held(state: probe_state.ProbeState) -> bool:
+    """Resume the held tasks, falling back to any other account that can.
+
+    Normally the account that suspended the tasks resumes them. That account can
+    disappear between the two - logged out, password changed, rights revoked -
+    and on a job it does not own that would leave somebody else's render sitting
+    half-suspended until the backstop gives up on it. So any other logged-in
+    account gets a turn before we call it a failure.
+    """
+    if await deadline.resume_tasks_by_user_id(
+        state.telegram_user_id, state.job_id, state.held_task_ids
+    ):
+        return True
+
+    from app.storage.user_settings import list_probe_release_candidates
+
+    try:
+        candidates = await list_probe_release_candidates(state.telegram_user_id)
+    except Exception:
+        logger.exception("Could not list fallback accounts for releasing %s", state.job_id)
+        return False
+
+    for user_id in candidates:
+        if await deadline.resume_tasks_by_user_id(
+            user_id, state.job_id, state.held_task_ids
+        ):
+            logger.warning(
+                "Released held tasks of %s with the credentials of user %s; "
+                "the account that suspended them (%s) could not",
+                state.job_id,
+                user_id,
+                state.telegram_user_id,
+            )
+            return True
+    return False
+
+
 async def _release(state: probe_state.ProbeState, reason: str) -> bool:
     if not state.held_task_ids:
         await probe_state.mark_probe_released(state.job_id)
         return True
-    ok = await deadline.resume_tasks_by_user_id(
-        state.telegram_user_id, state.job_id, state.held_task_ids
-    )
+    ok = await _resume_held(state)
     if ok:
         await probe_state.mark_probe_released(state.job_id)
         logger.info(

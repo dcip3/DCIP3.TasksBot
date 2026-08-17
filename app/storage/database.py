@@ -71,6 +71,7 @@ async def init_db():
             preview_default_method TEXT,
             preview_auto_enabled INTEGER DEFAULT 0,
             preview_auto_scope TEXT,
+            probe_scope TEXT DEFAULT 'own',
             last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -129,6 +130,9 @@ async def init_db():
     await _ensure_user_session_column("preview_default_method", "TEXT")
     await _ensure_user_session_column("preview_auto_enabled", "INTEGER DEFAULT 0")
     await _ensure_user_session_column("preview_auto_scope", "TEXT")
+    # Which renders this account may hold back to measure ("off"/"own"/"all").
+    # Existing rows inherit the default, so an upgrade changes nobody's behaviour.
+    await _ensure_user_session_column("probe_scope", "TEXT DEFAULT 'own'")
     # When the user was last told their stored credentials are rejected, so the
     # warning is not repeated on every bot restart.
     await _ensure_user_session_column("auth_failure_notified_at", "INTEGER")

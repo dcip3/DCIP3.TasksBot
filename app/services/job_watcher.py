@@ -28,7 +28,11 @@ from app.services.preview.runtime import (
     preview_missing_strikes,
     preview_tracked_jobs,
 )
-from app.storage.user_settings import _normalize_scope
+from app.storage.user_settings import (
+    DEFAULT_PROBE_SCOPE,
+    _normalize_probe_scope,
+    _normalize_scope,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +94,7 @@ class _WatcherUser:
     auto_scope: str
     preview_worker: Optional[str]
     auto_preview_enabled: bool
+    probe_scope: str = DEFAULT_PROBE_SCOPE
 
 
 @dataclass(frozen=True, slots=True)
@@ -705,7 +710,8 @@ async def _load_watcher_users() -> list[_WatcherUser]:
                    notification_scope,
                    preview_default_worker,
                    preview_auto_enabled,
-                   preview_auto_scope
+                   preview_auto_scope,
+                   probe_scope
             FROM user_sessions
             """
         ) as cursor:
@@ -725,6 +731,7 @@ async def _load_watcher_users() -> list[_WatcherUser]:
             preview_worker,
             preview_auto_enabled,
             preview_auto_scope_raw,
+            probe_scope_raw,
         ) = row
 
         if not user_id or not login or not encrypted_password:
@@ -748,6 +755,7 @@ async def _load_watcher_users() -> list[_WatcherUser]:
                 auto_scope=auto_scope,
                 preview_worker=preview_worker,
                 auto_preview_enabled=bool(preview_auto_enabled),
+                probe_scope=_normalize_probe_scope(probe_scope_raw),
             )
         )
 
@@ -1345,16 +1353,45 @@ async def _scan_auto_preview_candidates(users: list[_WatcherUser]) -> int:
     return total_scheduled
 
 
-def _job_belongs_to(job: dict, props: dict, user: "_WatcherUser") -> bool:
-    """Only the job's own submitter probes it, so two users never both hold it."""
-    return _job_matches_scope("own", user.login, props, job)
+def _may_probe(job: dict, props: dict, user: "_WatcherUser") -> bool:
+    """Whether this account is allowed to hold back this job's tasks.
+
+    Probing is a write on somebody's render - most of its tasks go to Suspended
+    for a while - so it is opt-in per account:
+
+        off   never probe (the account only reads the farm)
+        own   probe the jobs this login submitted (the default)
+        all   probe anyone's job, for an account with the Deadline rights to
+              suspend foreign tasks
+
+    "all" exists because the submitter is often not the one who can probe: they
+    may not be logged into the bot, may submit under a different account name
+    than their bot login, or may lack the rights to suspend their own tasks. In
+    all those cases nobody probes the job and its ETA stays a guess for hours.
+    """
+    scope = _normalize_probe_scope(user.probe_scope)
+    if scope == "off":
+        return False
+    return _job_matches_scope(scope, user.login, props, job)
+
+
+def _probe_scan_order(users: list[_WatcherUser]) -> list[_WatcherUser]:
+    """Owners first, farm-wide accounts second.
+
+    Both may be eligible for the same job, and whoever gets there first claims
+    it for the whole probe phase. The submitter is the better holder: their
+    rights to their own tasks are not in question, and a release under their own
+    login is what an artist watching Monitor expects to see.
+    """
+    eligible = [u for u in users if _normalize_probe_scope(u.probe_scope) != "off"]
+    return sorted(eligible, key=lambda u: _normalize_probe_scope(u.probe_scope) == "all")
 
 
 async def _scan_render_probes(users: list[_WatcherUser]) -> None:
     """Drive the probe phase of active renders, so the ETA has a cost curve.
 
-    Cheap by design: it only touches Active render jobs the user submitted, and
-    only fetches a task list for those.
+    Cheap by design: it only touches Active render jobs in the account's probe
+    scope, and only fetches a task list for those.
     """
     from app.services import probe_scheduler
     from app.services.deadline import get_job_tasks_by_user_id, get_jobs_by_credentials
@@ -1365,7 +1402,7 @@ async def _scan_render_probes(users: list[_WatcherUser]) -> None:
     except Exception as exc:
         logger.warning("Watcher: stale probe sweep failed: %s", exc)
 
-    for user in users:
+    for user in _probe_scan_order(users):
         try:
             jobs = await get_jobs_by_credentials(user.login, user.password, use_cache=True)
         except Exception as exc:
@@ -1385,7 +1422,7 @@ async def _scan_render_probes(users: list[_WatcherUser]) -> None:
             props = job.get("Props") or {}
             if not isinstance(props, dict):
                 props = {}
-            if _is_preview_job(props) or not _job_belongs_to(job, props, user):
+            if _is_preview_job(props) or not _may_probe(job, props, user):
                 continue
 
             try:

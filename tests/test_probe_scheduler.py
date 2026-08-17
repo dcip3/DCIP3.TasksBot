@@ -605,5 +605,105 @@ class StaleProbeRecoveryTests(unittest.IsolatedAsyncioTestCase):
         mark_mock.assert_awaited_once_with("gone")
 
 
+class ReleaseFallbackTests(unittest.IsolatedAsyncioTestCase):
+    """Held tasks must come back even if the account that suspended them cannot.
+
+    On your own job a failed release is your own problem. Once an account probes
+    other people's renders, the same failure strands somebody else's job with
+    half its tasks suspended - so every other logged-in account gets a turn.
+    """
+
+    def setUp(self) -> None:
+        self.state = probe_state.ProbeState(
+            job_id="job1",
+            telegram_user_id=42,
+            probe_task_ids=[0],
+            held_task_ids=[1, 2, 3],
+            started_at=int(time.time()) - 2 * probe_scheduler.MAX_PROBE_SECONDS,
+            released_at=None,
+        )
+        self.attempts: list[int] = []
+
+    def _patches(self, working_user: int | None, candidates: list[int]):
+        async def resume(user_id, job_id, ids):
+            self.attempts.append(user_id)
+            return user_id == working_user
+
+        return (
+            mock.patch.object(
+                probe_state,
+                "list_unreleased_probes",
+                new=mock.AsyncMock(return_value=[self.state]),
+            ),
+            mock.patch.object(probe_state, "mark_probe_released", new=mock.AsyncMock()),
+            mock.patch.object(
+                deadline, "resume_tasks_by_user_id", new=mock.AsyncMock(side_effect=resume)
+            ),
+            mock.patch(
+                "app.storage.user_settings.list_probe_release_candidates",
+                new=mock.AsyncMock(return_value=candidates),
+            ),
+        )
+
+    async def _sweep(self, working_user: int | None, candidates: list[int]) -> int:
+        patches = self._patches(working_user, candidates)
+        for patch in patches:
+            patch.start()
+        try:
+            return await probe_scheduler.release_stale_probes()
+        finally:
+            for patch in patches:
+                patch.stop()
+
+    async def test_no_fallback_when_the_original_account_works(self) -> None:
+        released = await self._sweep(working_user=42, candidates=[7, 9])
+        self.assertEqual(released, 1)
+        self.assertEqual(self.attempts, [42])
+
+    async def test_falls_back_to_another_account(self) -> None:
+        released = await self._sweep(working_user=9, candidates=[7, 9])
+        self.assertEqual(released, 1)
+        self.assertEqual(self.attempts, [42, 7, 9])
+
+    async def test_reports_failure_when_nobody_can_release(self) -> None:
+        released = await self._sweep(working_user=None, candidates=[7])
+        self.assertEqual(released, 0)
+        self.assertEqual(self.attempts, [42, 7])
+
+    async def test_release_if_ready_uses_the_fallback_too(self) -> None:
+        """The timed-out path runs on the watcher tick, not only in the sweep."""
+        tasks = job_tasks(5)
+
+        async def resume(user_id, job_id, ids):
+            self.attempts.append(user_id)
+            return user_id == 9
+
+        patches = (
+            mock.patch.object(
+                probe_state,
+                "get_probe_state",
+                new=mock.AsyncMock(return_value=self.state),
+            ),
+            mock.patch.object(probe_state, "mark_probe_released", new=mock.AsyncMock()),
+            mock.patch.object(
+                deadline, "resume_tasks_by_user_id", new=mock.AsyncMock(side_effect=resume)
+            ),
+            mock.patch(
+                "app.storage.user_settings.list_probe_release_candidates",
+                new=mock.AsyncMock(return_value=[9]),
+            ),
+        )
+        for patch in patches:
+            patch.start()
+        try:
+            released = await probe_scheduler.release_if_ready("job1", tasks)
+        finally:
+            for patch in patches:
+                patch.stop()
+
+        self.assertTrue(released)
+        self.assertEqual(self.attempts, [42, 9])
+
+
 if __name__ == "__main__":
     unittest.main()

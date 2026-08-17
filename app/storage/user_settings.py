@@ -12,10 +12,25 @@ DEFAULT_NOTIFICATION_SCOPE: NotificationScope = "all"
 VALID_NOTIFICATION_SCOPES = {"all", "own"}
 PREVIEW_DEFAULT_WORKER_AUTO = "__auto__"
 
+# Probing suspends most of a render's tasks for a while, so unlike the read-only
+# scopes above this one also has an "off", and it defaults to the job's own
+# submitter. "all" is for an account that may reorder anybody's render - on this
+# farm that means someone with the Deadline rights to suspend foreign tasks.
+ProbeScope = Literal["off", "own", "all"]
+DEFAULT_PROBE_SCOPE: ProbeScope = "own"
+VALID_PROBE_SCOPES = {"off", "own", "all"}
+
 __all__ = [
     "NotificationScope",
     "DEFAULT_NOTIFICATION_SCOPE",
     "VALID_NOTIFICATION_SCOPES",
+    "ProbeScope",
+    "DEFAULT_PROBE_SCOPE",
+    "VALID_PROBE_SCOPES",
+    "_normalize_probe_scope",
+    "get_probe_scope",
+    "set_probe_scope",
+    "list_probe_release_candidates",
     "PREVIEW_DEFAULT_WORKER_AUTO",
     "PREVIEW_POST_EFFECTS",
     "get_preview_post_effects",
@@ -44,6 +59,101 @@ def _normalize_scope(scope: Optional[str]) -> NotificationScope:
         return DEFAULT_NOTIFICATION_SCOPE
     scope_lower = scope.lower()
     return scope_lower if scope_lower in VALID_NOTIFICATION_SCOPES else DEFAULT_NOTIFICATION_SCOPE
+
+
+def _normalize_probe_scope(scope: Optional[str]) -> ProbeScope:
+    """Normalize a probe scope, defaulting to the safe "my jobs only"."""
+    if not scope:
+        return DEFAULT_PROBE_SCOPE
+    scope_lower = scope.lower()
+    return scope_lower if scope_lower in VALID_PROBE_SCOPES else DEFAULT_PROBE_SCOPE
+
+
+async def get_probe_scope(telegram_user_id: int) -> ProbeScope:
+    """Which renders this user's credentials may probe for a better ETA."""
+    conn = get_db_connection()
+    if conn is None:
+        return DEFAULT_PROBE_SCOPE
+
+    try:
+        async with conn.execute(
+            "SELECT probe_scope FROM user_sessions WHERE telegram_user_id = ?",
+            (telegram_user_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return DEFAULT_PROBE_SCOPE
+            return _normalize_probe_scope(row[0])
+    except Exception as e:
+        logger.error("Failed to fetch probe scope for user %s: %s", telegram_user_id, e)
+        return DEFAULT_PROBE_SCOPE
+
+
+async def set_probe_scope(telegram_user_id: int, scope: ProbeScope) -> ProbeScope:
+    """Set which renders this user's credentials may probe."""
+    conn = get_db_connection()
+    if conn is None:
+        return DEFAULT_PROBE_SCOPE
+
+    normalized_scope = _normalize_probe_scope(scope)
+    try:
+        await conn.execute(
+            """
+            UPDATE user_sessions
+            SET probe_scope = ?
+            WHERE telegram_user_id = ?
+            """,
+            (normalized_scope, telegram_user_id),
+        )
+        await conn.commit()
+        logger.info("User %s probe scope set to %s", telegram_user_id, normalized_scope)
+        return normalized_scope
+    except Exception as e:
+        logger.error("Failed to set probe scope for user %s: %s", telegram_user_id, e)
+        return DEFAULT_PROBE_SCOPE
+
+
+async def list_probe_release_candidates(exclude_user_id: Optional[int] = None) -> list[int]:
+    """Users whose credentials could release held tasks of someone else's job.
+
+    Held tasks are normally resumed by whoever suspended them. When that account
+    is gone - logged out, password changed, rights revoked - a foreign render
+    would otherwise sit half-suspended until the backstop gives up on it, so the
+    release falls back to these accounts in turn.
+
+    Farm-wide ("all") accounts come first: they are the ones expected to have the
+    Deadline rights to touch a job they do not own.
+    """
+    conn = get_db_connection()
+    if conn is None:
+        return []
+
+    try:
+        async with conn.execute(
+            """
+            SELECT telegram_user_id, probe_scope
+            FROM user_sessions
+            WHERE deadline_login IS NOT NULL
+              AND deadline_login <> ''
+              AND deadline_password IS NOT NULL
+              AND deadline_password <> ''
+            """
+        ) as cursor:
+            rows = await cursor.fetchall()
+    except Exception as e:
+        logger.error("Failed to list probe release candidates: %s", e)
+        return []
+
+    candidates = [
+        (int(row[0]), _normalize_probe_scope(row[1] if len(row) > 1 else None))
+        for row in rows
+        if row and row[0] is not None
+    ]
+    return [
+        user_id
+        for user_id, scope in sorted(candidates, key=lambda item: item[1] != "all")
+        if user_id != exclude_user_id
+    ]
 
 
 async def get_notification_settings(telegram_user_id: int) -> Tuple[bool, NotificationScope]:
