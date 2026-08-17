@@ -18,7 +18,7 @@ HELP_TEXT = (
     "Buttons:\n"
     "📂 Jobs — browse jobs and actions.\n"
     "🖥️ Workers — check render node status.\n"
-    "⚙️ Settings — notifications and preview defaults.\n"
+    "⚙️ Settings — error alerts, previews and ETA probing.\n"
     "\n"
     "Commands:\n"
     "/start — start the bot.\n"

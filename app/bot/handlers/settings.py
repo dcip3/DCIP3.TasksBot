@@ -92,7 +92,7 @@ def _build_settings_root_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 inline_button(
-                    text="🔔 Notifications",
+                    text="🚨 Error Alerts",
                     callback_data="settings:notifications",
                 )
             ],
@@ -122,19 +122,28 @@ def _build_settings_root_keyboard() -> InlineKeyboardMarkup:
 
 
 def _render_notification_settings_text(enabled: bool, scope: str) -> str:
+    """The Error Alerts screen.
+
+    The bulleted list describes _ERROR_ALERT_RULES in job_watcher - keep the two
+    in step when a rule is added, so the screen never promises an alert that
+    nothing sends.
+    """
     status_text = "On" if enabled else "Off"
     scope_lower = scope.lower()
     scope_text = "My jobs only" if scope_lower == "own" else "All jobs"
 
     details = [
-        "🔔 Notifications",
+        "🚨 Error Alerts",
         "",
         f"• Status: {status_text}",
         f"• Scope: {scope_text}",
         "",
-        "Choose when you want to receive job alerts.",
+        "Alerts when Deadline reports a render error:",
+        "• Redshift activation failures",
+        "• Scenes pointing at a local C: path",
     ]
     if not enabled:
+        details.append("")
         details.append("• Alerts are currently turned off")
     return "\n".join(details)
 
@@ -146,7 +155,7 @@ def _build_notification_keyboard(enabled: bool, scope: str) -> InlineKeyboardMar
         inline_keyboard=[
             [
                 selectable_inline_button(
-                    text="Receive notifications",
+                    text="Alert me about errors",
                     callback_data="settings:notif:toggle",
                     selected=enabled,
                     prefix_unselected="◻ ",
@@ -712,7 +721,7 @@ async def settings_callback_handler(callback_query: CallbackQuery) -> None:
             enabled, scope = await set_notification_enabled(user_id, not current_enabled)
             await show_notifications()
             await callback_query.answer(
-                "Notifications enabled" if enabled else "Notifications disabled"
+                "Error alerts enabled" if enabled else "Error alerts disabled"
             )
             return
 
