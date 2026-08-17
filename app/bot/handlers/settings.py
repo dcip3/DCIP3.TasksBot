@@ -140,9 +140,9 @@ def _render_notification_settings_text(enabled: bool, scope: str) -> str:
         "",
         "Alerts when Deadline reports a render error:",
         "• Redshift activation failures",
-        "• Scenes pointing at a local C: path",
-        "• A scene the farm keeps failing to open (still syncing?)",
-        "• A worker that cannot start the plugin sandbox",
+        "• Scenes submitted from a local C: path",
+        "• Scenes the farm cannot open (still syncing)",
+        "• Workers that cannot start the plugin sandbox",
     ]
     if not enabled:
         details.append("")
@@ -202,14 +202,12 @@ def _render_probe_settings_text(scope: str) -> str:
     details.extend(
         [
             "",
-            "Renders compute front to back, so for the first hours the ETA is "
-            "only a guess. Probing lets a few chunks from across the whole range "
-            "render first — same work, just a different order — and the ETA "
-            "lands within ~10%.",
+            "Renders compute front to back, so the ETA guesses for hours. "
+            "Probing runs a few chunks from across the whole range first — "
+            "same work, different order — and the ETA lands within ~10%.",
             "",
-            "• My jobs only — the renders you submitted",
-            "• All jobs — other people's renders too, so they get a real ETA. "
-            "Needs the Deadline rights to suspend their tasks.",
+            "• My jobs only — renders you submitted",
+            "• All jobs — other people's too. Needs rights to suspend their tasks.",
         ]
     )
     return "\n".join(details)
