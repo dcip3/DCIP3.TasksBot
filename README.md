@@ -7,6 +7,7 @@ TasksBot is a Telegram bot for monitoring Deadline render jobs, managing queue a
 - Shows jobs/workers in Telegram and supports actions: suspend, resume, requeue, delete.
 - Builds previews on Deadline workers (preview job submitted by the bot).
 - Supports auto-preview when jobs complete (pre-submitted while the render finishes).
+- Previews each render *run*: requeueing tasks of a finished job queues a new preview for the repaired frames.
 - Accepts direct worker-to-bot preview uploads via HTTP endpoint with one-time tokens.
 
 ## Current Architecture

@@ -1938,6 +1938,18 @@ async def worker_toggle_enable_callback(callback_query: CallbackQuery) -> None:
         await callback_query.answer("Error updating worker status.", show_alert=True)
 
 
+async def _forget_previewed_runs(job_id: str) -> None:
+    """A requeue from chat starts a new render run, same as one from Monitor."""
+    from app.services.job_watcher import forget_auto_preview_run
+
+    try:
+        await forget_auto_preview_run(job_id)
+    except Exception as exc:
+        logger.warning(
+            "Could not clear preview run records for requeued job %s: %s", job_id, exc
+        )
+
+
 @router.callback_query(lambda c: c.data and c.data.startswith("requeue_job:"))
 async def requeue_job_callback(callback_query: CallbackQuery) -> None:
     """Handle requeue job button press."""
@@ -1956,6 +1968,8 @@ async def requeue_job_callback(callback_query: CallbackQuery) -> None:
             success = await resume_failed_job_by_user_id(
                 callback_query.from_user.id, job_id
             )
+            if success:
+                await _forget_previewed_runs(job_id)
             await callback_query.answer(
                 "Failed tasks requeued!" if success else "Failed to resume job.",
                 show_alert=not success,
@@ -1964,6 +1978,7 @@ async def requeue_job_callback(callback_query: CallbackQuery) -> None:
 
         success = await requeue_job_by_user_id(callback_query.from_user.id, job_id)
         if success:
+            await _forget_previewed_runs(job_id)
             await callback_query.answer("Job requeued successfully!")
         else:
             await callback_query.answer("Failed to requeue job.", show_alert=True)
@@ -1986,6 +2001,7 @@ async def resume_failed_job_callback(callback_query: CallbackQuery) -> None:
     try:
         success = await resume_failed_job_by_user_id(callback_query.from_user.id, job_id)
         if success:
+            await _forget_previewed_runs(job_id)
             await callback_query.answer("Failed tasks requeued!")
         else:
             await callback_query.answer("Failed to resume job.", show_alert=True)

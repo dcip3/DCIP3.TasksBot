@@ -112,6 +112,21 @@ class TTLCache:
             return True
         return False
 
+    def remove_where(self, predicate) -> int:
+        """
+        Remove every key the predicate accepts.
+
+        Args:
+            predicate: Callable applied to each key; truthy means remove.
+
+        Returns:
+            Number of entries removed
+        """
+        doomed = [key for key in self._cache if predicate(key)]
+        for key in doomed:
+            del self._cache[key]
+        return len(doomed)
+
     def _cleanup(self) -> int:
         """
         Remove all expired entries from the cache.

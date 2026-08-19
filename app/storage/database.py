@@ -96,6 +96,29 @@ async def init_db():
         ON auto_preview_history(created_at)
         """
     )
+    # A render can be previewed more than once: requeueing a few tasks of a
+    # finished job starts a new run that deserves its own preview. These two
+    # columns say which run a row stands for - "armed" while its preview is
+    # queued, "delivered" once that run has been handled, stamped with the
+    # completion time it was handled at.
+    await ensure_column(tasks_db_conn, "auto_preview_history", "run_state", "TEXT")
+    await ensure_column(tasks_db_conn, "auto_preview_history", "completed_at", "TEXT")
+    try:
+        # Rows written before this existed cover a run whose completion time is
+        # unknown. Call them delivered: the next completion adopts its stamp
+        # instead of sending a preview the user has already seen.
+        await tasks_db_conn.execute(
+            """
+            UPDATE auto_preview_history
+            SET run_state = 'delivered'
+            WHERE run_state IS NULL OR run_state = ''
+            """
+        )
+        await tasks_db_conn.commit()
+    except Exception as backfill_error:
+        logger.warning(
+            "Failed to backfill auto_preview_history run state: %s", backfill_error
+        )
 
     # Probe scheduling state. This one MUST survive a restart: while a job is
     # being probed most of its tasks sit suspended, and only this table tells

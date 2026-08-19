@@ -79,8 +79,40 @@ async def handle_deadline_event(request: web.Request) -> web.Response:
         # Do not make the farm wait for the HTTP response.
         asyncio.create_task(release_previews_waiting_on(job_id))
 
+    if event == "job_requeued" and job_id:
+        # The render is going to produce new frames, so whatever was previewed
+        # before is out of date. Forget the run records and the scan woken
+        # below queues a preview for the new run.
+        asyncio.create_task(forget_previewed_runs_of(job_id))
+
     request_watcher_wakeup(f"{event} {job_id}")
     return web.Response(status=200, text="ok")
+
+
+async def forget_previewed_runs_of(source_job_id: str) -> None:
+    """Let a requeued render be previewed again.
+
+    Auto previews are deduplicated per render run, and a requeue starts a new
+    one. The watcher notices a requeue by itself on its next pass; doing it
+    here as well only makes it immediate.
+    """
+    from app.services.job_watcher import forget_auto_preview_run
+
+    try:
+        owners = await forget_auto_preview_run(source_job_id)
+    except Exception as exc:
+        logger.warning(
+            "Could not clear preview run records for requeued job %s: %s",
+            source_job_id,
+            exc,
+        )
+        return
+    if owners:
+        logger.info(
+            "Job %s was requeued; %s watcher(s) may get a new preview",
+            source_job_id,
+            owners,
+        )
 
 
 async def release_previews_waiting_on(source_job_id: str) -> int:

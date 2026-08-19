@@ -1124,34 +1124,91 @@ async def _process_active_previews_parallel(
             )
 
 
-async def _register_auto_preview_history(telegram_user_id: int, job_id: str) -> bool:
-    """Return True only for new (user, job) pairs, False when already processed."""
+# What a history row says about the render run it stands for: its preview is
+# queued ("armed"), or that run has been handled ("delivered").
+_RUN_ARMED = "armed"
+_RUN_DELIVERED = "delivered"
+
+# Answers to "does this run still need a preview?". UNKNOWN means the database
+# could not say, and the in-memory dedupe is all there is to go on.
+_CLAIM_NEW = "new"
+_CLAIM_KNOWN = "known"
+_CLAIM_UNKNOWN = "unknown"
+
+
+async def _read_auto_preview_run(
+    conn, telegram_user_id: int, job_id: str
+) -> Optional[tuple]:
+    async with conn.execute(
+        """
+        SELECT run_state, completed_at
+        FROM auto_preview_history
+        WHERE telegram_user_id = ? AND job_id = ?
+        LIMIT 1
+        """,
+        (telegram_user_id, job_id),
+    ) as cursor:
+        return await cursor.fetchone()
+
+
+async def _write_auto_preview_run(
+    conn, telegram_user_id: int, job_id: str, run_state: str, completed_at: str
+) -> None:
+    await conn.execute(
+        """
+        INSERT INTO auto_preview_history
+            (telegram_user_id, job_id, created_at, run_state, completed_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(telegram_user_id, job_id) DO UPDATE SET
+            created_at = excluded.created_at,
+            run_state = excluded.run_state,
+            completed_at = excluded.completed_at
+        """,
+        (telegram_user_id, job_id, int(time.time()), run_state, completed_at),
+    )
+    await conn.commit()
+
+
+async def _claim_completed_run(
+    telegram_user_id: int, job_id: str, completed_at: str
+) -> str:
+    """Does this completion still need a preview?
+
+    A render can finish more than once: requeueing a few tasks of a finished
+    job starts another run, and those repaired frames are exactly what the
+    user wants to see. So the question is not "was this job previewed" but
+    "was *this completion* previewed", which is what the stored completion
+    time answers.
+    """
     conn = get_db_connection()
     if conn is None:
-        return True
+        return _CLAIM_UNKNOWN
 
+    stamp = str(completed_at or "").strip()
     try:
-        async with conn.execute(
-            """
-            SELECT 1
-            FROM auto_preview_history
-            WHERE telegram_user_id = ? AND job_id = ?
-            LIMIT 1
-            """,
-            (telegram_user_id, job_id),
-        ) as cursor:
-            if await cursor.fetchone():
-                return False
+        row = await _read_auto_preview_run(conn, telegram_user_id, job_id)
+        if row is None:
+            await _write_auto_preview_run(
+                conn, telegram_user_id, job_id, _RUN_DELIVERED, stamp
+            )
+            return _CLAIM_NEW
 
-        cursor = await conn.execute(
-            """
-            INSERT OR IGNORE INTO auto_preview_history (telegram_user_id, job_id, created_at)
-            VALUES (?, ?, ?)
-            """,
-            (telegram_user_id, job_id, int(time.time())),
+        known = str(row[1] or "").strip()
+        if not known:
+            # Either a preview is already on its way for this run, or the row
+            # predates run tracking. Adopt this completion as the one it
+            # stands for rather than sending a preview twice.
+            await _write_auto_preview_run(
+                conn, telegram_user_id, job_id, _RUN_DELIVERED, stamp
+            )
+            return _CLAIM_KNOWN
+        if not stamp or known == stamp:
+            return _CLAIM_KNOWN
+
+        await _write_auto_preview_run(
+            conn, telegram_user_id, job_id, _RUN_DELIVERED, stamp
         )
-        await conn.commit()
-        return (cursor.rowcount or 0) > 0
+        return _CLAIM_NEW
     except Exception as exc:
         logger.warning(
             "Watcher: failed to access auto_preview_history for user %s job %s: %s",
@@ -1159,8 +1216,82 @@ async def _register_auto_preview_history(telegram_user_id: int, job_id: str) -> 
             job_id,
             exc,
         )
-        # Fallback to in-memory dedupe only.
-        return True
+        return _CLAIM_UNKNOWN
+
+
+async def _claim_new_run(telegram_user_id: int, job_id: str) -> str:
+    """Is this render running a run that has no preview queued yet?
+
+    True for a render seen for the first time, and again for one that is back
+    at work after a run we already delivered - that is a requeue, and it earns
+    its own preview.
+    """
+    conn = get_db_connection()
+    if conn is None:
+        return _CLAIM_UNKNOWN
+
+    try:
+        row = await _read_auto_preview_run(conn, telegram_user_id, job_id)
+        if row is not None and str(row[0] or "").strip().lower() == _RUN_ARMED:
+            return _CLAIM_KNOWN
+        await _write_auto_preview_run(conn, telegram_user_id, job_id, _RUN_ARMED, "")
+        return _CLAIM_NEW
+    except Exception as exc:
+        logger.warning(
+            "Watcher: failed to access auto_preview_history for user %s job %s: %s",
+            telegram_user_id,
+            job_id,
+            exc,
+        )
+        return _CLAIM_UNKNOWN
+
+
+async def forget_auto_preview_run(job_id: str, telegram_user_id: Optional[int] = None) -> int:
+    """Drop what we remember about a render's runs, for all of its watchers.
+
+    Called when the farm says a job was requeued: whatever was previewed
+    before, the render is producing new frames now and the next scan should
+    treat it as a fresh run.
+    """
+    job_id = str(job_id or "").strip()
+    if not job_id:
+        return 0
+
+    owners: list[int] = []
+    conn = get_db_connection()
+    if conn is not None:
+        try:
+            if telegram_user_id is None:
+                async with conn.execute(
+                    "SELECT telegram_user_id FROM auto_preview_history WHERE job_id = ?",
+                    (job_id,),
+                ) as cursor:
+                    owners = [int(row[0]) for row in await cursor.fetchall()]
+                await conn.execute(
+                    "DELETE FROM auto_preview_history WHERE job_id = ?", (job_id,)
+                )
+            else:
+                cursor = await conn.execute(
+                    "DELETE FROM auto_preview_history WHERE job_id = ? AND telegram_user_id = ?",
+                    (job_id, telegram_user_id),
+                )
+                if (cursor.rowcount or 0) > 0:
+                    owners = [int(telegram_user_id)]
+            await conn.commit()
+        except Exception as exc:
+            logger.warning(
+                "Watcher: failed to clear auto_preview_history for job %s: %s",
+                job_id,
+                exc,
+            )
+
+    if telegram_user_id is None:
+        auto_preview_jobs.remove_where(
+            lambda key: isinstance(key, tuple) and key and key[0] == job_id
+        )
+    else:
+        auto_preview_jobs.remove((job_id, telegram_user_id))
+    return len(owners)
 
 
 async def _maybe_cleanup_auto_preview_history() -> None:
@@ -1289,6 +1420,42 @@ def _is_presubmitted_preview(props: dict) -> bool:
     return False
 
 
+def _sources_with_live_previews(jobs: list, telegram_user_id: int) -> set[str]:
+    """Renders that already have a preview job of their own on the farm.
+
+    This holds back the preview a *running* render would otherwise get queued
+    twice, and it is read before the run records are touched, so a render whose
+    earlier preview is still up is left exactly as it was and its new run is
+    picked up on a later pass, once that preview has delivered and gone.
+
+    A completion is never held back this way. Whether a preview covers it is
+    already recorded - an armed run says one is on its way - and a completion
+    nobody has covered must be sent even while an older preview is still
+    rendering the frames it replaced.
+    """
+    from app.services.preview.runtime import _extract_preview_context
+
+    live: set[str] = set()
+    for entry in jobs:
+        if not isinstance(entry, dict):
+            continue
+        props = entry.get("Props") or {}
+        if not isinstance(props, dict) or not _is_preview_job(props):
+            continue
+        # 1=queued/rendering, 2=suspended, 6=pending on its render
+        if entry.get("Stat", 0) not in {1, 2, 6}:
+            continue
+        try:
+            *_, owner_id, _, source_job_id = _extract_preview_context(
+                props, telegram_user_id
+            )
+        except Exception:
+            continue
+        if source_job_id and owner_id == telegram_user_id:
+            live.add(str(source_job_id))
+    return live
+
+
 async def _reconcile_presubmitted_previews(user: "_WatcherUser", jobs: list) -> None:
     """Clean up pre-submitted previews whose render will never complete.
 
@@ -1405,6 +1572,7 @@ async def _scan_auto_preview_candidates(users: list[_WatcherUser]) -> int:
                 return 0
 
             scheduled = 0
+            live_previews = _sources_with_live_previews(jobs, user.telegram_user_id)
             for job in jobs:
                 if not isinstance(job, dict):
                     continue
@@ -1434,14 +1602,17 @@ async def _scan_auto_preview_candidates(users: list[_WatcherUser]) -> int:
                         and _presubmit_ready(job, props)
                         and _job_matches_scope(user.auto_scope, user.login, props, job)
                     ):
-                        auto_key = (job_id, user.telegram_user_id)
-                        if auto_key in auto_preview_jobs:
+                        if job_id in live_previews:
+                            # This render already has a preview on the farm.
+                            # Leave the record untouched: once that preview is
+                            # done and gone, a run still waiting for one is
+                            # picked up on a later pass.
                             continue
-                        is_new = await _register_auto_preview_history(
-                            user.telegram_user_id, job_id
-                        )
-                        if not is_new:
-                            auto_preview_jobs.add(auto_key)
+                        auto_key = (job_id, user.telegram_user_id)
+                        claim = await _claim_new_run(user.telegram_user_id, job_id)
+                        if claim == _CLAIM_KNOWN:
+                            continue
+                        if claim == _CLAIM_UNKNOWN and auto_key in auto_preview_jobs:
                             continue
                         auto_preview_jobs.add(auto_key)
                         job_name = str(props.get("Name") or "").split("/")[-1] or job_id
@@ -1463,12 +1634,14 @@ async def _scan_auto_preview_candidates(users: list[_WatcherUser]) -> int:
                     continue
 
                 auto_key = (job_id, user.telegram_user_id)
-                if auto_key in auto_preview_jobs:
+                claim = await _claim_completed_run(
+                    user.telegram_user_id,
+                    job_id,
+                    str(job.get("DateComp") or props.get("DateComp") or ""),
+                )
+                if claim == _CLAIM_KNOWN:
                     continue
-
-                is_new = await _register_auto_preview_history(user.telegram_user_id, job_id)
-                if not is_new:
-                    auto_preview_jobs.add(auto_key)
+                if claim == _CLAIM_UNKNOWN and auto_key in auto_preview_jobs:
                     continue
 
                 auto_preview_jobs.add(auto_key)
