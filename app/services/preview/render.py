@@ -126,6 +126,93 @@ def _normalize_listed_workers(raw_value: Any) -> List[str]:
     return normalized
 
 
+def _worker_is_usable(entry: Dict[str, Any]) -> bool:
+    """Can this worker take a task at all?
+
+    Its status is not the whole answer: a Worker that has been disabled in
+    Deadline keeps reporting itself as Idle - it stays connected, it just never
+    dequeues anything - so a job pinned to it waits for good.
+    """
+    info = entry.get("Info") or {}
+    worker_settings = entry.get("Settings") or {}
+    if worker_settings.get("Enable") is False:
+        return False
+    return info.get("Stat") in ALLOWED_WORKER_STATUSES
+
+
+def _unusable_workers(
+    names: List[str], workers: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Which of these workers cannot take the preview, and why."""
+    by_name = {}
+    for entry in workers:
+        info = entry.get("Info") or {}
+        name = info.get("Name")
+        if name:
+            by_name[name] = entry
+
+    unusable: List[Dict[str, Any]] = []
+    for name in names:
+        entry = by_name.get(name)
+        if entry is None:
+            unusable.append(
+                {"name": name, "status_code": None, "status_text": "Unknown worker"}
+            )
+            continue
+        if _worker_is_usable(entry):
+            continue
+        status_code = (entry.get("Info") or {}).get("Stat")
+        if (entry.get("Settings") or {}).get("Enable") is False:
+            status_text = "Disabled"
+        else:
+            status_text = settings.worker_status_map.get(
+                status_code, f"Unknown ({status_code})"
+            )
+        unusable.append(
+            {"name": name, "status_code": status_code, "status_text": status_text}
+        )
+    return unusable
+
+
+def _machine_restriction_fields(
+    preferred_slaves: List[str], whitelist_flag: Optional[bool]
+) -> Dict[str, Any]:
+    """Deadline job-info fields for a machine allow or deny list.
+
+    Deadline's submission keys are "Whitelist" and "Blacklist"; which one is
+    used *is* the flag. There is no key that flips a list from one to the
+    other - "WhitelistFlag" belongs to Limit Groups and is ignored here - so
+    writing the deny list under "Whitelist" pinned the preview to the very
+    machines the artist had excluded from the render.
+    """
+    if not preferred_slaves:
+        return {"MachineLimit": 0}
+    if whitelist_flag is False:
+        # A deny list says where the preview must not go; every other machine
+        # is fair game, so it must not carry a machine limit of its own.
+        return {"MachineLimit": 0, "Blacklist": ",".join(preferred_slaves)}
+    return {
+        "MachineLimit": len(preferred_slaves),
+        "Whitelist": ",".join(preferred_slaves),
+    }
+
+
+def preview_cannot_run_anywhere(
+    preview_props: Dict[str, Any], workers: List[Dict[str, Any]]
+) -> bool:
+    """True when no machine on the farm may pick this preview up.
+
+    Only an allow list can do that: it names the machines, and when none of
+    them can take a task the job sits in the queue for ever. Deadline shows it
+    as Queued with no error, which looks exactly like a busy farm until you
+    check what it is allowed to run on.
+    """
+    listed, whitelist_flag = _resolve_machine_restrictions(preview_props)
+    if not listed or whitelist_flag is False:
+        return False
+    return len(_unusable_workers(listed, workers)) == len(listed)
+
+
 def _resolve_machine_restrictions(job_props: Dict[str, Any]) -> tuple[List[str], Optional[bool]]:
     """Extract whitelist/blacklist settings from the source job."""
     listed_workers = _normalize_listed_workers(job_props.get("ListedSlaves"))
@@ -399,38 +486,31 @@ async def create_video_from_job(
         preferred_slaves = []
         whitelist_flag = None
 
-    if preferred_slaves and whitelist_flag is not False and not skip_worker_validation:
+    # An allow list may only name machines that can actually take the job. A
+    # deny list needs no such check - it says where the preview must not go.
+    if preferred_slaves and whitelist_flag is not False:
         workers = await get_workers_by_credentials(login, password)
-        worker_map = {}
-        for worker in workers:
-            info = worker.get("Info", {})
-            name = info.get("Name")
-            if name:
-                worker_map[name] = info
-        invalid_workers: List[Dict[str, Any]] = []
-        for slave in preferred_slaves:
-            info = worker_map.get(slave)
-            if not info:
-                invalid_workers.append(
-                    {
-                        "name": slave,
-                        "status_code": None,
-                        "status_text": "Unknown worker",
-                    }
-                )
-                continue
-            status_code = info.get("Stat")
-            if status_code not in ALLOWED_WORKER_STATUSES:
-                status_text = settings.worker_status_map.get(status_code, f"Unknown ({status_code})")
-                invalid_workers.append(
-                    {
-                        "name": slave,
-                        "status_code": status_code,
-                        "status_text": status_text,
-                    }
-                )
-        if invalid_workers:
+        invalid_workers = _unusable_workers(preferred_slaves, workers)
+        if invalid_workers and not skip_worker_validation:
             raise WorkerStatusError(invalid_workers, preferred_slaves)
+        if invalid_workers:
+            # Nobody is waiting to be asked here (auto previews, retries), and
+            # a preview pinned to a machine that cannot run it waits in the
+            # queue for ever without a word. Run it somewhere that works.
+            unusable_names = {entry["name"] for entry in invalid_workers}
+            logger.warning(
+                "Preview for %s: dropping unusable worker(s) %s from the allow list",
+                job_id,
+                ", ".join(
+                    f"{entry['name']} ({entry['status_text']})"
+                    for entry in invalid_workers
+                ),
+            )
+            preferred_slaves = [
+                name for name in preferred_slaves if name not in unusable_names
+            ]
+            if not preferred_slaves:
+                whitelist_flag = None
 
     # Outrank the source render (and its siblings) so the worker that frees up
     # picks this preview before dequeuing the next render job.
@@ -449,7 +529,6 @@ async def create_video_from_job(
         "Frames": "0-0",
         "ChunkSize": 1,
         "Priority": preview_priority,
-        "MachineLimit": len(preferred_slaves) if preferred_slaves else 0,
         "ExtraInfo0": expected_local_path,
         "ExtraInfo1": expected_display_video,
         "ExtraInfoKeyValue0": f"PreviewLocal={expected_local_path}",
@@ -479,9 +558,7 @@ async def create_video_from_job(
         preview_job_info["SecondaryPool"] = props["SecPool"]
     if props.get("Grp"):
         preview_job_info["Group"] = props["Grp"]
-    if preferred_slaves:
-        preview_job_info["Whitelist"] = ",".join(preferred_slaves)
-        preview_job_info["WhitelistFlag"] = "True" if whitelist_flag is not False else "False"
+    preview_job_info.update(_machine_restriction_fields(preferred_slaves, whitelist_flag))
 
     environment_pairs: Dict[str, str] = {
         "PREVIEW_SCRIPT_B64": script_b64,

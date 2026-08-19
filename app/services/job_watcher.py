@@ -53,6 +53,9 @@ _ERROR_LOADING_RE = re.compile(
 )
 
 _AUTO_PREVIEW_SCAN_INTERVAL_SECONDS = 30
+# How long a preview may sit on unusable machines before it is moved. Long
+# enough that a Worker restarting is not mistaken for one that is gone.
+_STRANDED_PREVIEW_GRACE_SECONDS = 180
 # How long a suspended render may hold its pending preview before the preview is
 # dropped. Short pauses (fixing something and resuming) keep their preview; a
 # render left paused releases it, and resuming re-queues a fresh one.
@@ -69,6 +72,8 @@ _PROBE_SCAN_INTERVAL_SECONDS = 10
 _ERROR_REPORT_MAX_AGE_SECONDS = 24 * 60 * 60
 _ERROR_ALERT_CACHE_TTL_SECONDS = 14 * 24 * 60 * 60
 _last_auto_preview_history_cleanup_monotonic = 0.0
+# Previews waiting on machines that cannot take them: id -> first seen.
+_stranded_preview_since: dict[str, float] = {}
 _error_alert_cache = TTLCache(
     ttl_seconds=_ERROR_ALERT_CACHE_TTL_SECONDS,
     max_size=100000,
@@ -1456,6 +1461,100 @@ def _sources_with_live_previews(jobs: list, telegram_user_id: int) -> set[str]:
     return live
 
 
+async def _strand_check(user: "_WatcherUser", previews: list) -> set[str]:
+    """Previews that are queued on machines which cannot take them.
+
+    A Worker can be disabled or go offline after its preview was queued, and
+    then the job waits in the queue with no error and no worker - the farm
+    cannot tell anyone, because from Deadline's side nothing is wrong. Held for
+    a grace period first, so a Worker restarting does not count.
+    """
+    from app.services.deadline import get_workers_by_credentials
+    from app.services.preview.render import preview_cannot_run_anywhere
+
+    # Only jobs waiting to start can be stranded; a rendering one has a worker.
+    waiting = [
+        (preview_id, props)
+        for preview_id, preview, props in previews
+        if preview.get("Stat", 0) == 1 and _job_chunk_count(preview, "RenderingChunks") == 0
+    ]
+    if not waiting:
+        _stranded_preview_since.clear()
+        return set()
+
+    try:
+        workers = await get_workers_by_credentials(user.login, user.password)
+    except Exception as exc:
+        logger.warning("Watcher: could not read workers for preview check: %s", exc)
+        return set()
+    if not workers:
+        return set()
+
+    stranded: set[str] = set()
+    for preview_id, props in waiting:
+        if not preview_cannot_run_anywhere(props, workers):
+            _stranded_preview_since.pop(preview_id, None)
+            continue
+        since = _stranded_preview_since.setdefault(preview_id, time.monotonic())
+        if (time.monotonic() - since) >= _STRANDED_PREVIEW_GRACE_SECONDS:
+            stranded.add(preview_id)
+    return stranded
+
+
+async def _rescue_stranded_preview(
+    user: "_WatcherUser", preview_id: str, props: dict
+) -> None:
+    """Replace a preview nobody can run with one that is free to go elsewhere."""
+    from app.services.deadline import delete_job
+    from app.services.preview.runtime import (
+        _extract_preview_context,
+        _submit_auto_preview_deadline,
+        untrack_preview_job,
+    )
+
+    *_, owner_id, _, source_job_id = _extract_preview_context(
+        props, user.telegram_user_id
+    )
+    if not source_job_id or owner_id != user.telegram_user_id:
+        return
+
+    try:
+        deleted = await delete_job(user.login, user.password, preview_id)
+    except Exception as exc:
+        logger.warning("Watcher: could not delete stranded preview %s: %s", preview_id, exc)
+        return
+    if not deleted:
+        return
+
+    _stranded_preview_since.pop(preview_id, None)
+    untrack_preview_job(preview_id)
+    pop_preview_message(preview_id)
+    logger.warning(
+        "Watcher: preview %s could not run on any allowed worker; resubmitting for %s",
+        preview_id,
+        source_job_id,
+    )
+
+    job_name = str(props.get("Name") or "").split("/")[-1].removesuffix(" - Preview")
+    # The render has long finished by now, so this one starts straight away.
+    # Submission re-reads the machine list and drops workers that cannot take
+    # it, which is what keeps this from queueing another stranded preview.
+    submitted = await _submit_auto_preview_deadline(
+        user.telegram_user_id,
+        source_job_id,
+        job_name or source_job_id,
+        user.preview_worker,
+        notify_on_failure=False,
+    )
+    if not submitted:
+        logger.error(
+            "Watcher: could not resubmit preview for %s after it was stranded",
+            source_job_id,
+        )
+        auto_preview_jobs.remove((source_job_id, user.telegram_user_id))
+        await _unregister_auto_preview_history(user.telegram_user_id, source_job_id)
+
+
 async def _reconcile_presubmitted_previews(user: "_WatcherUser", jobs: list) -> None:
     """Clean up pre-submitted previews whose render will never complete.
 
@@ -1484,9 +1583,15 @@ async def _reconcile_presubmitted_previews(user: "_WatcherUser", jobs: list) -> 
         ):
             previews.append((entry_id, entry, props))
 
+    stranded = await _strand_check(user, previews)
+
     for preview_id, preview, props in previews:
         # 1=queued/rendering, 2=suspended, 6=pending on a dependency
         if preview.get("Stat", 0) not in {1, 2, 6}:
+            continue
+
+        if preview_id in stranded:
+            await _rescue_stranded_preview(user, preview_id, props)
             continue
 
         _, _, _, target_user_id, _, source_job_id = _extract_preview_context(
