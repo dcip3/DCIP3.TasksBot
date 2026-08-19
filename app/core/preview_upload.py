@@ -898,6 +898,9 @@ async def _handle_preview_upload(request: web.Request) -> web.Response:
         overscan_header = request.headers.get("X-Preview-Overscan")
         if overscan_header:
             upload_meta["overscan"] = urllib.parse.unquote(overscan_header).strip()
+        passes_header = request.headers.get("X-Preview-Passes")
+        if passes_header:
+            upload_meta["passes"] = urllib.parse.unquote(passes_header).strip()
         if upload_meta:
             with contextlib.suppress(Exception):
                 (upload_dir / _UPLOAD_META_FILENAME).write_text(
@@ -1056,6 +1059,7 @@ async def _deliver_preview(payload: PreviewUploadPayload, temp_path: Path) -> No
         resolution=upload_meta.get("resolution"),
         color_controls=upload_meta.get("color_controls"),
         overscan=upload_meta.get("overscan"),
+        passes=upload_meta.get("passes"),
     )
 
     async def _delete() -> bool:

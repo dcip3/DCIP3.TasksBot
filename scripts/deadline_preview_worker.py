@@ -2099,6 +2099,41 @@ def _describe_overscan(sidecar: Optional[dict]) -> Optional[str]:
     return f"Overscan {amount}"
 
 
+# A long AOV list would crowd out the rest of the caption, so name the first
+# few and count the rest.
+_MAX_NAMED_PASSES = 8
+
+
+def _describe_passes(sidecar: Optional[dict]) -> Optional[str]:
+    """The extra passes this render writes, named as they are in the AOV list.
+
+    The names come from each AOV's "Name" field, because that is what ends up
+    in the EXR layer and in the AOV tab the artist is looking at. AOVs with no
+    name of their own fall back to their type ("Cryptomatte", "Z Depth").
+    """
+    aovs = (sidecar or {}).get("aovs")
+    if not isinstance(aovs, dict) or aovs.get("all_disabled"):
+        return None
+
+    names: List[str] = []
+    for entry in aovs.get("list") or []:
+        if not isinstance(entry, dict) or not entry.get("enabled", True):
+            continue
+        for candidate in (entry.get("name"), entry.get("type_label"), entry.get("type")):
+            name = str(candidate or "").strip()
+            if name:
+                break
+        if name and name not in names:
+            names.append(name)
+    if not names:
+        return None
+
+    shown = names[:_MAX_NAMED_PASSES]
+    if len(names) > len(shown):
+        return ", ".join(shown) + " +%d more" % (len(names) - len(shown))
+    return ", ".join(shown)
+
+
 def _frame_resolution(sidecar: Optional[dict]) -> Optional[str]:
     """The size the shot is delivered at, before overscan is added."""
     res = (sidecar or {}).get("resolution") or {}
@@ -2137,7 +2172,10 @@ def _upload_metadata_headers(
     ffmpeg_path: str,
     sidecar: Optional[dict] = None,
 ) -> dict:
-    """Describe the preview for the bot's caption (LUT, color controls, resolution)."""
+    """Describe the preview for the bot's caption.
+
+    Covers the LUT, color controls, resolution and the extra passes rendered.
+    """
     headers: dict = {}
     lut_spec = (color_spec or {}).get("lut")
     if lut_spec and lut_spec.get("file"):
@@ -2163,6 +2201,9 @@ def _upload_metadata_headers(
         headers["X-Preview-Resolution"] = resolution
     if overscan_summary:
         headers["X-Preview-Overscan"] = urllib.parse.quote(overscan_summary, safe="")
+    passes_summary = _describe_passes(sidecar)
+    if passes_summary:
+        headers["X-Preview-Passes"] = urllib.parse.quote(passes_summary, safe="")
     return headers
 
 

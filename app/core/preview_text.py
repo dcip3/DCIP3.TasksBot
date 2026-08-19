@@ -28,11 +28,12 @@ def build_preview_caption(
     resolution: Optional[str] = None,
     color_controls: Optional[str] = None,
     overscan: Optional[str] = None,
+    passes: Optional[str] = None,
 ) -> str:
     """Build a consistent caption for preview media.
 
     Layout: title, blank line, optional render details (resolution, overscan,
-    camera LUT, camera color controls), blank line, source path.
+    extra passes, camera LUT, camera color controls), blank line, source path.
     """
     parts = [f"{icon} {_normalize_title(title)}"]
 
@@ -43,6 +44,10 @@ def build_preview_caption(
         # The preview is wider than the delivered frame; say so, because
         # otherwise the extra margin reads as part of the shot.
         details.append(f"🖼 <code>{html.escape(_pretty_dimensions(overscan))}</code>")
+    if passes:
+        # The AOVs riding along with the beauty. Names only - no dimension
+        # formatting, because an AOV may legitimately be called "x2".
+        details.append(f"🧩 <code>{html.escape(str(passes))}</code>")
     if lut:
         details.append(f"🎨 <code>{html.escape(str(lut))}</code>")
     if color_controls:
