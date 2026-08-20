@@ -669,19 +669,79 @@ def _humanize_eta(eta_str: str) -> str:
     return f"{hours} h {minutes} min"
 
 
-def _job_render_seconds(job: dict, now_utc: datetime | None = None) -> float | None:
-    """Wall time the render has taken: start of rendering to finish, or to now.
+def _render_busy_seconds(tasks: list, now_utc: datetime) -> float | None:
+    """How long this job was actually rendering, waiting not counted.
 
-    Deliberately measured from DateStart rather than submission - a job can sit
-    queued for hours, and that waiting is not render time.
+    A job does not render for every minute between its first task and its last:
+    the farm takes its machines away for other work, probing suspends most of
+    its tasks, a requeue puts it back in the queue. One job on the farm read
+    "13 h 33 min" on its card while only 4 h 27 min of that had a task
+    running - the other nine hours it sat waiting its turn.
+
+    So this measures the union of the intervals in which at least one task was
+    rendering. Overlaps count once: two machines working in parallel make a job
+    finish sooner, not take longer.
+    """
+    spans: list[list[datetime]] = []
+    for task in tasks or []:
+        if not isinstance(task, dict):
+            continue
+        started = _parse_task_datetime(task.get("StartRen")) or _parse_task_datetime(
+            task.get("Start")
+        )
+        if started is None:
+            continue
+        finished = _parse_task_datetime(task.get("Comp"))
+        if finished is None:
+            # 4 = rendering right now; anything else without a completion time
+            # was requeued or suspended, and its earlier run cannot be measured.
+            if task.get("Stat") != 4:
+                continue
+            finished = now_utc
+        if finished <= started:
+            continue
+        spans.append([started, finished])
+
+    if not spans:
+        return None
+
+    spans.sort()
+    merged = [spans[0]]
+    for start, end in spans[1:]:
+        if start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+
+    seconds = sum((end - start).total_seconds() for start, end in merged)
+    return seconds if seconds > 0 else None
+
+
+def _job_render_seconds(
+    job: dict,
+    now_utc: datetime | None = None,
+    *,
+    tasks: list | None = None,
+) -> float | None:
+    """Time the render has taken, counting only the time it was rendering.
+
+    Falls back to the wall time since DateStart when there are no task details
+    to go on - still better than measuring from submission, since a job can sit
+    queued for hours before it starts.
     """
     if not isinstance(job, dict):
         return None
+    now = now_utc or datetime.now(timezone.utc)
+
+    busy = _render_busy_seconds(tasks or [], now)
+    if busy is not None:
+        return busy
+
     started = render_cost._parse_datetime(job.get("DateStart"))
     if started is None:
         return None
     finished = render_cost._parse_datetime(job.get("DateComp"))
-    end = finished or (now_utc or datetime.now(timezone.utc))
+    end = finished or now
     seconds = (end - started).total_seconds()
     return seconds if seconds > 0 else None
 
@@ -1574,7 +1634,7 @@ async def job_info_callback(callback_query: CallbackQuery) -> None:
                 progress_str=progress_str,
                 errors_count=errors_count,
                 eta_str=eta_str,
-                render_seconds=_job_render_seconds(job),
+                render_seconds=_job_render_seconds(job, tasks=tasks),
             )
 
             is_preview_job, preview_source_id = _extract_preview_meta(props)
@@ -1656,7 +1716,7 @@ async def job_update_callback(callback_query: CallbackQuery) -> None:
             progress_str=progress_str,
             errors_count=errors_count,
             eta_str=eta_str,
-            render_seconds=_job_render_seconds(selected_job),
+            render_seconds=_job_render_seconds(selected_job, tasks=tasks),
         )
 
         is_preview_job, preview_source_id = _extract_preview_meta(props)

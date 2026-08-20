@@ -1012,7 +1012,8 @@ async def _handle_missing_preview_job(preview_job_id: str, user: _WatcherUser) -
     Usually it was deleted by hand (or cleaned up by the farm). A few misses are
     tolerated first, because a lookup can also fail transiently. Once it is
     considered gone, the dedupe records are cleared so the render can get a new
-    preview instead of being skipped forever.
+    preview instead of being skipped forever - unless that preview is gone
+    precisely because it delivered, which is not a run owed anything.
     """
     strikes = preview_missing_strikes.get(preview_job_id, 0) + 1
     preview_missing_strikes[preview_job_id] = strikes
@@ -1030,9 +1031,23 @@ async def _handle_missing_preview_job(preview_job_id: str, user: _WatcherUser) -
         "Watcher: preview job %s is gone from Deadline; no longer following it",
         preview_job_id,
     )
-    if source_job_id:
-        auto_preview_jobs.remove((source_job_id, user.telegram_user_id))
-        await _unregister_auto_preview_history(user.telegram_user_id, source_job_id)
+    if not source_job_id:
+        return
+
+    if (preview_job_id, user.telegram_user_id) in notified_jobs:
+        # The bot deletes a preview once its video is in the chat, so this is
+        # the ordinary end of a preview, not a lost one. Clearing the records
+        # here sent a second copy of the video the user had just received: the
+        # render still counted as recently completed, so the next scan saw a
+        # completion with nothing on record and made another preview of it.
+        logger.debug(
+            "Watcher: preview %s was delivered before it vanished; run stays on record",
+            preview_job_id,
+        )
+        return
+
+    auto_preview_jobs.remove((source_job_id, user.telegram_user_id))
+    await _unregister_auto_preview_history(user.telegram_user_id, source_job_id)
 
 
 async def _process_active_preview_job(
