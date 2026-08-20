@@ -35,7 +35,7 @@ TasksBot is a Telegram bot for monitoring Deadline render jobs, managing queue a
 ## Getting Started
 
 ### Prerequisites
-- Python 3.11+
+- Python 3.13 (the image the bot ships in; 3.11+ still runs it)
 - FFmpeg available in `PATH` (or configured via `FFMPEG_PATH`)
 - Docker + Docker Compose (optional)
 

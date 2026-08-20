@@ -68,10 +68,11 @@ async def authenticate_user(username: str, password: str, telegram_user_id: int)
     """
     try:
         session = await get_aiosession()
-        auth = aiohttp.BasicAuth(username, password)
+        from app.services.deadline import auth_headers
+
         async with session.get(
             f"{settings.deadline_api_url}/jobs",
-            auth=auth,
+            headers=auth_headers(username, password),
             ssl=settings.deadline_tls_verify,
         ) as resp:
             if resp.status == 200:

@@ -28,6 +28,15 @@ from app.core.bot_core import get_aiosession
 logger = logging.getLogger(__name__)
 
 ALLOWED_WORKER_STATUSES = {0, 1, 2}
+
+
+def auth_headers(login: str, password: str) -> Dict[str, str]:
+    """Basic auth for the Deadline RCS, as a header.
+
+    aiohttp.BasicAuth is deprecated and goes away in aiohttp 4; the header it
+    builds is the whole of what the RCS asks for.
+    """
+    return {"Authorization": aiohttp.encode_basic_auth(login, password)}
 T = TypeVar("T")
 # Farm snapshot windows. Data younger than FRESH is served as-is; between FRESH
 # and STALE_MAX it is served instantly while a background refresh runs
@@ -178,11 +187,11 @@ async def _fetch_jobs_by_credentials(
     logger.info("Jobs cache miss for login %s", login)
 
     session = await get_aiosession()
-    auth = aiohttp.BasicAuth(login, password)
+    auth = auth_headers(login, password)
     request_started_at = time.monotonic()
     async with session.get(
         f"{settings.deadline_api_url}/jobs",
-        auth=auth,
+        headers=auth,
         ssl=settings.deadline_tls_verify,
     ) as resp:
         if resp.status != 200:
@@ -429,8 +438,8 @@ async def _fetch_workers(
 
     try:
         session = await get_aiosession()
-        headers = aiohttp.BasicAuth(login, password)
-        async with session.get(f"{settings.deadline_api_url}/slaves?Data=infosettings", auth=headers, ssl=settings.deadline_tls_verify) as resp:
+        headers = auth_headers(login, password)
+        async with session.get(f"{settings.deadline_api_url}/slaves?Data=infosettings", headers=headers, ssl=settings.deadline_tls_verify) as resp:
             logger.info(f"Slaves API response status: {resp.status}")
             if resp.status == 200:
                 data = await resp.json()
@@ -501,11 +510,11 @@ async def get_worker_infosettings(
 
     try:
         session = await get_aiosession()
-        auth = aiohttp.BasicAuth(login, password)
+        auth = auth_headers(login, password)
         async with session.get(
             f"{settings.deadline_api_url}/slaves",
             params=params,
-            auth=auth,
+            headers=auth,
             ssl=settings.deadline_tls_verify,
         ) as resp:
             if resp.status != 200:
@@ -559,7 +568,7 @@ async def save_worker_settings(
     """Save worker settings via Deadline /slaves Command=savesettings."""
     try:
         session = await get_aiosession()
-        auth = aiohttp.BasicAuth(login, password)
+        auth = auth_headers(login, password)
         payload = {
             "Command": "savesettings",
             "SlaveSettings": worker_settings,
@@ -567,7 +576,7 @@ async def save_worker_settings(
         async with session.put(
             f"{settings.deadline_api_url}/slaves",
             json=payload,
-            auth=auth,
+            headers=auth,
             ssl=settings.deadline_tls_verify,
         ) as resp:
             response_text = await resp.text()
@@ -601,12 +610,12 @@ async def save_worker_settings_by_user_id(
 async def get_job_info_direct(login: str, password: str, job_id: str) -> Optional[Dict[str, Any]]:
     """Fetch one job by id using a targeted Deadline query, fallback to cached list lookup."""
     session = await get_aiosession()
-    auth = aiohttp.BasicAuth(login, password)
+    auth = auth_headers(login, password)
     try:
         async with session.get(
             f"{settings.deadline_api_url}/jobs",
             params={"JobID": job_id},
-            auth=auth,
+            headers=auth,
             ssl=settings.deadline_tls_verify,
         ) as resp:
             if resp.status == 200:
@@ -663,8 +672,8 @@ async def get_worker_report_contents(
 
     url = f"{settings.deadline_api_url}/slaves"
     session = await get_aiosession()
-    auth = aiohttp.BasicAuth(login, password)
-    async with session.get(url, params=params, auth=auth, ssl=settings.deadline_tls_verify) as resp:
+    auth = auth_headers(login, password)
+    async with session.get(url, params=params, headers=auth, ssl=settings.deadline_tls_verify) as resp:
         text = await resp.text()
         if resp.status != 200:
             logger.error(
@@ -739,11 +748,11 @@ async def get_job_reports(
 
     try:
         session = await get_aiosession()
-        auth = aiohttp.BasicAuth(login, password)
+        auth = auth_headers(login, password)
         async with session.get(
             f"{settings.deadline_api_url}/jobreports",
             params={"Data": normalized_report_data, "JobID": normalized_job_id},
-            auth=auth,
+            headers=auth,
             ssl=settings.deadline_tls_verify,
         ) as resp:
             raw_text = await resp.text()
@@ -818,7 +827,7 @@ async def get_job_report_contents(
 
     try:
         session = await get_aiosession()
-        auth = aiohttp.BasicAuth(login, password)
+        auth = auth_headers(login, password)
         async with session.get(
             f"{settings.deadline_api_url}/jobreports",
             params={
@@ -826,7 +835,7 @@ async def get_job_report_contents(
                 "JobID": normalized_job_id,
                 "ReportID": normalized_report_id,
             },
-            auth=auth,
+            headers=auth,
             ssl=settings.deadline_tls_verify,
         ) as resp:
             raw_text = await resp.text()
@@ -933,11 +942,11 @@ async def get_job_tasks(login: str, password: str, job_id: str) -> List[Dict[str
     """
     try:
         session = await get_aiosession()
-        headers = aiohttp.BasicAuth(login, password)
+        headers = auth_headers(login, password)
         async with session.get(
             f"{settings.deadline_api_url}/tasks",
             params={"JobID": job_id},
-            auth=headers,
+            headers=headers,
             ssl=settings.deadline_tls_verify,
         ) as resp:
             if resp.status == 200:
@@ -1042,10 +1051,10 @@ async def submit_deadline_job(
     logger.info("Submitting Deadline job via %s", submit_url)
 
     session = await get_aiosession()
-    auth = aiohttp.BasicAuth(login, password)
+    auth = auth_headers(login, password)
     async with session.post(
         submit_url,
-        auth=auth,
+        headers=auth,
         ssl=settings.deadline_tls_verify,
         json=payload,
     ) as resp:
@@ -1076,10 +1085,9 @@ async def submit_deadline_job(
             payload_bytes = await asyncio.to_thread(local_path.read_bytes)
             async with session.put(
                 upload_url,
-                auth=auth,
                 ssl=settings.deadline_tls_verify,
                 data=payload_bytes,
-                headers={"Content-Type": "application/octet-stream"},
+                headers={**auth, "Content-Type": "application/octet-stream"},
             ) as upload_resp:
                 if upload_resp.status not in (200, 201, 204):
                     text = await upload_resp.text()
@@ -1097,7 +1105,7 @@ async def submit_deadline_job(
             complete_url = f"{settings.deadline_api_url}/jobs/{job_id}/complete-submission"
             async with session.post(
                 complete_url,
-                auth=auth,
+                headers=auth,
                 ssl=settings.deadline_tls_verify,
             ) as comp_resp:
                 if comp_resp.status not in (200, 201, 204):
@@ -1132,12 +1140,12 @@ async def _put_job_command(login: str, password: str, command: str, job_id: str)
         raise ValueError(f"Unsupported job command: {command}")
     try:
         session = await get_aiosession()
-        auth = aiohttp.BasicAuth(login, password)
+        auth = auth_headers(login, password)
         json_body = {"Command": command, "JobID": job_id}
         async with session.put(
             f"{settings.deadline_api_url}/jobs",
             json=json_body,
-            auth=auth,
+            headers=auth,
             ssl=settings.deadline_tls_verify,
         ) as resp:
             if resp.status != 200:
@@ -1175,11 +1183,11 @@ async def _put_task_command(
         return False
     try:
         session = await get_aiosession()
-        auth = aiohttp.BasicAuth(login, password)
+        auth = auth_headers(login, password)
         async with session.put(
             f"{settings.deadline_api_url}/tasks",
             json={"Command": command, "JobID": job_id, "TaskList": ids},
-            auth=auth,
+            headers=auth,
             ssl=settings.deadline_tls_verify,
         ) as resp:
             body = (await resp.text()).strip()
@@ -1304,11 +1312,11 @@ async def delete_job(login: str, password: str, job_id: str) -> bool:
     """
     try:
         session = await get_aiosession()
-        headers = aiohttp.BasicAuth(login, password)
+        headers = auth_headers(login, password)
         async with session.delete(
             f"{settings.deadline_api_url}/jobs",
             params={"JobID": job_id},
-            auth=headers,
+            headers=headers,
             ssl=settings.deadline_tls_verify,
         ) as resp:
             success = resp.status == 200

@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.13-slim
 
 # Make pip more resilient to transient network issues during image builds.
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
