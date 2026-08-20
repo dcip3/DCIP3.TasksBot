@@ -304,8 +304,22 @@ class PreviewUploadTokenStore:
                     await conn.commit()
                     return None
                 if state.status in _UPLOAD_STATUSES_WITH_FILE:
-                    await conn.rollback()
-                    return None
+                    # The record says a file arrived. If it is still on disk,
+                    # this upload is a duplicate and the caller is told so.
+                    if _resolve_upload_temp_path(state) is not None:
+                        await conn.rollback()
+                        return None
+                    # If it is not, the only copy left is the one the worker is
+                    # offering, and refusing it is a dead end: the record can
+                    # never leave this state again, so every worker collects
+                    # the same 403 for ever - and each one strikes itself off
+                    # the job until no machine is left that may run it.
+                    logger.warning(
+                        "Upload token %s is marked %s but its file is gone; "
+                        "taking the upload again",
+                        token,
+                        state.status,
+                    )
                 if state.claimed_until > now:
                     await conn.rollback()
                     return None
@@ -313,7 +327,7 @@ class PreviewUploadTokenStore:
                 await conn.execute(
                     """
                     UPDATE preview_upload_tokens
-                    SET claimed_until = ?, status = ?
+                    SET claimed_until = ?, status = ?, delivery_attempts = 0, next_retry_at = 0
                     WHERE token = ?
                     """,
                     (claim_until, STATUS_CLAIMED, token),

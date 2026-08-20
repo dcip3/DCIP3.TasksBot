@@ -36,12 +36,16 @@ class DeadlinePreviewWorkerUploadTests(unittest.TestCase):
             deadline_preview_worker.time,
             "sleep",
         ) as sleep_mock:
-            self.assertTrue(deadline_preview_worker._maybe_upload_preview(self.video_path))
+            self.assertEqual(
+                deadline_preview_worker._maybe_upload_preview(self.video_path),
+                deadline_preview_worker.UPLOAD_OK,
+            )
 
         self.assertEqual(upload_mock.call_count, 3)
         self.assertEqual([call.args[0] for call in sleep_mock.call_args_list], [5, 15])
 
-    def test_upload_failure_returns_false_after_retries(self) -> None:
+    def test_a_bot_that_answers_and_refuses_is_the_bots_problem(self) -> None:
+        """Every attempt got an answer, so this machine is not the difference."""
         with mock.patch.object(
             deadline_preview_worker,
             "_upload_preview_file",
@@ -50,13 +54,46 @@ class DeadlinePreviewWorkerUploadTests(unittest.TestCase):
             deadline_preview_worker.time,
             "sleep",
         ) as sleep_mock:
-            self.assertFalse(deadline_preview_worker._maybe_upload_preview(self.video_path))
+            self.assertEqual(
+                deadline_preview_worker._maybe_upload_preview(self.video_path),
+                deadline_preview_worker.UPLOAD_REFUSED,
+            )
 
         self.assertEqual(upload_mock.call_count, 9)
         self.assertEqual(
             [call.args[0] for call in sleep_mock.call_args_list],
             [5, 15, 30, 60, 120, 240, 480, 480],
         )
+
+    def test_a_bot_that_never_answers_may_be_this_machine(self) -> None:
+        with mock.patch.object(
+            deadline_preview_worker,
+            "_upload_preview_file",
+            side_effect=OSError("connection refused"),
+        ), mock.patch.object(deadline_preview_worker.time, "sleep"):
+            self.assertEqual(
+                deadline_preview_worker._maybe_upload_preview(self.video_path),
+                deadline_preview_worker.UPLOAD_UNREACHABLE,
+            )
+
+    def test_only_an_unreachable_bot_moves_the_task_off_this_worker(self) -> None:
+        """A refusal reaches every machine alike; striking them off one by one
+        walks the job through the farm until nothing can run it."""
+        with mock.patch.object(
+            deadline_preview_worker, "_requeue_preview_task_elsewhere"
+        ) as requeue, mock.patch.object(deadline_preview_worker.time, "sleep"):
+            with self.assertRaises(RuntimeError):
+                deadline_preview_worker._handle_upload_failure(
+                    deadline_preview_worker.UPLOAD_REFUSED
+                )
+            requeue.assert_not_called()
+
+            requeue.return_value = True
+            with self.assertRaises(RuntimeError):
+                deadline_preview_worker._handle_upload_failure(
+                    deadline_preview_worker.UPLOAD_UNREACHABLE
+                )
+            requeue.assert_called_once()
 
     def test_upload_not_configured_is_success(self) -> None:
         with mock.patch.dict(
@@ -66,7 +103,10 @@ class DeadlinePreviewWorkerUploadTests(unittest.TestCase):
             deadline_preview_worker,
             "_upload_preview_file",
         ) as upload_mock:
-            self.assertTrue(deadline_preview_worker._maybe_upload_preview(self.video_path))
+            self.assertEqual(
+                deadline_preview_worker._maybe_upload_preview(self.video_path),
+                deadline_preview_worker.UPLOAD_OK,
+            )
 
         upload_mock.assert_not_called()
 
@@ -85,7 +125,7 @@ class DeadlinePreviewWorkerUploadTests(unittest.TestCase):
         ) as convert_mock, mock.patch.object(
             deadline_preview_worker,
             "_maybe_upload_preview",
-            return_value=True,
+            return_value=deadline_preview_worker.UPLOAD_OK,
         ) as upload_mock, mock.patch.object(
             deadline_preview_worker,
             "run_ffmpeg",
@@ -133,7 +173,7 @@ class DeadlinePreviewWorkerUploadTests(unittest.TestCase):
         ) as validate_mock, mock.patch.object(
             deadline_preview_worker,
             "_maybe_upload_preview",
-            return_value=True,
+            return_value=deadline_preview_worker.UPLOAD_OK,
         ) as upload_mock:
             result = deadline_preview_worker.main(
                 [

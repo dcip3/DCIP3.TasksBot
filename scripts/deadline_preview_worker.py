@@ -2207,11 +2207,18 @@ def _upload_metadata_headers(
     return headers
 
 
-def _maybe_upload_preview(output_path: Path, extra_headers: Optional[dict] = None) -> bool:
+# Told apart because they call for opposite responses: only a machine that
+# never reached the bot at all has a problem of its own.
+UPLOAD_OK = "ok"
+UPLOAD_REFUSED = "refused"          # the bot answered, and said no
+UPLOAD_UNREACHABLE = "unreachable"  # no answer ever came back
+
+
+def _maybe_upload_preview(output_path: Path, extra_headers: Optional[dict] = None) -> str:
     upload_url = os.environ.get("PREVIEW_UPLOAD_URL", "").strip()
     token = os.environ.get("PREVIEW_UPLOAD_TOKEN", "").strip()
     if not upload_url or not token:
-        return True
+        return UPLOAD_OK
 
     # Up to ~22 minutes of cumulative retry, covering bot restarts and network blips.
     attempt_delays = (0, 5, 15, 30, 60, 120, 240, 480, 480)
@@ -2243,7 +2250,7 @@ def _maybe_upload_preview(output_path: Path, extra_headers: Optional[dict] = Non
             ok = False
         if ok:
             logging.info("Preview upload succeeded on attempt %s/%s", attempt, total_attempts)
-            return True
+            return UPLOAD_OK
         logging.warning("Preview upload attempt %s/%s failed", attempt, total_attempts)
         if not got_http_response and attempt >= transport_failfast_attempts:
             logging.error(
@@ -2251,13 +2258,31 @@ def _maybe_upload_preview(output_path: Path, extra_headers: Optional[dict] = Non
                 "this machine likely cannot reach the bot",
                 attempt,
             )
-            return False
-    return False
+            return UPLOAD_UNREACHABLE
+    return UPLOAD_REFUSED if got_http_response else UPLOAD_UNREACHABLE
 
 
-def _handle_upload_failure() -> None:
-    """Hand the task to another worker when this machine cannot deliver the upload."""
-    if _requeue_preview_task_elsewhere():
+def _handle_upload_failure(outcome: str = UPLOAD_UNREACHABLE) -> None:
+    """React to an upload this machine could not deliver.
+
+    Handing the task to another worker means striking this one off the job's
+    machine list, and that is only right when the fault is this machine's. A
+    bot that answers and refuses - an expired upload token, say - refuses every
+    machine alike, and moving the task then walks the job through the farm
+    crossing off one worker at a time until none is left. That is exactly what
+    happened to a preview here: two workers in a row collected nine 403s each
+    and struck themselves off, leaving a job no machine could take.
+
+    So the task moves only when the bot never answered at all. Otherwise this
+    fails outright, and the bot reports a failed preview - a message beats a
+    job quietly stranded on an empty machine list.
+    """
+    if outcome == UPLOAD_REFUSED:
+        logging.error(
+            "The bot refused the upload; every worker would be refused the same "
+            "way, so this task stays where it is instead of moving on."
+        )
+    elif _requeue_preview_task_elsewhere():
         logging.warning(
             "Preview upload failed; task requeued for another worker. "
             "Waiting for the Deadline Worker to stop this process..."
@@ -2478,8 +2503,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                 args.ffmpeg_path,
                 sidecar=_load_color_sidecar(args.input_pattern),
             )
-            if not _maybe_upload_preview(output_path, extra_headers=upload_headers):
-                _handle_upload_failure()
+            outcome = _maybe_upload_preview(output_path, extra_headers=upload_headers)
+            if outcome != UPLOAD_OK:
+                _handle_upload_failure(outcome)
             return 0
 
         if _has_sequence_placeholder(args.input_pattern):
@@ -2520,10 +2546,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                     args.ffmpeg_path,
                     sidecar=_load_color_sidecar(args.input_pattern),
                 )
-                if not _maybe_upload_preview(
+                outcome = _maybe_upload_preview(
                     Path(args.output_path), extra_headers=upload_headers
-                ):
-                    _handle_upload_failure()
+                )
+                if outcome != UPLOAD_OK:
+                    _handle_upload_failure(outcome)
                 return 0
 
         if apply_color:
@@ -2665,8 +2692,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             args.ffmpeg_path,
             sidecar=_load_color_sidecar(args.input_pattern),
         )
-        if not _maybe_upload_preview(Path(args.output_path), extra_headers=upload_headers):
-            _handle_upload_failure()
+        outcome = _maybe_upload_preview(Path(args.output_path), extra_headers=upload_headers)
+        if outcome != UPLOAD_OK:
+            _handle_upload_failure(outcome)
     except Exception as exc:  # pragma: no cover - Deadline handles logging
         logging.error("Preview conversion failed: %s", exc, exc_info=True)
         return 1

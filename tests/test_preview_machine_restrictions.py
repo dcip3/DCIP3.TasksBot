@@ -119,8 +119,25 @@ class StrandedPreviewTests(unittest.TestCase):
             render.preview_cannot_run_anywhere(self._props(["NodeB", "NodeC"], True), FARM)
         )
 
-    def test_a_deny_list_never_strands_a_preview(self) -> None:
+    def test_a_deny_list_leaves_a_preview_alone_while_a_machine_remains(self) -> None:
         self.assertFalse(render.preview_cannot_run_anywhere(self._props(["NodeB"], False), FARM))
+
+    def test_a_deny_list_that_grew_over_every_working_machine_strands_it(self) -> None:
+        """Workers strike themselves off a preview they cannot deliver; two of
+        them in a row leave nothing that can run it."""
+        self.assertTrue(
+            render.preview_cannot_run_anywhere(self._props(["NodeA", "NodeC"], False), FARM)
+        )
+
+    def test_denying_only_machines_that_could_not_work_anyway_changes_nothing(self) -> None:
+        self.assertFalse(
+            render.preview_cannot_run_anywhere(self._props(["NodeB", "nodee"], False), FARM)
+        )
+
+    def test_the_deny_list_is_matched_whatever_the_case(self) -> None:
+        self.assertTrue(
+            render.preview_cannot_run_anywhere(self._props(["nodea", "nodec"], False), FARM)
+        )
 
     def test_an_unrestricted_preview_is_only_ever_waiting_its_turn(self) -> None:
         self.assertFalse(render.preview_cannot_run_anywhere({"Name": "Shot - Preview"}, FARM))

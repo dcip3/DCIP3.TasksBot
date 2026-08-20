@@ -202,14 +202,25 @@ def preview_cannot_run_anywhere(
 ) -> bool:
     """True when no machine on the farm may pick this preview up.
 
-    Only an allow list can do that: it names the machines, and when none of
-    them can take a task the job sits in the queue for ever. Deadline shows it
-    as Queued with no error, which looks exactly like a busy farm until you
-    check what it is allowed to run on.
+    An allow list can do that by naming only machines that cannot take a task.
+    So can a deny list, once it has grown to cover every machine that can:
+    workers strike themselves off a preview they failed to deliver, and two of
+    them in a row leave nothing behind. Either way Deadline shows the job as
+    Queued with no error, which looks exactly like a busy farm until you check
+    what it is allowed to run on.
     """
     listed, whitelist_flag = _resolve_machine_restrictions(preview_props)
-    if not listed or whitelist_flag is False:
+    if not listed:
         return False
+
+    if whitelist_flag is False:
+        denied = {name.strip().lower() for name in listed}
+        return not any(
+            _worker_is_usable(entry)
+            and str((entry.get("Info") or {}).get("Name") or "").strip().lower() not in denied
+            for entry in workers
+        )
+
     return len(_unusable_workers(listed, workers)) == len(listed)
 
 
