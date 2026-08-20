@@ -117,11 +117,20 @@ def cleanup_old_files(max_age_hours: int = 24) -> None:
     if preview_dir:
         directories_to_clean.append(preview_dir)
 
+    # An upload that has landed but not yet reached the chat belongs to the
+    # token that is waiting to deliver it, and that token lives for days. Aging
+    # its file out from under it leaves a record pointing at nothing, which no
+    # upload can ever satisfy again - the token store clears both together when
+    # the token itself expires. The startup sweep already spares these.
+    preserve_prefixes = ("upload_",) if settings.preview_upload_enabled else ()
+
     for directory in directories_to_clean:
         if not directory.exists():
             continue
 
         for item in directory.iterdir():
+            if preserve_prefixes and item.name.startswith(preserve_prefixes):
+                continue
             try:
                 if item.stat().st_mtime < cutoff_time:
                     if item.is_dir():

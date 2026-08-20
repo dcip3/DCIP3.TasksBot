@@ -15,6 +15,7 @@ worker is holding is the only one left, and it is taken.
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -26,7 +27,7 @@ os.environ.setdefault(
     "ENCRYPTION_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 )
 
-from app.core import preview_upload
+from app.core import maintenance, preview_upload
 from app.core.config import settings
 from app.core.preview_upload import (
     STATUS_DELIVERING,
@@ -129,6 +130,62 @@ class TokenClaimTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_an_unknown_token_is_refused(self) -> None:
         self.assertIsNone(await self.store.claim("never-issued"))
+
+
+class TempSweepTests(unittest.TestCase):
+    """The periodic sweep must not age out an upload a token still owns."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self._old_temp = settings.temp_dir
+        self._old_conv = settings.conv_dir
+        self._old_enabled = settings.preview_upload_enabled
+        settings.temp_dir = str(Path(self._tmp.name) / "temp")
+        settings.conv_dir = str(Path(self._tmp.name) / "conv")
+        settings.preview_upload_enabled = True
+        Path(settings.temp_dir).mkdir(parents=True)
+        Path(settings.conv_dir).mkdir(parents=True)
+
+        def restore() -> None:
+            settings.temp_dir = self._old_temp
+            settings.conv_dir = self._old_conv
+            settings.preview_upload_enabled = self._old_enabled
+
+        self.addCleanup(restore)
+
+    def _age(self, path: Path, hours: int) -> None:
+        old = time.time() - hours * 3600
+        os.utime(path, (old, old))
+
+    def test_a_waiting_upload_survives_the_sweep(self) -> None:
+        upload = Path(settings.temp_dir) / "upload_tok"
+        upload.mkdir()
+        (upload / "preview.mp4").write_bytes(b"video")
+        self._age(upload, 48)
+
+        maintenance.cleanup_old_files(24)
+
+        self.assertTrue((upload / "preview.mp4").exists())
+
+    def test_everything_else_old_is_still_swept(self) -> None:
+        stale = Path(settings.temp_dir) / "leftover.mp4"
+        stale.write_bytes(b"junk")
+        self._age(stale, 48)
+
+        maintenance.cleanup_old_files(24)
+
+        self.assertFalse(stale.exists())
+
+    def test_with_uploads_disabled_nothing_is_spared(self) -> None:
+        settings.preview_upload_enabled = False
+        upload = Path(settings.temp_dir) / "upload_tok"
+        upload.mkdir()
+        self._age(upload, 48)
+
+        maintenance.cleanup_old_files(24)
+
+        self.assertFalse(upload.exists())
 
 
 if __name__ == "__main__":
