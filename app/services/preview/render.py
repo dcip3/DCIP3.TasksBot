@@ -439,6 +439,8 @@ async def create_video_from_job(
         "24",
         "--max-size-mb",
         "45",
+        "--max-dimension",
+        str(settings.preview_max_dimension),
     ]
 
     if expected_frames > 0:

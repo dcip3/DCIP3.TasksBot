@@ -19,6 +19,25 @@ def _normalize_title(title: Optional[str]) -> str:
     return text or "Preview"
 
 
+# Telegram refuses a media caption longer than this.
+_CAPTION_LIMIT = 1024
+
+
+def _fit_pass_list(caption: str, passes: str) -> str:
+    """Drop pass names, from the end, until the caption is short enough.
+
+    Every pass is named, because that is what the artist is looking for. Only a
+    caption Telegram would reject gives any of them up, and it says how many.
+    """
+    names = [name.strip() for name in str(passes).split(",") if name.strip()]
+    for keep in range(len(names) - 1, 0, -1):
+        shortened = ", ".join(names[:keep]) + f" +{len(names) - keep} more"
+        candidate = caption.replace(passes, shortened, 1)
+        if len(candidate) <= _CAPTION_LIMIT:
+            return candidate
+    return caption
+
+
 def build_preview_caption(
     title: Optional[str],
     path: Optional[str],
@@ -59,4 +78,7 @@ def build_preview_caption(
         display_path = normalize_preview_path(path) or str(path)
         parts.append(f"<code>{display_path}</code>")
 
-    return "\n\n".join(parts)
+    caption = "\n\n".join(parts)
+    if passes and len(caption) > _CAPTION_LIMIT:
+        caption = _fit_pass_list(caption, str(passes))
+    return caption

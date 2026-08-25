@@ -1367,12 +1367,20 @@ def _read_output_signature(output_path: Path, ffmpeg_path: str) -> Optional[str]
     return value or None
 
 
+# Renders are delivered at whatever size the shot needs, and a preview at that
+# size is not always a video anything can play: Telegram handed back one at
+# 3556x2404 that downloaded fine and refused to play in the chat. Fitting the
+# preview inside a box keeps it decodable everywhere, and smaller to send.
+DEFAULT_MAX_DIMENSION = 1920
+
+
 def _reusable_existing_output(
     output_path: Path,
     input_files: List[Path],
     ffmpeg_path: str,
     expected_frames: int,
     color_signature: Optional[str] = None,
+    max_dimension: int = DEFAULT_MAX_DIMENSION,
 ) -> bool:
     """True when a previous run already produced this preview from the same frames.
 
@@ -1380,7 +1388,8 @@ def _reusable_existing_output(
     task moved to another machine. Guards against stale files from earlier
     render versions by requiring the video to be newer than every input frame
     (mtimes survive Dropbox sync) and to carry the same color-pipeline
-    signature.
+    signature - and against files built before the frame size was capped,
+    which are the ones Telegram will not play.
     """
     try:
         if not input_files or not output_path.exists():
@@ -1402,6 +1411,17 @@ def _reusable_existing_output(
                 "(%s != %s); rebuilding",
                 existing or "no signature",
                 color_signature,
+            )
+            return False
+
+    if max_dimension and max_dimension > 0:
+        resolution = _probe_output_resolution(output_path, ffmpeg_path)
+        sides = [int(part) for part in str(resolution or "").split("x") if part.isdigit()]
+        if sides and max(sides) > max_dimension:
+            logging.info(
+                "Existing preview is %s, larger than the %s-pixel limit; rebuilding",
+                resolution,
+                max_dimension,
             )
             return False
 
@@ -1719,6 +1739,22 @@ def convert_sequence_cpu(
             _unregister_temp_path(cpu_dir)
         raise
 
+def _scale_filter(max_dimension: int) -> Optional[str]:
+    """Fit inside a square box without ever enlarging, on even dimensions.
+
+    force_original_aspect_ratio=decrease does the fitting; taking the smaller
+    of the frame and the box means a shot already inside it is left alone. The
+    second pass rounds to even numbers, which yuv420p requires.
+    """
+    if not max_dimension or max_dimension <= 0:
+        return None
+    return (
+        f"scale=w='min(iw,{max_dimension})':h='min(ih,{max_dimension})'"
+        ":force_original_aspect_ratio=decrease"
+        ",scale=trunc(iw/2)*2:trunc(ih/2)*2"
+    )
+
+
 def build_ffmpeg_command(
     *,
     ffmpeg_path: str,
@@ -1731,6 +1767,7 @@ def build_ffmpeg_command(
     crf: int,
     concat_manifest: Optional[Path] = None,
     color_signature: Optional[str] = None,
+    max_dimension: int = DEFAULT_MAX_DIMENSION,
 ) -> tuple[list[str], str]:
     selected_encoder = _resolve_video_encoder(ffmpeg_path, video_encoder)
     command: list[str] = [
@@ -1766,6 +1803,10 @@ def build_ffmpeg_command(
 
     if concat_manifest is not None:
         command.extend(["-r", f"{frame_rate:g}"])
+
+    scale = _scale_filter(max_dimension)
+    if scale:
+        command.extend(["-vf", scale])
 
     command.extend(
         _build_encoder_args(
@@ -1979,6 +2020,12 @@ def parse_arguments(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--crf", type=int, default=24, help="Preview quality value (CRF/CQ)")
     parser.add_argument("--max-size-mb", type=float, default=45.0, help="Max MP4 size in MB for delivery")
     parser.add_argument(
+        "--max-dimension",
+        type=int,
+        default=DEFAULT_MAX_DIMENSION,
+        help="Fit the preview inside this many pixels on its longest side (0 keeps the render size)",
+    )
+    parser.add_argument(
         "--temp-dir",
         default=None,
         help="Optional directory for temporary files (uses system temp if omitted)",
@@ -2099,11 +2146,6 @@ def _describe_overscan(sidecar: Optional[dict]) -> Optional[str]:
     return f"Overscan {amount}"
 
 
-# A long AOV list would crowd out the rest of the caption, so name the first
-# few and count the rest.
-_MAX_NAMED_PASSES = 8
-
-
 def _describe_passes(sidecar: Optional[dict]) -> Optional[str]:
     """The extra passes this render writes, named as they are in the AOV list.
 
@@ -2128,10 +2170,9 @@ def _describe_passes(sidecar: Optional[dict]) -> Optional[str]:
     if not names:
         return None
 
-    shown = names[:_MAX_NAMED_PASSES]
-    if len(names) > len(shown):
-        return ", ".join(shown) + " +%d more" % (len(names) - len(shown))
-    return ", ".join(shown)
+    # Every one of them, named. A pass the caption leaves out is a pass the
+    # artist has to go and look up, which is the opposite of the point.
+    return ", ".join(names)
 
 
 def _frame_resolution(sidecar: Optional[dict]) -> Optional[str]:
@@ -2166,11 +2207,34 @@ def _resolution_fits_inside(frame: str, rendered: Optional[str]) -> bool:
     return 0 < fw <= rw and 0 < fh <= rh
 
 
+def _rendered_resolution(input_pattern: Optional[str], ffmpeg_path: str) -> Optional[str]:
+    """The size of the frames the farm produced, read from one of them.
+
+    The caption reports the render, not the video: those were the same figure
+    until previews started being fitted into a box, at which point reading the
+    encoded file began answering a question nobody asked.
+    """
+    if not input_pattern:
+        return None
+    try:
+        if _has_sequence_placeholder(input_pattern):
+            *_, frames = _expand_sequence(input_pattern)
+        else:
+            frames = [Path(input_pattern)]
+        for frame in frames:
+            if frame.exists():
+                return _probe_output_resolution(frame, ffmpeg_path)
+    except Exception as exc:
+        logging.debug("Could not read the rendered frame size: %s", exc)
+    return None
+
+
 def _upload_metadata_headers(
     color_spec: Optional[dict],
     output_path: Path,
     ffmpeg_path: str,
     sidecar: Optional[dict] = None,
+    input_pattern: Optional[str] = None,
 ) -> dict:
     """Describe the preview for the bot's caption.
 
@@ -2186,7 +2250,11 @@ def _upload_metadata_headers(
         headers["X-Preview-Color-Controls"] = urllib.parse.quote(
             controls_summary, safe=""
         )
-    resolution = _probe_output_resolution(output_path, ffmpeg_path)
+    # Falls back to the encoded file only when no frame can be read - better a
+    # figure than none, and without a cap the two agree anyway.
+    resolution = _rendered_resolution(input_pattern, ffmpeg_path) or _probe_output_resolution(
+        output_path, ffmpeg_path
+    )
     overscan_summary = _describe_overscan(sidecar)
     if overscan_summary:
         # The rendered image carries the overscan margin, but the resolution
@@ -2502,6 +2570,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 output_path,
                 args.ffmpeg_path,
                 sidecar=_load_color_sidecar(args.input_pattern),
+                input_pattern=args.input_pattern,
             )
             outcome = _maybe_upload_preview(output_path, extra_headers=upload_headers)
             if outcome != UPLOAD_OK:
@@ -2535,6 +2604,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 args.ffmpeg_path,
                 validation_frame_count,
                 color_signature=_color_signature(color_spec),
+                max_dimension=args.max_dimension,
             ):
                 logging.info(
                     "Reusing existing preview output %s (newer than all input frames)",
@@ -2545,6 +2615,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     Path(args.output_path),
                     args.ffmpeg_path,
                     sidecar=_load_color_sidecar(args.input_pattern),
+                    input_pattern=args.input_pattern,
                 )
                 outcome = _maybe_upload_preview(
                     Path(args.output_path), extra_headers=upload_headers
@@ -2591,6 +2662,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             video_encoder=args.video_encoder,
             preset=args.preset,
             crf=args.crf,
+            max_dimension=args.max_dimension,
             concat_manifest=concat_manifest,
             color_signature=_color_signature(color_spec),
         )
@@ -2606,6 +2678,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 video_encoder=encoder_name,
                 preset=args.preset,
                 crf=args.crf,
+                max_dimension=args.max_dimension,
                 concat_manifest=concat_manifest,
                 color_signature=_color_signature(color_spec),
             )
@@ -2691,6 +2764,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             Path(args.output_path),
             args.ffmpeg_path,
             sidecar=_load_color_sidecar(args.input_pattern),
+            input_pattern=args.input_pattern,
         )
         outcome = _maybe_upload_preview(Path(args.output_path), extra_headers=upload_headers)
         if outcome != UPLOAD_OK:

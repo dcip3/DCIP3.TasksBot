@@ -79,6 +79,15 @@ class Settings(BaseSettings):
             "TasksBot Deadline event plugin config); empty disables the endpoint"
         ),
     )
+    preview_max_dimension: int = Field(
+        1920,
+        ge=0,
+        description=(
+            "Fit previews inside this many pixels on their longest side; a "
+            "render's own size is not always one Telegram's player can decode "
+            "(0 keeps the render size)"
+        ),
+    )
     preview_presubmit_enabled: bool = Field(
         True,
         description=(

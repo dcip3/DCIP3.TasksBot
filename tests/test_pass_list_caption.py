@@ -100,11 +100,13 @@ class DescribePassesTests(unittest.TestCase):
     def test_the_same_name_twice_is_shown_once(self) -> None:
         self.assertEqual(WORKER._describe_passes(sidecar(aov("Z"), aov("Z"))), "Z")
 
-    def test_a_long_list_is_cut_short_with_a_count(self) -> None:
+    def test_a_long_list_is_named_in_full(self) -> None:
+        """It used to stop at eight and count the rest, which hid the ones the
+        artist was looking for."""
         entries = [aov("aov%d" % index) for index in range(1, 12)]
         self.assertEqual(
             WORKER._describe_passes(sidecar(*entries)),
-            "aov1, aov2, aov3, aov4, aov5, aov6, aov7, aov8 +3 more",
+            ", ".join("aov%d" % index for index in range(1, 12)),
         )
 
     def test_silent_when_the_rop_disables_every_aov(self) -> None:
