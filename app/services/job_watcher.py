@@ -56,6 +56,11 @@ _AUTO_PREVIEW_SCAN_INTERVAL_SECONDS = 30
 # How long a preview may sit on unusable machines before it is moved. Long
 # enough that a Worker restarting is not mistaken for one that is gone.
 _STRANDED_PREVIEW_GRACE_SECONDS = 180
+# How many task errors a preview may collect before it is treated as a job that
+# will keep failing rather than one having a bad run. Deadline requeues a failed
+# task, so without this a preview whose upload the bot refuses runs, fails and
+# runs again for as long as the render sits on the farm.
+_PREVIEW_ERROR_LIMIT = 3
 # How long a suspended render may hold its pending preview before the preview is
 # dropped. Short pauses (fixing something and resuming) keep their preview; a
 # render left paused releases it, and resuming re-queues a fresh one.
@@ -74,6 +79,9 @@ _ERROR_ALERT_CACHE_TTL_SECONDS = 14 * 24 * 60 * 60
 _last_auto_preview_history_cleanup_monotonic = 0.0
 # Previews waiting on machines that cannot take them: id -> first seen.
 _stranded_preview_since: dict[str, float] = {}
+# Renders whose preview was replaced recently, so a replacement that fails the
+# same way is not replaced again in an endless circle.
+_recently_replaced_previews = TTLCache(ttl_seconds=3600, max_size=1000)
 _error_alert_cache = TTLCache(
     ttl_seconds=_ERROR_ALERT_CACHE_TTL_SECONDS,
     max_size=100000,
@@ -1516,10 +1524,61 @@ async def _strand_check(user: "_WatcherUser", previews: list) -> set[str]:
     return stranded
 
 
-async def _rescue_stranded_preview(
-    user: "_WatcherUser", preview_id: str, props: dict
+async def _rescue_failing_preview(
+    user: "_WatcherUser", preview_id: str, preview: dict, props: dict
 ) -> None:
-    """Replace a preview nobody can run with one that is free to go elsewhere."""
+    """Deal with a preview that keeps failing instead of letting it loop.
+
+    Deadline hands a failed task straight back to the queue, so a preview that
+    cannot finish - an upload the bot refuses, say - runs, fails and runs again
+    every twenty minutes for as long as its render is on the farm, taking a
+    machine each time and telling nobody. One replacement is worth trying,
+    because a fresh preview job carries a fresh upload token and that is the
+    failure worth retrying. If the replacement fails the same way, the render
+    is out of luck and the user hears about it rather than the farm churning.
+    """
+    from app.services.preview.runtime import _extract_preview_context
+
+    *_, owner_id, _, source_job_id = _extract_preview_context(
+        props, user.telegram_user_id
+    )
+    if not source_job_id or owner_id != user.telegram_user_id:
+        return
+
+    errors = _job_chunk_count(preview, "Errs")
+    if (source_job_id, owner_id) not in _recently_replaced_previews:
+        _recently_replaced_previews.add((source_job_id, owner_id))
+        logger.warning(
+            "Watcher: preview %s failed %s times; replacing it", preview_id, errors
+        )
+        await _rescue_stranded_preview(
+            user, preview_id, props, reason=f"it failed {errors} times"
+        )
+        return
+
+    from app.services.deadline import delete_job
+
+    logger.error(
+        "Watcher: replacement preview %s failed again (%s errors); giving up",
+        preview_id,
+        errors,
+    )
+    with contextlib.suppress(Exception):
+        await delete_job(user.login, user.password, preview_id)
+    name = str(props.get("Name") or "").split("/")[-1].removesuffix(" - Preview")
+    with contextlib.suppress(Exception):
+        await bot.send_message(
+            owner_id,
+            f"❌ Preview for <b>{name or source_job_id}</b> keeps failing; "
+            "the farm has stopped retrying it. Try 🔍 Preview on the job.",
+            parse_mode="HTML",
+        )
+
+
+async def _rescue_stranded_preview(
+    user: "_WatcherUser", preview_id: str, props: dict, *, reason: str = "it was stranded"
+) -> None:
+    """Replace a preview that cannot finish where it is with a fresh one."""
     from app.services.deadline import delete_job
     from app.services.preview.runtime import (
         _extract_preview_context,
@@ -1545,8 +1604,9 @@ async def _rescue_stranded_preview(
     untrack_preview_job(preview_id)
     pop_preview_message(preview_id)
     logger.warning(
-        "Watcher: preview %s could not run on any allowed worker; resubmitting for %s",
+        "Watcher: preview %s replaced (%s); resubmitting for %s",
         preview_id,
+        reason,
         source_job_id,
     )
 
@@ -1606,7 +1666,13 @@ async def _reconcile_presubmitted_previews(user: "_WatcherUser", jobs: list) -> 
             continue
 
         if preview_id in stranded:
-            await _rescue_stranded_preview(user, preview_id, props)
+            await _rescue_stranded_preview(
+                user, preview_id, props, reason="no worker may run it"
+            )
+            continue
+
+        if _job_chunk_count(preview, "Errs") >= _PREVIEW_ERROR_LIMIT:
+            await _rescue_failing_preview(user, preview_id, preview, props)
             continue
 
         _, _, _, target_user_id, _, source_job_id = _extract_preview_context(

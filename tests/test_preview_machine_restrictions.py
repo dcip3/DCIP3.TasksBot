@@ -289,5 +289,75 @@ class WatcherRescueTests(unittest.IsolatedAsyncioTestCase):
         delete.assert_not_awaited()
 
 
+class FailingPreviewTests(unittest.IsolatedAsyncioTestCase):
+    """A preview that keeps failing is replaced once, then reported.
+
+    From the farm: one preview job collected 22 errors over nine hours, running
+    and failing every twenty minutes because the bot refused its upload token.
+    Deadline hands a failed task straight back to the queue, so nothing stopped
+    it and nobody was told.
+    """
+
+    def setUp(self) -> None:
+        job_watcher._recently_replaced_previews.clear()
+
+    def _user(self):
+        return job_watcher._WatcherUser(
+            telegram_user_id=7,
+            login="artist2",
+            password="pw",
+            notifications_enabled=True,
+            notification_scope="all",
+            auto_scope="all",
+            preview_worker=None,
+            auto_preview_enabled=True,
+        )
+
+    def _props(self) -> dict:
+        return {
+            "Name": "Shot - Preview",
+            "ExDic": {
+                "PreviewJob": "1",
+                "PreviewPresubmit": "1",
+                "PreviewSource": "src1",
+                "PreviewTelegram": "7",
+            },
+        }
+
+    async def _handle(self, errors: int):
+        rescue = mock.AsyncMock()
+        delete = mock.AsyncMock(return_value=True)
+        send = mock.AsyncMock()
+        with mock.patch.object(job_watcher, "_rescue_stranded_preview", new=rescue),              mock.patch("app.services.deadline.delete_job", new=delete),              mock.patch.object(job_watcher.bot, "send_message", new=send):
+            await job_watcher._rescue_failing_preview(
+                self._user(), "prev1", {"_id": "prev1", "Errs": errors}, self._props()
+            )
+        return rescue, delete, send
+
+    async def test_the_first_run_of_bad_luck_earns_a_fresh_preview(self) -> None:
+        rescue, delete, send = await self._handle(job_watcher._PREVIEW_ERROR_LIMIT)
+        rescue.assert_awaited_once()
+        send.assert_not_awaited()
+
+    async def test_a_replacement_that_fails_the_same_way_is_not_replaced_again(self) -> None:
+        await self._handle(3)
+        rescue, delete, send = await self._handle(3)
+
+        rescue.assert_not_awaited()
+        delete.assert_awaited_once()
+        send.assert_awaited_once()
+        self.assertIn("keeps failing", send.await_args.args[1])
+
+    async def test_a_preview_belonging_to_someone_else_is_left_alone(self) -> None:
+        props = self._props()
+        props["ExDic"]["PreviewTelegram"] = "999"
+        rescue = mock.AsyncMock()
+        with mock.patch.object(job_watcher, "_rescue_stranded_preview", new=rescue):
+            await job_watcher._rescue_failing_preview(
+                self._user(), "prev1", {"Errs": 9}, props
+            )
+        rescue.assert_not_awaited()
+
+
 if __name__ == "__main__":
     unittest.main()
