@@ -38,6 +38,7 @@ from app.services.deadline import (
     resume_job_by_user_id,
     save_worker_settings_by_user_id,
     suspend_job_by_user_id,
+    take_credentials_rejected_notice,
 )
 
 logger = logging.getLogger(__name__)
@@ -1401,6 +1402,11 @@ async def handle_jobs(message: Message, page: int = 0) -> None:
     try:
         jobs = await get_jobs_list(message.from_user.id)
         if not jobs:
+            if take_credentials_rejected_notice(message.from_user.id):
+                # Deadline refused the credentials a moment ago and the user
+                # was told so. Three guesses about why the list is empty, on
+                # top of an answer they already have, only make them doubt it.
+                return
             await message.answer(
                 "No jobs found. This could mean:\n"
                 "• There are no active jobs in Deadline\n"
@@ -1751,6 +1757,8 @@ async def handle_workers(message: Message) -> None:
     try:
         workers = await get_workers_list(message.from_user.id)
         if not workers:
+            if take_credentials_rejected_notice(message.from_user.id):
+                return
             await message.answer(
                 "No workers (slaves) found. This could mean:\n"
                 "• There are no active workers in Deadline\n"

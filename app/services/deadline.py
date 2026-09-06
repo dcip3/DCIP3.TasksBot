@@ -109,8 +109,22 @@ CREDENTIALS_REJECTED_MESSAGE = (
 )
 
 
+# Users told about a 401 by the action they just took. The handler that got
+# the empty default reads this to tell "the farm refused you" apart from "the
+# farm has nothing to show", which look identical from the return value alone.
+_CREDENTIALS_NOTICE_TTL_SECONDS = 60.0
+_credentials_rejected_notice: dict[int, float] = {}
+
+
+def take_credentials_rejected_notice(telegram_user_id: int) -> bool:
+    """True once if this user's last action was answered with a 401."""
+    stamped = _credentials_rejected_notice.pop(telegram_user_id, None)
+    return stamped is not None and time.monotonic() - stamped < _CREDENTIALS_NOTICE_TTL_SECONDS
+
+
 async def _notify_rejected_credentials(telegram_user_id: int) -> None:
     """Tell the user their stored credentials no longer work."""
+    _credentials_rejected_notice[telegram_user_id] = time.monotonic()
     try:
         from app.core.bot_core import bot
 
@@ -361,6 +375,17 @@ def pop_auth_failure_notification(login: str) -> bool:
         _auth_notify_pending.discard(key)
         return True
     return False
+
+
+def dismiss_auth_failure_notification(login: str) -> None:
+    """Drop a pending suspension warning for a login the user is re-entering.
+
+    Someone who just typed /login is already being asked for new credentials;
+    the watcher telling them to /login again belongs to the case where they
+    have not noticed yet. The daily claim is left untouched, so this spends
+    no part of the reminder budget.
+    """
+    _auth_notify_pending.discard(_auth_key(login))
 
 
 def clear_auth_suspension(login: str) -> None:

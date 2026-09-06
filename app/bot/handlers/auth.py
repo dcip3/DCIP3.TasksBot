@@ -13,7 +13,7 @@ from app.auth import (
     save_deadline_credentials,
 )
 from app.core.ui_helpers import cancel_inline_button, get_main_keyboard
-from app.services.deadline import is_auth_suspended
+from app.services.deadline import dismiss_auth_failure_notification, is_auth_suspended
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +48,10 @@ async def cmd_login_start(message: Message, state: FSMContext) -> None:
     credentials = await get_deadline_credentials(message.from_user.id)
     if credentials:
         stored_login = credentials[0]
+        # The watcher's own "please /login again" is queued for the moment the
+        # account is suspended. Landing it on someone already answering that
+        # very prompt reads as the bot not noticing them, so drop it here.
+        dismiss_auth_failure_notification(stored_login)
         if is_auth_suspended(stored_login):
             intro = (
                 f"Deadline is rejecting the stored credentials for {stored_login}.\n\n"
