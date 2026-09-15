@@ -408,11 +408,13 @@ def _report_dedupe_id(job_id: str, report: dict, rule_key: str) -> str:
         # One message about the job, however many of its tasks tripped over it.
         return f"{rule_key}:{str(job_id or '').strip()}"
 
-    if rule_key == "plugin_sandbox_error":
+    if rule_key in ("plugin_sandbox_error", "redshift_activation"):
         # A worker in this state fails every task it is handed - SHA_0070_DS_v019
-        # collected 100 reports from one machine in 23 minutes. Alert once per
-        # machine per job; per report would be a flood, and the message would say
-        # the same thing every time.
+        # collected 100 sandbox reports from one machine in 23 minutes, and an
+        # unlicensed Redshift on NodeB sent nine identical alerts for
+        # SHC_0170_ID_v022 in half an hour. Alert once per machine per job; per
+        # report would be a flood, and the message would say the same thing
+        # every time.
         slave = _normalize_identity(report.get("Slave")) or "unknown"
         return f"{rule_key}:{str(job_id or '').strip()}:{slave}"
 
@@ -440,6 +442,14 @@ def _build_error_alert_text(
     worker_name = html.escape(str(report.get("Slave") or "Unknown"))
     job_name = html.escape(str(report.get("JobName") or report.get("Job") or "Unknown job"))
     title_raw = str(report.get("Title") or report.get("LogErr") or "Unknown error").strip()
+    # Deadline appends the .NET frames it raised from ("at Deadline.Plugins.
+    # PluginWrapper.RenderTasks(...)"). They say where the worker noticed the
+    # failure, never why, and in a chat message they bury the line that does.
+    title_raw = "\n".join(
+        line
+        for line in title_raw.splitlines()
+        if not (line.strip().startswith("at ") and "(" in line)
+    ).strip() or title_raw
     if len(title_raw) > 900:
         title_raw = title_raw[:897].rstrip() + "..."
     error_text = html.escape(title_raw)
@@ -501,6 +511,30 @@ def _build_error_alert_text(
             ]
         )
         return "\n".join(details)
+
+    if rule.key == "redshift_activation":
+        # Two wordings reach this rule from the same machine: the licence
+        # server could not be reached (WinHTTP 12002 is a timeout), or Redshift
+        # has no licence at all and pops the key prompt. Only one alert per
+        # machine per job gets sent, so the advice has to cover both.
+        return "\n".join(
+            header_lines
+            + [
+                "",
+                f"📝 <b>Message</b>: <code>{error_text}</code>",
+                "",
+                "💡 <b>What To Do</b>:",
+                f"• The job is fine - Redshift on <code>{worker_name}</code> has no "
+                "licence, so that machine fails every task it takes. Resubmitting "
+                "will not help.",
+                "• <code>HTTP send failure (12002)</code> means it could not reach the "
+                "Maxon licence server: check internet, proxy and firewall on that machine.",
+                "• <code>Enter activation key</code> means it is not signed in: open the "
+                "Maxon App there, sign in and check a Redshift licence is assigned to it "
+                "and not held by another machine.",
+                "• Until it is fixed, take the machine offline so it stops eating tasks.",
+            ]
+        )
 
     if rule.key == "plugin_sandbox_error":
         return "\n".join(
