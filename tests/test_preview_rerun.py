@@ -307,7 +307,7 @@ class ScanTests(_DatabaseTestCase):
             new=lambda *args, **kwargs: (completed.append(args), _noop())[1],
         ), mock.patch.object(
             job_watcher,
-            "_reconcile_presubmitted_previews",
+            "_reconcile_previews",
             new=mock.AsyncMock(return_value=None),
         ):
             await job_watcher._scan_auto_preview_candidates([self._user()])

@@ -1664,19 +1664,26 @@ async def _rescue_stranded_preview(
         await _unregister_auto_preview_history(user.telegram_user_id, source_job_id)
 
 
-async def _reconcile_presubmitted_previews(user: "_WatcherUser", jobs: list) -> None:
-    """Clean up pre-submitted previews whose render will never complete.
+async def _reconcile_previews(user: "_WatcherUser", jobs: list) -> None:
+    """Deal with previews that cannot finish, whenever they were queued.
 
-    Deadline keeps these previews Pending until their dependency finishes, so
-    the only case left to handle is a render that failed or was deleted: its
-    preview would wait forever (ResumeOnFailed/DeletedDependencies are off).
-    Manually requested previews are never touched.
+    A preview that no worker may run, or that keeps failing, is the same waste
+    whether it was pre-submitted or queued once the render completed - and the
+    completion-time ones used to be skipped here entirely. SHC_EDU_071_v01 was
+    one: its render wrote frames to a folder whose name no longer matched the
+    path in the job, so every attempt found no frames, and Deadline handed the
+    task back to a worker 97 times before anyone looked.
+
+    The dependency checks below stay with pre-submitted previews. They ask what
+    became of the render the preview is waiting on; a preview queued after that
+    render finished is waiting on nothing.
     """
     from app.services.deadline import delete_job
     from app.services.preview.runtime import _extract_preview_context
 
     jobs_by_id: dict[str, dict] = {}
     previews: list[tuple[str, dict, dict]] = []
+    presubmitted: set[str] = set()
     for entry in jobs:
         if not isinstance(entry, dict):
             continue
@@ -1685,12 +1692,10 @@ async def _reconcile_presubmitted_previews(user: "_WatcherUser", jobs: list) -> 
             continue
         jobs_by_id[entry_id] = entry
         props = entry.get("Props") or {}
-        if (
-            isinstance(props, dict)
-            and _is_preview_job(props)
-            and _is_presubmitted_preview(props)
-        ):
+        if isinstance(props, dict) and _is_preview_job(props):
             previews.append((entry_id, entry, props))
+            if _is_presubmitted_preview(props):
+                presubmitted.add(entry_id)
 
     stranded = await _strand_check(user, previews)
 
@@ -1707,6 +1712,11 @@ async def _reconcile_presubmitted_previews(user: "_WatcherUser", jobs: list) -> 
 
         if _job_chunk_count(preview, "Errs") >= _PREVIEW_ERROR_LIMIT:
             await _rescue_failing_preview(user, preview_id, preview, props)
+            continue
+
+        if preview_id not in presubmitted:
+            # Queued after its render finished: there is no dependency left to
+            # reconcile, and a manual preview is the user's to keep.
             continue
 
         _, _, _, target_user_id, _, source_job_id = _extract_preview_context(
@@ -1877,7 +1887,7 @@ async def _scan_auto_preview_candidates(users: list[_WatcherUser]) -> int:
                 scheduled += 1
 
             try:
-                await _reconcile_presubmitted_previews(user, jobs)
+                await _reconcile_previews(user, jobs)
             except Exception as exc:
                 logger.warning(
                     "Watcher: preview reconcile failed for user %s: %s",

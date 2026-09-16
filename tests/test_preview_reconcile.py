@@ -109,7 +109,7 @@ class ReconcileScopeTests(unittest.IsolatedAsyncioTestCase):
         ) as delete_mock, mock.patch.object(
             job_watcher, "_unregister_auto_preview_history", new=mock.AsyncMock()
         ):
-            await job_watcher._reconcile_presubmitted_previews(user, jobs)
+            await job_watcher._reconcile_previews(user, jobs)
         return delete_mock
 
     async def test_pending_preview_of_running_render_untouched(self) -> None:
@@ -156,6 +156,58 @@ class ReconcileScopeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("src1", job_watcher._suspended_source_since)
         await self._reconcile(self._jobs(presubmitted=True, source_stat=1))
         self.assertNotIn("src1", job_watcher._suspended_source_since)
+
+
+
+class FailingPreviewScopeTests(unittest.IsolatedAsyncioTestCase):
+    """A preview that keeps failing is rescued however it was queued.
+
+    SHC_EDU_071_v01 rendered to a folder whose name no longer matched the path
+    in the job, so its preview found no frames and Deadline handed the task
+    back 97 times. That preview was queued at completion time, which this
+    reconciler used to skip.
+    """
+
+    def _preview(self, presubmitted: bool, errors: int) -> list:
+        return [{
+            "_id": "prev1",
+            "Stat": 1,  # rendering
+            "Errs": errors,
+            "Props": preview_props(presubmitted=presubmitted),
+        }]
+
+    async def _reconcile(self, jobs: list):
+        user = mock.Mock(telegram_user_id=42, login="tester", password="pw")
+        with mock.patch.object(
+            job_watcher, "_strand_check", new=mock.AsyncMock(return_value=set())
+        ), mock.patch.object(
+            job_watcher, "_rescue_failing_preview", new=mock.AsyncMock()
+        ) as rescue_mock, mock.patch(
+            "app.services.preview.runtime._extract_preview_context",
+            return_value=("", "", "", 42, {}, "src1"),
+        ), mock.patch(
+            "app.services.deadline.delete_job", new=mock.AsyncMock(return_value=True)
+        ):
+            await job_watcher._reconcile_previews(user, jobs)
+        return rescue_mock
+
+    async def test_completion_time_preview_is_rescued(self) -> None:
+        rescue = await self._reconcile(
+            self._preview(presubmitted=False, errors=job_watcher._PREVIEW_ERROR_LIMIT)
+        )
+        rescue.assert_awaited_once()
+
+    async def test_presubmitted_preview_is_still_rescued(self) -> None:
+        rescue = await self._reconcile(
+            self._preview(presubmitted=True, errors=job_watcher._PREVIEW_ERROR_LIMIT)
+        )
+        rescue.assert_awaited_once()
+
+    async def test_a_preview_below_the_limit_is_left_alone(self) -> None:
+        rescue = await self._reconcile(
+            self._preview(presubmitted=False, errors=job_watcher._PREVIEW_ERROR_LIMIT - 1)
+        )
+        rescue.assert_not_awaited()
 
 
 if __name__ == "__main__":
