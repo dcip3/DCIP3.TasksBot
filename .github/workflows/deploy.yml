@@ -58,4 +58,13 @@ jobs:
               tail -n 40 deploy.log | sed -e "s#$PWD#<deploy path>#g" -e "s#$project#<project>#g"
               exit 1
             fi
-            docker compose ps --format '{{.Service}}: {{.Status}}'
+            # A bot that exits at startup (a bad .env, say) keeps restarting and
+            # would still look deployed. Its logs can name jobs and users, so
+            # they stay on the server.
+            sleep 20
+            state=$(docker inspect -f '{{.State.Status}}, restarts: {{.RestartCount}}' "$(docker compose ps -q tasksbot)")
+            echo "tasksbot: $state"
+            if [ "$state" != "running, restarts: 0" ]; then
+              echo "The bot did not stay up; run docker compose logs tasksbot on the server."
+              exit 1
+            fi
