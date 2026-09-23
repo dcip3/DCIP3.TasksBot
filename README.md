@@ -86,7 +86,8 @@ docker compose up -d --build
 [deploy.yml](.github/workflows/deploy.yml) deploys the tip of `main` over SSH once the
 repository checks pass. Prepare a working installation on the server and add the repository
 secrets `VDS_HOST`, `VDS_USER`, `VDS_SSH_KEY`, and `DEPLOY_PATH` (the absolute path of that
-installation), plus `VDS_HOST_FINGERPRINT` to pin the server's host key. The SSH user needs
+installation), plus `VDS_HOST_FINGERPRINT` to pin the server's host key: the `SHA256:...` value
+from `ssh-keygen -lf /etc/ssh/ssh_host_ecdsa_key.pub` on the server. The SSH user needs
 access to that directory, Git, and Docker; `.env` and `data/` stay on the server. The deployment
 points the checkout at this repository over HTTPS and resets it to the commit that passed the
 checks, so keep local changes out of that directory. Compose output stays in `deploy.log` on the
