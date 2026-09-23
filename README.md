@@ -128,6 +128,7 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 | `OCIO_CONFIG_PATH` | `data/config.ocio` | OCIO config path |
 | `JOB_WATCHER_INTERVAL_NORMAL` | `60` | Polling interval (seconds) |
 | `JOB_WATCHER_INTERVAL_PREVIEW` | `5` | Faster polling when preview jobs are active |
+| `SCHEDULER_TIMEZONE` | `UTC` | IANA time zone for the scheduled cleanup jobs |
 
 ### Preview upload (worker -> bot)
 | Variable | Default | Purpose |

@@ -24,7 +24,7 @@ from app.core.maintenance import (
 logger = logging.getLogger(__name__)
 
 scheduler = AsyncIOScheduler(
-    timezone="Europe/Moscow",
+    timezone=settings.scheduler_timezone,
     job_defaults={"coalesce": True, "max_instances": 1},
 )
 job_watcher_task: Optional[asyncio.Task] = None
@@ -64,9 +64,29 @@ async def on_startup(bot) -> None:
     scheduler.start()
     logger.info("Scheduler started")
 
+    _schedule_maintenance_jobs()
+    logger.info("Scheduled cleanup tasks added")
+
+    global job_watcher_task
+    if job_watcher_task is None or job_watcher_task.done():
+        from app.services.job_watcher import job_progress_watcher
+
+        job_watcher_task = asyncio.create_task(job_progress_watcher(bot))
+        logger.info("Job progress watcher started")
+
+
+def _schedule_maintenance_jobs() -> None:
+    """Add the periodic cleanup and housekeeping jobs to the scheduler.
+
+    Each trigger is given the scheduler's zone explicitly. A trigger object
+    passed to add_job keeps the zone it was built with, and one built without
+    a zone uses the host's local zone, not the scheduler's.
+    """
+    zone = scheduler.timezone
+
     scheduler.add_job(
         cleanup_old_files,
-        CronTrigger(hour="*/6"),
+        CronTrigger(hour="*/6", timezone=zone),
         args=[24],
         id="cleanup_old_files",
         replace_existing=True,
@@ -74,7 +94,7 @@ async def on_startup(bot) -> None:
 
     scheduler.add_job(
         log_directory_sizes,
-        CronTrigger(minute=0),
+        CronTrigger(minute=0, timezone=zone),
         id="log_directory_sizes",
         replace_existing=True,
     )
@@ -87,7 +107,7 @@ async def on_startup(bot) -> None:
 
     scheduler.add_job(
         log_cache_stats,
-        CronTrigger(minute=0),
+        CronTrigger(minute=0, timezone=zone),
         id="log_cache_stats",
         replace_existing=True,
     )
@@ -99,7 +119,7 @@ async def on_startup(bot) -> None:
 
     scheduler.add_job(
         cleanup_preview_tokens,
-        CronTrigger(minute=0),
+        CronTrigger(minute=0, timezone=zone),
         id="cleanup_preview_tokens",
         replace_existing=True,
     )
@@ -117,19 +137,13 @@ async def on_startup(bot) -> None:
     if settings.preview_upload_enabled:
         scheduler.add_job(
             recover_preview_upload_tokens,
-            IntervalTrigger(seconds=settings.preview_upload_recovery_interval_seconds),
+            IntervalTrigger(
+                seconds=settings.preview_upload_recovery_interval_seconds,
+                timezone=zone,
+            ),
             id="recover_preview_uploads",
             replace_existing=True,
         )
-
-    logger.info("Scheduled cleanup tasks added")
-
-    global job_watcher_task
-    if job_watcher_task is None or job_watcher_task.done():
-        from app.services.job_watcher import job_progress_watcher
-
-        job_watcher_task = asyncio.create_task(job_progress_watcher(bot))
-        logger.info("Job progress watcher started")
 
 
 async def on_shutdown(bot) -> None:

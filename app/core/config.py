@@ -7,6 +7,7 @@ for environment variable management and validation.
 """
 
 from typing import Dict, Optional
+from zoneinfo import ZoneInfo
 from cryptography.fernet import Fernet
 from pydantic_settings import BaseSettings
 from pydantic import Field, field_validator
@@ -154,6 +155,12 @@ class Settings(BaseSettings):
     job_watcher_interval_normal: int = Field(60, ge=5, description="Job monitoring interval in seconds (normal mode)")
     job_watcher_interval_preview: int = Field(5, ge=5, description="Job monitoring interval in seconds (when preview jobs are active)")
 
+    # Maintenance scheduler (6-hourly file cleanup, hourly housekeeping)
+    scheduler_timezone: str = Field(
+        "UTC",
+        description="IANA time zone the maintenance jobs are scheduled in, e.g. Europe/Berlin",
+    )
+
     # Worker and Job Status Mappings
     worker_status_map: Dict[int, str] = {
         0: "Unknown",
@@ -207,6 +214,16 @@ class Settings(BaseSettings):
                 "bytes); generate one with Fernet.generate_key()"
             ) from exc
         return v
+
+    @field_validator("scheduler_timezone")
+    def validate_scheduler_timezone(cls, v):
+        """Fail at startup with an error naming this setting, not later in APScheduler."""
+        name = v.strip()
+        try:
+            ZoneInfo(name)
+        except Exception as exc:
+            raise ValueError(f"{v!r} is not a known IANA time zone") from exc
+        return name
 
 # Global settings instance
 settings = Settings()  # type: ignore[reportCallIssue]
