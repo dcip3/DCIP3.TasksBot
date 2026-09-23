@@ -29,12 +29,12 @@ _SCRIPT_CACHE_PATH: Optional[Path] = None
 _SCRIPT_CACHE_MTIME_NS: Optional[int] = None
 _SCRIPT_CACHE_B64: Optional[str] = None
 
-# Task errors a preview may collect before Deadline itself fails it. This farm
-# never fails a task on its own (task failure detection is off and a job only
-# fails at 100 errors), so a preview that cannot finish runs, fails and runs
-# again on the machine it has just freed for as long as nobody looks. The
-# watcher steps in earlier (job_watcher._PREVIEW_ERROR_LIMIT); this is what
-# stops the loop when the bot cannot.
+# Task errors a preview may collect before Deadline itself fails it. A farm can
+# be set up so Deadline never fails a task on its own (task failure detection
+# off, a job failing only at 100 errors), and there a preview that cannot finish
+# runs, fails and runs again on the machine it has just freed for as long as
+# nobody looks. The watcher steps in earlier (job_watcher._PREVIEW_ERROR_LIMIT);
+# this is what stops the loop when the bot cannot.
 PREVIEW_TASK_ERROR_LIMIT = 5
 
 
@@ -56,9 +56,8 @@ def render_has_no_frames_yet(job: Dict[str, Any]) -> bool:
     A preview of such a render has nothing to encode: it waits for frames,
     finds none, fails, and Deadline hands it straight back to the queue - at a
     higher priority than the render, so it takes the machine the render needs.
-    SHC_0260_ID_v011 and SHD_0270_ID_v009 were previewed from the chat while
-    they were still queued, and two of the three workers spent two hours on
-    that loop instead of rendering.
+    A preview asked for from the chat while its render is still queued can keep
+    workers on that loop for hours instead of rendering.
     """
     # Queued or rendering, suspended, failed, pending. A render whose state is
     # not known is previewed as before rather than held on a guess.

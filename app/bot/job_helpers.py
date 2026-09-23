@@ -193,7 +193,7 @@ def truncate_cell(text: str, max_width: int = BATCH_COLUMN_WIDTH) -> str:
 
 def format_progress_old(completed: int, total: int) -> str:
     """
-    Format progress in old style (like in an earlier bot).
+    Format progress in the old compact style: percentage, then done/total.
 
     Args:
         completed: Number of completed items

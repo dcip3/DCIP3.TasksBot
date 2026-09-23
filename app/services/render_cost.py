@@ -1,9 +1,9 @@
 """Cost model for render-time estimation.
 
-Frame cost is wildly uneven on real shots - on SHB_city_main_v027 the most
-expensive chunk took 67x longer than the cheapest, and the expensive ones sat
-in the middle of the range. Any estimator that assumes "the frames left cost
-what the recent frames cost" therefore lowballs the ETA by ~5x for hours.
+Frame cost is wildly uneven on real shots - the most expensive chunk can take
+dozens of times longer than the cheapest, and the expensive ones may sit in the
+middle of the range. Any estimator that assumes "the frames left cost what the
+recent frames cost" therefore lowballs the ETA, by as much as ~5x, for hours.
 
 This module models cost as a *curve over frame index* instead: every completed
 task is one sample of that curve, unobserved stretches are interpolated between

@@ -2337,9 +2337,8 @@ def _handle_upload_failure(outcome: str = UPLOAD_UNREACHABLE) -> None:
     machine list, and that is only right when the fault is this machine's. A
     bot that answers and refuses - an expired upload token, say - refuses every
     machine alike, and moving the task then walks the job through the farm
-    crossing off one worker at a time until none is left. That is exactly what
-    happened to a preview here: two workers in a row collected nine 403s each
-    and struck themselves off, leaving a job no machine could take.
+    crossing off one worker at a time until none is left, leaving a job no
+    machine can take.
 
     So the task moves only when the bot never answered at all. Otherwise this
     fails outright, and the bot reports a failed preview - a message beats a

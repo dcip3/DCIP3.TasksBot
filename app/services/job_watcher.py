@@ -318,10 +318,10 @@ def _matches_scene_not_ready_error(report: dict) -> bool:
 def _matches_plugin_sandbox_error(report: dict) -> bool:
     """The worker cannot start the sandbox process its plugins run in.
 
-    Seen on NodeC during SHA_0070_DS_v019: 100 tasks failed in 23 minutes, every
-    one of them on that machine while the rest of the farm rendered the same job
-    fine. The sandbox child process could not connect back to the worker's own
-    command listener on loopback:
+    The fault is the machine's, not the job's: every task that lands on it fails
+    within moments while the rest of the farm renders the same job fine. The
+    sandbox child process cannot connect back to the worker's own command
+    listener on loopback:
 
         SocketException (10013): An attempt was made to access a socket in a way
         forbidden by its access permissions. [::1]:29293
@@ -335,8 +335,8 @@ def _matches_plugin_sandbox_error(report: dict) -> bool:
         return False
     # Deliberately narrow. "Failed to load the plugin because:" alone also covers
     # a missing DCC version or a bad plugin config, and this alert's advice - the
-    # loopback port - would be wrong for those. Across the 65 jobs currently on
-    # the farm these two phrases caught all 119 sandbox failures and nothing else.
+    # loopback port - would be wrong for those. These two phrases are what the
+    # sandbox failure itself reports, and in practice they match nothing else.
     return (
         "could not initialize the plugin sandbox" in search_text
         or "sandbox process exited unexpectedly" in search_text
@@ -409,12 +409,11 @@ def _report_dedupe_id(job_id: str, report: dict, rule_key: str) -> str:
         return f"{rule_key}:{str(job_id or '').strip()}"
 
     if rule_key in ("plugin_sandbox_error", "redshift_activation"):
-        # A worker in this state fails every task it is handed - SHA_0070_DS_v019
-        # collected 100 sandbox reports from one machine in 23 minutes, and an
-        # unlicensed Redshift on NodeB sent nine identical alerts for
-        # SHC_0170_ID_v022 in half an hour. Alert once per machine per job; per
-        # report would be a flood, and the message would say the same thing
-        # every time.
+        # A worker in this state fails every task it is handed, so one broken
+        # machine can file dozens of identical reports against a job within
+        # minutes; a worker without a Redshift licence would otherwise send one
+        # alert per task. Alert once per machine per job; per report would be a
+        # flood, and the message would say the same thing every time.
         slave = _normalize_identity(report.get("Slave")) or "unknown"
         return f"{rule_key}:{str(job_id or '').strip()}:{slave}"
 
@@ -1691,11 +1690,11 @@ async def _reconcile_previews(user: "_WatcherUser", jobs: list) -> None:
     """Deal with previews that cannot finish, whenever they were queued.
 
     A preview that no worker may run, or that keeps failing, is the same waste
-    whether it was pre-submitted or queued once the render completed - and the
-    completion-time ones used to be skipped here entirely. SHC_EDU_071_v01 was
-    one: its render wrote frames to a folder whose name no longer matched the
-    path in the job, so every attempt found no frames, and Deadline handed the
-    task back to a worker 97 times before anyone looked.
+    whether it was pre-submitted or queued once the render completed, so both
+    are checked here. A render that writes its frames to a folder whose name no
+    longer matches the path in the job is one case: every attempt of its
+    preview finds no frames, and Deadline hands the task back to a worker again
+    and again until someone steps in.
 
     The dependency checks below stay with pre-submitted previews. They ask what
     became of the render the preview is waiting on; a preview queued after that
@@ -1932,9 +1931,10 @@ async def _reconcile_previews_of_all_users(users: list[_WatcherUser]) -> None:
     """Look after every account's previews, not only the auto-preview ones.
 
     A preview asked for from the chat is as able to loop as an automatic one,
-    and this used to run only inside the auto-preview scan: nodeb previewed
-    SHC_0260_ID_v011 and SHD_0270_ID_v009 with auto previews off, both previews
-    failed about fifty times each, and nothing here ever looked at them.
+    so this runs for every account rather than inside the auto-preview scan,
+    which only covers accounts with auto previews on. Otherwise a preview from
+    an account with them off could fail over and over with nothing looking at
+    it.
     """
     from app.services.deadline import get_jobs_by_credentials
 

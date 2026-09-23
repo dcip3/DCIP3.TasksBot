@@ -1,9 +1,9 @@
 """Probe-first task scheduling, so the ETA has a cost curve to work with.
 
 A render normally walks the frame range in order, which means the first hours
-only ever sample one end of the shot. On SHB_city_main_v027 that end happened
-to be the cheapest part of the range, and the ETA sat at ~1.5 h while the true
-answer was 8 h.
+only ever sample one end of the shot. When that end happens to be the cheapest
+part of the range, the ETA can sit several times too low for hours - ~1.5 h
+shown for a render that really needs 8 h.
 
 So before letting the render proceed sequentially, we hold back all but a
 handful of chunks spread across the whole range. Those "probes" are ordinary
@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 # Spread this many probes across the range, then refine where the time is.
 INITIAL_PROBES = 5
-# Two refinements, measured over nine finished jobs on this farm (integral of
+# Two refinements, measured over nine finished production renders (integral of
 # the cost curve against what the job actually cost):
 #
 #     refinements   median   worst under   worst over   mean |error|
@@ -109,12 +109,12 @@ def pick_adaptive_probe(
     """The unrendered chunk that would tell us the most.
 
     Straight interpolation between evenly spaced probes flattens narrow peaks -
-    on SHB_city_main_v004 the chord across the middle read a 62-minute chunk as
-    23 minutes, and the whole estimate ran ~25% short for the entire render.
+    a chord across the middle of a shot can read a 62-minute chunk as 23
+    minutes and leave the whole estimate ~25% short for the entire render.
 
     Probes therefore go where the *render time* is, not where the curve is
     steepest. Chasing the steepest slope sounds right but keeps landing on the
-    cheap end of a ramp. Over nine finished jobs on this farm, with two
+    cheap end of a ramp. Over nine finished production renders, with two
     refinements each:
 
         by slope       median 1.03x, worst under 0.83x
@@ -128,9 +128,9 @@ def pick_adaptive_probe(
     # Split the range at every position already measured, being measured, or
     # just handed out in this same batch. A task that is rendering will deliver
     # its sample shortly, so a probe next to it buys nothing - going by curve
-    # points alone once put a probe on task 15 while task 14 was mid-render, and
-    # ignoring `exclude` here once sent a pair of probes to tasks 35 and 36,
-    # which between them measured the same thing twice.
+    # points alone would put a probe right beside a task that is mid-render, and
+    # ignoring `exclude` would send two probes to neighbouring tasks that
+    # between them measure the same thing twice.
     covered = sorted(
         {x for x, _ in curve}
         | {

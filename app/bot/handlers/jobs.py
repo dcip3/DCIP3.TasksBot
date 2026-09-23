@@ -675,9 +675,9 @@ def _render_busy_seconds(tasks: list, now_utc: datetime) -> float | None:
 
     A job does not render for every minute between its first task and its last:
     the farm takes its machines away for other work, probing suspends most of
-    its tasks, a requeue puts it back in the queue. One job on the farm read
-    "13 h 33 min" on its card while only 4 h 27 min of that had a task
-    running - the other nine hours it sat waiting its turn.
+    its tasks, a requeue puts it back in the queue. Counting the whole span can
+    make a job look three times longer than the time it had a task running -
+    the rest of that time it sat waiting its turn.
 
     So this measures the union of the intervals in which at least one task was
     rendering. Overlaps count once: two machines working in parallel make a job
