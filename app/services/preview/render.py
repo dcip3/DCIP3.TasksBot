@@ -46,6 +46,10 @@ class PreviewSubmissionError(RuntimeError):
         self.user_message = user_message
 
 
+class NoFramesYetError(PreviewSubmissionError):
+    """A preview of what is rendered so far was asked for, and nothing is."""
+
+
 def render_has_no_frames_yet(job: Dict[str, Any]) -> bool:
     """True while a render has not finished a single task.
 
@@ -283,6 +287,7 @@ async def create_video_from_job(
     input_wait_seconds: Optional[int] = None,
     presubmitted: bool = False,
     depends_on: Optional[str] = None,
+    if_no_frames: str = "hold",
 ) -> Optional[Dict[str, Any]]:
     """
     Submit a Deadline CommandLine job that generates a preview video using ffmpeg.
@@ -293,6 +298,12 @@ async def create_video_from_job(
         skip_worker_validation: Skip checking worker statuses before submission.
         use_any_machine: Ignore preferred workers and allow Deadline to pick any machine.
         specific_worker: Force preview job to run on specific worker (overrides other settings).
+        depends_on: Hold the preview Pending until this job completes.
+        if_no_frames: What to do when the render has not finished a single
+            task and no dependency was given: "hold" the preview until the
+            render completes (the bot's own previews), or "refuse" with
+            NoFramesYetError (a preview asked for from the chat is meant to
+            show what is there now).
 
     Returns:
         Dict with submission details and expected paths, or None if unable to submit.
@@ -322,16 +333,28 @@ async def create_video_from_job(
             "Render output path was not found for this job."
         )
 
-    if depends_on is None and render_has_no_frames_yet(job_info):
+    if depends_on is not None and job_info.get("Stat") == 3:
+        # Finished between being looked at and being previewed: there is
+        # nothing left to wait for, and a dependency would only hold the
+        # preview until the farm's next pending scan.
+        depends_on = None
+    elif depends_on is None and render_has_no_frames_yet(job_info):
         if job_info.get("Stat") == 4:
             raise PreviewSubmissionError(
                 "This render failed before finishing a single frame, "
                 "so there is nothing to preview."
             )
+        if if_no_frames == "refuse":
+            # Submitting it anyway is what cost two machines two hours: it
+            # waits for frames, finds none, fails, and Deadline hands it back.
+            raise NoFramesYetError(
+                "Nothing to preview yet: this render has not finished a single "
+                "frame. Press 🔍 Preview again once it has, or have the preview "
+                "sent when the render finishes."
+            )
         # Hold the preview on the render, the way automatic ones are held:
         # it costs nothing while it waits and starts the moment the render is
-        # done. A render already producing frames still gets a preview of
-        # what is there now, which is what asking for one mid-render means.
+        # done.
         depends_on = job_id
         presubmitted = True
         if input_wait_seconds is None:
@@ -603,10 +626,10 @@ async def create_video_from_job(
         "FailureDetectionTaskErrors": PREVIEW_TASK_ERROR_LIMIT,
     }
     if presubmitted:
-        # Marks previews queued before their render finished - automatic ones,
-        # and requested ones held for a render with nothing on disk yet. Only
-        # these are reconciled against the source job; a preview of frames
-        # that already exist runs as requested.
+        # Marks previews queued to wait for their render - automatic ones, and
+        # ones asked from the chat to be sent when the render finishes. Only
+        # these are reconciled against the source job; a preview of the
+        # frames rendered so far runs as requested.
         preview_job_info["ExtraInfoKeyValue6"] = "PreviewPresubmit=1"
     if depends_on:
         # Deadline holds the job in Pending until the render completes, so the

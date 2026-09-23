@@ -7,6 +7,10 @@ found none, failed, and Deadline handed them back. NodeB and NodeC did nothing
 else for two hours - about fifty failures each - while the render they were
 keeping from the machines starved. The farm itself never stops such a loop:
 task failure detection is off there, and a job only fails at 100 errors.
+
+A preview from the chat is for checking a render while it runs, so it still
+starts at once whenever there is something to show. When there is nothing,
+the user is told so, and may have the preview sent when the render finishes.
 """
 
 import base64
@@ -70,11 +74,10 @@ class NoFramesYetTests(unittest.TestCase):
         self.assertFalse(render.render_has_no_frames_yet(job))
 
 
-class HeldSubmissionTests(unittest.IsolatedAsyncioTestCase):
-    """What reaches Deadline when a preview is asked for from the chat."""
-
+class SubmissionTestCase(unittest.IsolatedAsyncioTestCase):
     async def _submit(self, job_info: dict, **kwargs):
         captured: dict = {}
+        self.submitted = captured
 
         async def _submit_job(**call):
             captured.update(call["job_info"])
@@ -100,8 +103,56 @@ class HeldSubmissionTests(unittest.IsolatedAsyncioTestCase):
                 return json.loads(base64.b64decode(value.split("=", 1)[1]))
         raise AssertionError("worker arguments missing")
 
-    async def test_a_preview_of_a_queued_render_waits_for_it(self) -> None:
+
+class ChatPreviewSubmissionTests(SubmissionTestCase):
+    """What reaches Deadline when 🔍 Preview is pressed in the chat."""
+
+    async def test_nothing_is_submitted_for_a_render_without_frames(self) -> None:
         """The incident: this preview used to start at once and loop."""
+        with self.assertRaises(render.NoFramesYetError) as caught:
+            await self._submit(render_job(1), if_no_frames="refuse")
+        self.assertIn("Nothing to preview yet", caught.exception.user_message)
+        self.assertEqual(self.submitted, {})
+
+    async def test_a_render_with_frames_is_previewed_now(self) -> None:
+        submitted, result = await self._submit(
+            render_job(1, completed=5, rendering=3), if_no_frames="refuse"
+        )
+        self.assertNotIn("JobDependencies", submitted)
+        self.assertNotIn("ExtraInfoKeyValue6", submitted)
+        self.assertFalse(result["waits_for_render"])
+
+    async def test_a_finished_render_is_previewed_now(self) -> None:
+        submitted, result = await self._submit(
+            render_job(3, completed=8, queued=0), if_no_frames="refuse"
+        )
+        self.assertNotIn("JobDependencies", submitted)
+        self.assertFalse(result["waits_for_render"])
+
+    async def test_asked_to_wait_it_waits_whatever_is_rendered(self) -> None:
+        submitted, result = await self._submit(
+            render_job(1),
+            depends_on="src1",
+            presubmitted=True,
+            input_wait_seconds=settings.preview_presubmit_input_wait,
+            if_no_frames="refuse",
+        )
+        self.assertEqual(submitted.get("JobDependencies"), "src1")
+        self.assertEqual(submitted.get("ExtraInfoKeyValue6"), "PreviewPresubmit=1")
+        self.assertTrue(result["waits_for_render"])
+
+    async def test_a_render_that_failed_before_any_frame_is_refused(self) -> None:
+        """Nothing will ever be there, so there is nothing to wait for either."""
+        with self.assertRaises(render.PreviewSubmissionError) as caught:
+            await self._submit(render_job(4), if_no_frames="refuse")
+        self.assertNotIsInstance(caught.exception, render.NoFramesYetError)
+        self.assertIn("failed before finishing a single frame", caught.exception.user_message)
+
+
+class BotQueuedPreviewSubmissionTests(SubmissionTestCase):
+    """Previews the bot queues itself - replacements above all - never loop."""
+
+    async def test_a_replacement_for_a_render_without_frames_waits_for_it(self) -> None:
         submitted, result = await self._submit(render_job(1))
         self.assertEqual(submitted.get("JobDependencies"), "src1")
         self.assertEqual(submitted.get("ResumeOnCompleteDependencies"), "true")
@@ -116,17 +167,6 @@ class HeldSubmissionTests(unittest.IsolatedAsyncioTestCase):
         wait = argv[argv.index("--input-wait-seconds") + 1]
         self.assertEqual(int(wait), settings.preview_presubmit_input_wait)
 
-    async def test_a_render_with_frames_is_previewed_now(self) -> None:
-        submitted, result = await self._submit(render_job(1, completed=5, rendering=3))
-        self.assertNotIn("JobDependencies", submitted)
-        self.assertNotIn("ExtraInfoKeyValue6", submitted)
-        self.assertFalse(result["waits_for_render"])
-
-    async def test_a_finished_render_is_previewed_now(self) -> None:
-        submitted, result = await self._submit(render_job(3, completed=8, queued=0))
-        self.assertNotIn("JobDependencies", submitted)
-        self.assertFalse(result["waits_for_render"])
-
     async def test_an_automatic_preview_keeps_its_own_dependency(self) -> None:
         submitted, result = await self._submit(
             render_job(1, rendering=2), depends_on="src1", presubmitted=True, input_wait_seconds=900
@@ -136,16 +176,18 @@ class HeldSubmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(argv[argv.index("--input-wait-seconds") + 1], "900")
         self.assertTrue(result["waits_for_render"])
 
-    async def test_a_render_that_failed_before_any_frame_is_refused(self) -> None:
-        """Held on a failed render it would wait for ever; say so instead."""
-        with self.assertRaises(render.PreviewSubmissionError) as caught:
-            await self._submit(render_job(4))
-        self.assertIn("nothing to preview", caught.exception.user_message)
+    async def test_no_dependency_on_a_render_that_has_already_finished(self) -> None:
+        """It would only sit Pending until the farm's next pending scan."""
+        submitted, result = await self._submit(
+            render_job(3, completed=8, queued=0), depends_on="src1", presubmitted=True
+        )
+        self.assertNotIn("JobDependencies", submitted)
+        self.assertFalse(result["waits_for_render"])
 
     async def test_deadline_stops_a_preview_that_keeps_failing(self) -> None:
         """This farm never fails a task by itself; every preview brings a limit."""
-        for job in (render_job(1), render_job(3, completed=8, queued=0)):
-            submitted, _ = await self._submit(job)
+        for kwargs in ({}, {"if_no_frames": "refuse"}):
+            submitted, _ = await self._submit(render_job(3, completed=8, queued=0), **kwargs)
             self.assertEqual(submitted.get("OverrideTaskFailureDetection"), "true")
             self.assertEqual(
                 submitted.get("FailureDetectionTaskErrors"), render.PREVIEW_TASK_ERROR_LIMIT
@@ -171,35 +213,86 @@ class RequestFromChatTests(unittest.IsolatedAsyncioTestCase):
         runtime.preview_message_registry.clear()
         runtime.preview_tracked_jobs.clear()
 
-    async def _press(self, result: dict):
+    @staticmethod
+    def _callback(data: str = "preview_job:src1"):
         message = mock.Mock()
         message.chat.id = 100000002
         message.message_id = 55
         message.edit_text = mock.AsyncMock()
         callback = mock.Mock()
+        callback.data = data
         callback.from_user.id = 100000002
+        callback.message = message
         callback.message.answer = mock.AsyncMock(return_value=message)
         callback.answer = mock.AsyncMock()
+        return callback, message
+
+    async def _press(self, submit: mock.AsyncMock, **kwargs):
+        callback, message = self._callback()
         with mock.patch.object(
-            preview_handlers, "create_video_from_job", new=mock.AsyncMock(return_value=result)
+            preview_handlers, "create_video_from_job", new=submit
         ), mock.patch.object(
             runtime, "_run_preview_animation", new=mock.AsyncMock()
         ):
-            await preview_handlers.create_new_video_process(callback, "src1")
+            await preview_handlers.create_new_video_process(callback, "src1", **kwargs)
         return message
 
-    async def test_a_held_preview_says_it_waits_for_the_render(self) -> None:
-        message = await self._press({"preview_job_id": "prev1", "waits_for_render": True})
+    async def test_a_preview_asks_for_what_is_there_now(self) -> None:
+        submit = mock.AsyncMock(return_value={"preview_job_id": "prev1", "waits_for_render": False})
+        await self._press(submit)
+        self.assertEqual(submit.await_args.kwargs["if_no_frames"], "refuse")
+        self.assertIsNone(submit.await_args.kwargs["depends_on"])
+
+    async def test_nothing_rendered_yet_is_said_at_once(self) -> None:
+        """No job on the farm, and a way to get the preview later."""
+        submit = mock.AsyncMock(side_effect=preview_handlers.NoFramesYetError("Nothing to preview yet: …"))
+        message = await self._press(submit)
         text = message.edit_text.await_args.args[0]
-        self.assertIn("starts as soon as the render completes", text)
+        self.assertTrue(text.startswith("⚠️ Nothing to preview yet"))
+        buttons = [
+            button.callback_data
+            for row in message.edit_text.await_args.kwargs["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        self.assertIn("preview_after_render:src1", buttons)
+        self.assertFalse(runtime.preview_message_registry)
+        self.assertFalse(runtime.preview_tracked_jobs)
+
+    async def test_send_it_when_the_render_finishes(self) -> None:
+        submit = mock.AsyncMock(return_value={"preview_job_id": "prev1", "waits_for_render": True})
+        callback, message = self._callback("preview_after_render:src1")
+        with mock.patch.object(
+            preview_handlers, "create_video_from_job", new=submit
+        ), mock.patch.object(
+            preview_handlers, "get_preview_default_worker", new=mock.AsyncMock(return_value=None)
+        ):
+            await preview_handlers.preview_after_render_callback(callback)
+
+        kwargs = submit.await_args.kwargs
+        self.assertEqual(kwargs["depends_on"], "src1")
+        self.assertTrue(kwargs["presubmitted"])
+        self.assertEqual(kwargs["input_wait_seconds"], settings.preview_presubmit_input_wait)
+        self.assertIn("starts as soon as the render completes", message.edit_text.await_args.args[0])
         # Hours of waiting are not animated into Telegram's rate limits.
         self.assertNotIn("prev1", runtime.preview_animation_tasks)
         self.assertEqual(runtime.preview_message_registry.get("prev1"), (100000002, 55))
         # The bot can release it itself when the render finishes.
         self.assertEqual(runtime.preview_tracked_jobs.get("prev1"), (100000002, "src1"))
 
+    async def test_a_named_default_worker_is_kept_for_the_wait(self) -> None:
+        submit = mock.AsyncMock(return_value={"preview_job_id": "prev1", "waits_for_render": True})
+        callback, _ = self._callback("preview_after_render:src1")
+        with mock.patch.object(
+            preview_handlers, "create_video_from_job", new=submit
+        ), mock.patch.object(
+            preview_handlers, "get_preview_default_worker", new=mock.AsyncMock(return_value="NodeC")
+        ):
+            await preview_handlers.preview_after_render_callback(callback)
+        self.assertEqual(submit.await_args.kwargs["specific_worker"], "NodeC")
+
     async def test_a_preview_that_runs_now_is_animated_as_before(self) -> None:
-        message = await self._press({"preview_job_id": "prev2", "waits_for_render": False})
+        submit = mock.AsyncMock(return_value={"preview_job_id": "prev2", "waits_for_render": False})
+        message = await self._press(submit)
         self.assertIn("Preview job queued", message.edit_text.await_args.args[0])
         self.assertIn("prev2", runtime.preview_animation_tasks)
         self.assertNotIn("prev2", runtime.preview_tracked_jobs)

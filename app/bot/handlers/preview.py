@@ -21,7 +21,9 @@ from app.services.deadline import (
     get_workers_list,
     WorkerStatusError,
 )
+from app.core.config import settings
 from app.services.preview.render import (
+    NoFramesYetError,
     PreviewSubmissionError,
     create_video_from_job,
 )
@@ -320,6 +322,33 @@ async def preview_render_options_callback(callback_query: CallbackQuery) -> None
         await callback_query.answer()
 
 
+@router.callback_query(lambda c: c.data and c.data.startswith("preview_after_render:"))
+async def preview_after_render_callback(callback_query: CallbackQuery) -> None:
+    """Queue a preview that waits for the render, after there was nothing to show."""
+    if callback_query.data is None or callback_query.from_user is None:
+        await callback_query.answer("Invalid callback data.", show_alert=True)
+        return
+
+    job_id = callback_query.data.split(":", 1)[1]
+    default_worker = await get_preview_default_worker(callback_query.from_user.id)
+    # Nobody is watching a worker menu for a preview due hours from now: a
+    # named default worker is honoured, anything else runs where the render
+    # may run.
+    specific_worker = (
+        default_worker
+        if default_worker and default_worker != PREVIEW_DEFAULT_WORKER_AUTO
+        else None
+    )
+    await create_new_video_process(
+        callback_query,
+        job_id,
+        skip_worker_validation=True,
+        progress_message=callback_query.message,
+        specific_worker=specific_worker,
+        wait_for_render=True,
+    )
+
+
 async def create_new_video_process(
     callback_query: CallbackQuery,
     job_id: str,
@@ -328,8 +357,14 @@ async def create_new_video_process(
     skip_worker_validation: bool = False,
     progress_message: Optional[Message] = None,
     specific_worker: Optional[str] = None,
+    wait_for_render: bool = False,
 ) -> None:
-    """Submit a Deadline job that generates a preview video via ffmpeg."""
+    """Submit a Deadline job that generates a preview video via ffmpeg.
+
+    A preview asked for from the chat shows what is rendered right now. With
+    ``wait_for_render`` it is held until the render finishes instead - the
+    user's choice when there was nothing rendered yet to show.
+    """
     if callback_query.from_user is None:
         await callback_query.answer("Error: user not found.", show_alert=True)
         return
@@ -356,6 +391,12 @@ async def create_new_video_process(
             skip_worker_validation=skip_worker_validation,
             use_any_machine=use_any_machine,
             specific_worker=specific_worker,
+            depends_on=job_id if wait_for_render else None,
+            presubmitted=wait_for_render,
+            input_wait_seconds=(
+                settings.preview_presubmit_input_wait if wait_for_render else None
+            ),
+            if_no_frames="refuse",
         )
         if not result:
             if progress_msg:
@@ -391,8 +432,7 @@ async def create_new_video_process(
                 callback_query,
                 progress_msg,
                 (
-                    "⏳ Preview queued. The render has no finished frames yet, "
-                    "so the preview starts as soon as the render completes."
+                    "⏳ Preview queued. It starts as soon as the render completes."
                     if waits_for_render
                     else "✅ Preview job queued\n□ □ □"
                 ),
@@ -453,6 +493,29 @@ async def create_new_video_process(
             if rate_limited:
                 return
         await callback_query.answer("Preferred workers are unavailable.", show_alert=False)
+    except NoFramesYetError as exc:
+        # Nothing was submitted: a preview queued now would only wait for
+        # frames, fail and be handed back to the farm again and again.
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="⏳ Send it when the render finishes",
+                        callback_data=f"preview_after_render:{job_id}",
+                    )
+                ],
+                [cancel_inline_button(callback_data="preview_cancel")],
+            ]
+        )
+        if progress_msg:
+            await _set_progress_message(
+                callback_query,
+                progress_msg,
+                f"⚠️ {exc.user_message}",
+                reply_markup=keyboard,
+            )
+        with contextlib.suppress(Exception):
+            await callback_query.answer("No frames to preview yet.", show_alert=False)
     except PreviewSubmissionError as exc:
         user_message = exc.user_message
         if progress_msg:
