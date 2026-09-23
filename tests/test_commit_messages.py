@@ -11,6 +11,7 @@ class CommitMessageTests(unittest.TestCase):
             "docs: explain worker setup\n\nAdd the ffmpeg note.\n# Git comment",
             'Revert "fix: keep the preview caption short"',
             'Revert "feat: add a long enough subject to pass the usual limit" (#12)',
+            "fix: " + "a" * 67 + " (#123)",
         ):
             with self.subTest(message=message):
                 self.assertEqual(validate(message), [])
@@ -18,7 +19,8 @@ class CommitMessageTests(unittest.TestCase):
     def test_rejects_invalid_messages(self):
         for message in (
             "", "# Only a comment", "Update files", "fix: update dates — again",
-            "fix: " + "a" * 68, "fix: update dates\nMissing blank line",
+            "fix: " + "a" * 68, "fix: " + "a" * 68 + " (#1)",
+            "fix: update dates\nMissing blank line",
         ):
             with self.subTest(message=message):
                 self.assertTrue(validate(message))

@@ -12,6 +12,8 @@ SUBJECT = re.compile(
 )
 # GitHub's Revert button titles its pull request 'Revert "<subject>"'.
 GITHUB_REVERT = re.compile(r'^Revert ".+"(?: \(#\d+\))?$')
+# A squash merge appends the pull request number to the title.
+PULL_REQUEST_NUMBER = re.compile(r" \(#\d+\)$")
 
 
 def validate(message: str, comment: str | None = "#") -> list[str]:
@@ -34,7 +36,7 @@ def validate(message: str, comment: str | None = "#") -> list[str]:
             errors.append(
                 "Use a Conventional Commit, e.g. fix: keep the preview caption short."
             )
-        if len(lines[0]) > 72:
+        if len(PULL_REQUEST_NUMBER.sub("", lines[0])) > 72:
             errors.append("Keep the subject within 72 characters.")
     if any(ord(char) > 126 or (ord(char) < 32 and char not in "\n\t") for char in message):
         errors.append("Use English text and ASCII punctuation.")

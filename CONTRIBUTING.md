@@ -30,7 +30,9 @@ Types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`
 `chore`, `revert`. An optional scope and breaking-change `!` are supported.
 Credit actual human contributions accurately; generated tool signatures are not
 required. Pull requests are squash-merged, so give them a title in the same
-format; GitHub's own `Revert "..."` titles are accepted too.
+format (CI checks it); GitHub's own `Revert "..."` titles are accepted too. The
+squash commit's body is built from the pull request's commit messages, which CI
+checks as well, never from its description.
 
 ## Local checks
 

@@ -1,0 +1,25 @@
+name: Pull request title
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  title:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # main's own checker, which the merged commit will face.
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      # Pull requests are squash-merged, so the title becomes a commit subject
+      # on main, where the history check would then fail on every later run.
+      - env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          printf '%s\n' "$TITLE" > "$RUNNER_TEMP/title"
+          python3 scripts/check_commit_messages.py --file "$RUNNER_TEMP/title"
