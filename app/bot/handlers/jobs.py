@@ -1420,7 +1420,7 @@ async def handle_jobs(message: Message, page: int = 0) -> None:
         text, keyboard = _build_jobs_overview(combined_jobs, page)
         await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
 
-    except Exception as exc:
+    except Exception:
         logger.exception("Error handling jobs for user %s", message.from_user.id)
         await message.answer("Error occurred while fetching jobs.")
 
@@ -1456,7 +1456,7 @@ async def jobs_page_callback(callback_query: CallbackQuery) -> None:
             page,
         )
 
-    except Exception as exc:
+    except Exception:
         logger.exception(
             "Error handling jobs page for user %s", callback_query.from_user.id
         )
@@ -1487,7 +1487,7 @@ async def jobs_back_callback(callback_query: CallbackQuery) -> None:
             0,
         )
 
-    except Exception as exc:
+    except Exception:
         logger.exception(
             "Error handling jobs back for user %s", callback_query.from_user.id
         )
@@ -1658,7 +1658,7 @@ async def job_info_callback(callback_query: CallbackQuery) -> None:
 
         await callback_query.answer()
 
-    except Exception as exc:
+    except Exception:
         logger.exception(
             "Error handling job info for user %s", callback_query.from_user.id
         )
@@ -1737,7 +1737,7 @@ async def job_update_callback(callback_query: CallbackQuery) -> None:
         await _edit_or_send_job_info(callback_query.message, info_text, keyboard)
         await callback_query.answer("Updated")
 
-    except Exception as exc:
+    except Exception:
         logger.exception(
             "Error updating job info for user %s", callback_query.from_user.id
         )
@@ -1770,7 +1770,7 @@ async def handle_workers(message: Message) -> None:
         text, keyboard = _build_workers_overview(workers, page=0)
         await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
 
-    except Exception as exc:
+    except Exception:
         logger.exception(
             "Error handling workers for user %s", message.from_user.id
         )
@@ -2050,7 +2050,7 @@ async def requeue_job_callback(callback_query: CallbackQuery) -> None:
             await callback_query.answer("Job requeued successfully!")
         else:
             await callback_query.answer("Failed to requeue job.", show_alert=True)
-    except Exception as exc:
+    except Exception:
         logger.exception(
             "Error requeuing job for user %s", callback_query.from_user.id
         )
@@ -2095,7 +2095,7 @@ async def resume_job_callback(callback_query: CallbackQuery) -> None:
             await callback_query.answer("Job resumed successfully!")
         else:
             await callback_query.answer("Failed to resume job.", show_alert=True)
-    except Exception as exc:
+    except Exception:
         logger.exception(
             "Error resuming job for user %s", callback_query.from_user.id
         )
@@ -2117,7 +2117,7 @@ async def suspend_job_callback(callback_query: CallbackQuery) -> None:
             await callback_query.answer("Job suspended successfully!")
         else:
             await callback_query.answer("Failed to suspend job.", show_alert=True)
-    except Exception as exc:
+    except Exception:
         logger.exception(
             "Error suspending job for user %s", callback_query.from_user.id
         )
@@ -2178,7 +2178,7 @@ async def delete_job_confirm_callback(callback_query: CallbackQuery) -> None:
                 await callback_query.message.edit_text("Job has been deleted.")
         else:
             await callback_query.answer("Failed to delete job.", show_alert=True)
-    except Exception as exc:
+    except Exception:
         logger.exception(
             "Error deleting job for user %s", callback_query.from_user.id
         )
@@ -2392,7 +2392,7 @@ async def tasks_job_callback(callback_query: CallbackQuery) -> None:
             )
         await callback_query.answer()
 
-    except Exception as exc:
+    except Exception:
         logger.exception(
             "Error getting tasks for user %s", callback_query.from_user.id
         )

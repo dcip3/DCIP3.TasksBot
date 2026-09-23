@@ -14,7 +14,7 @@ make it look three times longer than the time it spent rendering.
 import os
 import sys
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 

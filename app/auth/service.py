@@ -7,7 +7,6 @@ from cryptography.fernet import Fernet
 from app.core.config import settings
 from app.core.bot_core import get_aiosession
 from app.storage.database import get_db_connection
-import aiohttp
 
 logger = logging.getLogger(__name__)
 

@@ -29,8 +29,6 @@ os.environ.setdefault(
 from app.core import maintenance, preview_upload
 from app.core.config import settings
 from app.core.preview_upload import (
-    STATUS_DELIVERING,
-    STATUS_FAILED,
     STATUS_RECEIVED,
     PreviewUploadPayload,
 )
