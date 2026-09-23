@@ -59,12 +59,17 @@ jobs:
               exit 1
             fi
             # A bot that exits at startup (a bad .env, say) keeps restarting and
-            # would still look deployed. Its logs can name jobs and users, so
-            # they stay on the server.
+            # would still look deployed. Compare with the count right after the
+            # start, since a container compose left unchanged keeps its old
+            # restarts. The bot's logs can name jobs and users, so they stay on
+            # the server.
+            container=$(docker compose ps -q tasksbot)
+            [ -n "$container" ] || { echo "The bot container is not running."; exit 1; }
+            restarts=$(docker inspect -f '{{.RestartCount}}' "$container")
             sleep 20
-            state=$(docker inspect -f '{{.State.Status}}, restarts: {{.RestartCount}}' "$(docker compose ps -q tasksbot)")
+            state=$(docker inspect -f '{{.State.Status}}, restarts: {{.RestartCount}}' "$container")
             echo "tasksbot: $state"
-            if [ "$state" != "running, restarts: 0" ]; then
+            if [ "$state" != "running, restarts: $restarts" ]; then
               echo "The bot did not stay up; run docker compose logs tasksbot on the server."
               exit 1
             fi
