@@ -1,29 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-msg_file="${1:?Path to commit message is required}"
-
-# Remove git comments and blank lines before validation.
-message="$(sed -E '/^[[:space:]]*#/d;/^[[:space:]]*$/d' "$msg_file")"
-
-# Let git handle empty message errors.
-if [[ -z "$message" ]]; then
-  exit 0
-fi
-
-# Restrict to printable ASCII characters to keep message English-only.
-if LC_ALL=C grep -q '[^ -~[:space:]]' <<<"$message"; then
-  cat >&2 <<'ERR'
-Commit rejected: commit message must be in English only.
-Use Latin letters, numbers, spaces, and common punctuation.
-ERR
-  exit 1
-fi
-
-# Ensure there is at least one Latin letter in the message.
-if ! grep -Eq '[A-Za-z]' <<<"$message"; then
-  cat >&2 <<'ERR'
-Commit rejected: commit message must contain English text.
-ERR
-  exit 1
+root="$(git rev-parse --show-toplevel)"
+if command -v py >/dev/null 2>&1; then
+  exec py -3 "$root/scripts/check_commit_messages.py" --file "$1"
+elif command -v python3 >/dev/null 2>&1; then
+  exec python3 "$root/scripts/check_commit_messages.py" --file "$1"
+else
+  exec python "$root/scripts/check_commit_messages.py" --file "$1"
 fi

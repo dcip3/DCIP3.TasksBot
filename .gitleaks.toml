@@ -1,0 +1,23 @@
+title = "TasksBot secret scan"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "dropbox-short-lived-token"
+description = "Dropbox short-lived access token"
+regex = '''\bsl\.[A-Za-z0-9._-]{100,}'''
+keywords = ["sl."]
+
+[[rules]]
+id = "dropbox-team-member-id"
+description = "Dropbox Business team member ID"
+regex = '''\bdbmid:[A-Za-z0-9_-]{20,}'''
+keywords = ["dbmid:"]
+
+[allowlist]
+description = "Placeholder Fernet key the tests set, and its base64-decoded form"
+regexes = [
+  '''^MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=$''',
+  '''^0123456789abcdef0123456789abcdef$''',
+]

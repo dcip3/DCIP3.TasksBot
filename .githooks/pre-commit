@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+scanner="$(git config --path --get gitleaks.path || true)"
+if [[ -z "$scanner" ]]; then
+  scanner="gitleaks"
+fi
+if ! command -v "$scanner" >/dev/null 2>&1; then
+  echo "Install Gitleaks or set git config --local gitleaks.path /path/to/gitleaks." >&2
+  exit 1
+fi
+exec "$scanner" git --pre-commit --staged --redact --verbose --no-banner
