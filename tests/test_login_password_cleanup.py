@@ -36,7 +36,7 @@ class LoginPasswordCleanupTests(unittest.IsolatedAsyncioTestCase):
         self.state.clear = mock.AsyncMock()
 
     async def _run(self, auth_ok: bool = True) -> mock.AsyncMock:
-        save_mock = mock.AsyncMock()
+        save_mock = mock.AsyncMock(return_value=True)
         with mock.patch.object(
             auth, "authenticate_user", new=mock.AsyncMock(return_value=auth_ok)
         ), mock.patch.object(

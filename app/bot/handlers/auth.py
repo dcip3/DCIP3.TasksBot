@@ -114,11 +114,19 @@ async def process_login_password(message: Message, state: FSMContext) -> None:
 
     ok = await authenticate_user(username, password, message.from_user.id)
     if ok:
-        await save_deadline_credentials(message.from_user.id, username, password)
-        await message.answer(
-            "Successfully authorized! Welcome to TasksBot.",
-            reply_markup=get_main_keyboard(),
-        )
+        # Every later request reads the stored credentials, so a login the bot
+        # could not store (database unavailable, bad ENCRYPTION_KEY) leaves the
+        # user signed out. The cause is in the bot's log, for the admin to fix.
+        if await save_deadline_credentials(message.from_user.id, username, password):
+            await message.answer(
+                "Successfully authorized! Welcome to TasksBot.",
+                reply_markup=get_main_keyboard(),
+            )
+        else:
+            await message.answer(
+                "Deadline accepted the login, but the bot could not store the "
+                "credentials. Please ask the bot admin to check the logs."
+            )
     else:
         await message.answer("Invalid Deadline login or password.")
 
