@@ -63,6 +63,17 @@ jobs:
           persist-credentials: false
       # The deployment builds this image; a Dockerfile or .dockerignore mistake stops here.
       - run: docker build --pull --tag tasksbot:ci .
+      # .dockerignore lets in only the files it lists, and many modules load only
+      # when the bot starts, so a missing one would pass the build and crash
+      # the bot. Import every module, offline; settings load on import, hence
+      # the placeholder values.
+      - run: >-
+          docker run --rm --network none
+          -e TELEGRAM_BOT_TOKEN=123456:ABCDEFabcdef1234567890
+          -e DEADLINE_API_URL=https://deadline.invalid/api
+          -e ENCRYPTION_KEY=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
+          tasksbot:ci python -c "import importlib, sys; [importlib.import_module(m) for m in sys.argv[1:]]"
+          $(git ls-files 'app/*.py' main.py | sed -e 's/[.]py$//' -e 's#/__init__$##' -e 's#/#.#g')
 
   dependencies:
     runs-on: ubuntu-latest
