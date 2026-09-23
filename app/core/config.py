@@ -38,7 +38,6 @@ class Settings(BaseSettings):
     sqlite_db_path: str = Field("data/app.db", description="SQLite database file path")
     temp_dir: str = Field("data/temp", description="Temp directory for intermediate files")
     conv_dir: str = Field("data/conv", description="Directory for converted files")
-    http_timeout: int = Field(30, description="HTTP timeout for external requests in seconds")
 
     ocio_config_path: str = Field("data/config.ocio", description="Path to OCIO configuration file")
     preview_apply_color_transform: bool = Field(
@@ -151,15 +150,9 @@ class Settings(BaseSettings):
     # Security Settings
     encryption_key: str = Field(..., description="Fernet encryption key for password storage (generate with Fernet.generate_key())")
 
-    # Application Limits
-    min_free_space_bytes: int = Field(10 * 1024 * 1024 * 1024, description="Minimum required free disk space in bytes")
-
     # Job monitoring intervals (seconds)
     job_watcher_interval_normal: int = Field(60, ge=5, description="Job monitoring interval in seconds (normal mode)")
     job_watcher_interval_preview: int = Field(5, ge=5, description="Job monitoring interval in seconds (when preview jobs are active)")
-
-    # Development mode
-    dev_mode: bool = Field(False, description="Enable development mode (disables some security checks)")
 
     # Worker and Job Status Mappings
     worker_status_map: Dict[int, str] = {

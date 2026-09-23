@@ -13,15 +13,6 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 
-def has_enough_space(path: str, min_free_bytes: int | None = None) -> bool:
-    """Check if a path has enough free disk space."""
-    if min_free_bytes is None:
-        min_free_bytes = settings.min_free_space_bytes
-
-    total, used, free = shutil.disk_usage(path)
-    return free >= min_free_bytes
-
-
 def clear_folder(folder_path: str | Path, preserve_prefixes: tuple[str, ...] = ()) -> None:
     """Clear folder contents without deleting the folder itself."""
     folder = Path(folder_path)
