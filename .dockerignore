@@ -1,60 +1,24 @@
-# Git
-.git
-.gitignore
-
-# Python
-__pycache__
-*.pyc
-*.pyo
-*.pyd
-.Python
-env
-pip-log.txt
-pip-delete-this-directory.txt
-.tox
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.log
-.git
-.mypy_cache
-.pytest_cache
-.hypothesis
-
-# Virtual environments
-.venv
-venv/
-ENV/
-env/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
-
-# Project specific
-data/*
+# Keep the build context limited to what the Dockerfile copies.
+**
+!requirements.txt
+!main.py
+!app/
+!app/**
+!scripts/
+!scripts/**
 !data/config.ocio
-.env
-node_modules/
-mini-app/dist/
-mini-app/node_modules/
 
-# Docker
-Dockerfile
-docker-compose.yml
-.dockerignore
+# Never bake local state or credentials into an image.
+**/__pycache__/
+**/*.py[cod]
+**/.env
+**/.env.*
+**/*.env
+**/*.pem
+**/*.key
+**/*.db
+**/*.db-*
+**/*.sqlite
+**/*.sqlite-*
+**/*.sqlite3
+**/*.sqlite3-*

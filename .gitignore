@@ -1,24 +1,55 @@
-# General artifacts
-.DS_Store
-*.log
-*.tmp
-
-# Python
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Virtual environments
 .venv/
+venv/
+ENV/
 
-# Runtime environment
+# Environment and secrets
 .env
-
-# Local storage artifacts
-storage/conv/
-storage/temp/
-storage/tasks_bot.db*
-data/conv/
-data/temp/
-data/*.db*
-
-# Secrets
+.env.*
+!.env.example
+*.env
+!*.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
 credentials.json
+
+# Runtime data: the SQLite database, uploads and scratch files.
+# data/config.ocio is the one tracked file in data/.
+data/*
+!data/config.ocio
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+backups/
+*.bundle
+
+# Local tool and editor settings
+.claude/
+.codex/
+.vscode/
+.idea/
+.DS_Store
+
+# Logs and caches
+*.log
+*.tmp
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
