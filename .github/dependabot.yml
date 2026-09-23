@@ -1,0 +1,20 @@
+version: 2
+updates:
+  # Security updates only: version updates stay manual (limit 0), but the
+  # commit messages below still apply, so the pull requests pass the checks.
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    commit-message:
+      prefix: build
+      include: scope
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    commit-message:
+      prefix: ci
+      include: scope
