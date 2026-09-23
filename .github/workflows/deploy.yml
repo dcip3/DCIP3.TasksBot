@@ -1,49 +1,61 @@
 name: Deploy to VDS
 
 on:
-  push:
-    branches:
-      - main
+  workflow_run:
+    workflows: ["Repository checks"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-vds
+  cancel-in-progress: false
 
 jobs:
-  checks:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg libopenexr-dev libopencolorio-dev
-
-      - name: Install Python dependencies
-        run: python -m pip install --upgrade pip setuptools wheel && python -m pip install -r requirements.txt
-
-      - name: Run tests
-        run: python -m unittest discover -s tests -v
-
   deploy:
-    needs: checks
+    # Only pushes to main of this repository; never a pull request or a fork.
+    if: >-
+      github.repository == 'dcip3/DCIP3.TasksBot'
+      && github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.event == 'push'
+      && github.event.workflow_run.head_branch == 'main'
+      && github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1.0.3
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        env:
+          # A secret rather than a variable, so the log masks the server path.
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          DEPLOY_SHA: ${{ github.event.workflow_run.head_sha }}
+          REPOSITORY_URL: https://github.com/${{ github.repository }}.git
         with:
           host: ${{ secrets.VDS_HOST }}
           username: ${{ secrets.VDS_USER }}
           key: ${{ secrets.VDS_SSH_KEY }}
-          script_stop: true
+          fingerprint: ${{ secrets.VDS_HOST_FINGERPRINT }}
+          envs: DEPLOY_PATH,DEPLOY_SHA,REPOSITORY_URL
           script: |
             set -eu
-            cd /opt/tasksbot
-            git fetch origin main
-            git reset --hard origin/main
-            docker compose build
-            docker compose down --remove-orphans
-            docker compose up -d --remove-orphans
+            cd "${DEPLOY_PATH:?add the DEPLOY_PATH repository secret}"
+            # A forced fetch and a hard reset also survive a history rewrite
+            # or a repository move.
+            git remote set-url origin "$REPOSITORY_URL"
+            git fetch --quiet --prune origin +refs/heads/main:refs/remotes/origin/main
+            # Checks can finish out of order: deploy only the current tip of main.
+            if [ "$DEPLOY_SHA" != "$(git rev-parse origin/main)" ]; then
+              echo "Skipping $DEPLOY_SHA: main has moved on."
+              exit 0
+            fi
+            git reset --quiet --hard "$DEPLOY_SHA"
+            echo "Deploying $(git log -1 --format='%h %s')"
+            # Compose names containers after the server directory, so its output
+            # stays in a log on the server and only the result is shown here.
+            if ! docker compose up -d --build --remove-orphans > deploy.log 2>&1; then
+              project=$(basename "$PWD" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')
+              tail -n 40 deploy.log | sed -e "s#$PWD#<deploy path>#g" -e "s#$project#<project>#g"
+              exit 1
+            fi
+            docker compose ps --format '{{.Service}}: {{.Status}}'
