@@ -1,242 +1,222 @@
-# TasksBot
+<p align="center">
+  <img src="docs/assets/tasksbot.jpg" alt="TasksBot icon" width="128" height="128">
+</p>
+<h1 align="center">TasksBot</h1>
 
-TasksBot is a Telegram bot for monitoring Deadline render jobs, managing queue actions, and delivering previews via worker uploads.
+A self-hosted Telegram bot for [Thinkbox Deadline](https://aws.amazon.com/thinkbox-deadline/) render farms.
+Built with Python 3.13, aiogram, and SQLite.
 
-## What It Does
-- Authenticates users against Deadline REST (RCS) and stores encrypted credentials in SQLite.
-- Shows jobs/workers in Telegram and supports actions: suspend, resume, requeue, delete.
-- Builds previews on Deadline workers (preview job submitted by the bot).
-- Supports auto-preview when jobs complete (pre-submitted while the render finishes).
-- Previews each render *run*: requeueing tasks of a finished job queues a new preview for the repaired frames.
-- Accepts direct worker-to-bot preview uploads via HTTP endpoint with one-time tokens.
+- Browse jobs, tasks, and workers; suspend, resume, requeue, or delete jobs from the chat.
+- Get previews of renders while they run: a farm worker turns the EXR frames rendered so far
+  into an MP4 with the ACES view transform and sends it to the chat.
+- See an ETA drawn from the whole frame range, and get alerts for errors that need a person.
 
-## Current Architecture
+Everyone signs in with their own Deadline account, and the bot acts with that account's rights.
 
-### App layers
-- `app/bot/handlers/` - Telegram routers (`auth`, `jobs`, `preview`, `settings`, `common`).
-- `app/services/` - business/application services:
-  - `deadline.py`
-  - `job_watcher.py`
-  - `preview/render.py`
-  - `preview/runtime.py`
-- `app/storage/` - persistence layer:
-  - `database.py` (connection + schema)
-  - `user_settings.py` (user preferences CRUD)
-- `app/auth/service.py` - Deadline auth/session logic.
-- `app/core/` - runtime wiring and shared runtime utilities (`lifecycle`, `bot_core`, config, upload server, etc.).
-- `app/integrations/` - media delivery helpers.
+## How it works
 
-### Runtime flow
-1. `main.py` starts aiogram polling.
-2. `app/core/lifecycle.py` handles startup/shutdown, scheduler jobs, and background job watcher.
-3. `app/services/job_watcher.py` polls Deadline and triggers notifications/auto-preview.
-4. Preview runtime and delivery logic lives in `app/services/preview/runtime.py`.
+```mermaid
+flowchart LR
+  TG["Telegram"] <-->|"long polling"| BOT["TasksBot<br/>Docker"]
+  BOT <-->|"REST API, each user's login"| DL["Deadline<br/>Web Service"]
+  DL -->|"preview job"| W["Render workers"]
+  W -->|"POST /preview-upload"| BOT
+  W -->|"MP4 beside the frames"| ST[("Render storage")]
+```
 
-## Getting Started
+The bot connects out to Telegram and to the Deadline REST API. It needs one inbound port, 8081
+by default, for preview uploads from workers and optional farm events.
 
-### Prerequisites
-- Python 3.13 (the image the bot ships in; 3.11+ still runs it)
-- FFmpeg available in `PATH` (or configured via `FFMPEG_PATH`)
-- Docker + Docker Compose (optional)
+| Area | What it does |
+| --- | --- |
+| Jobs | Paged list grouped by batch. A job card shows progress, frames, time spent rendering, ETA, and errors, with Suspend, Resume, Requeue, Resume failed, and Delete. |
+| Tasks and workers | Per-task table with run times; worker list with live status and an Enable/Disable toggle. |
+| Previews | From the chat on the frames rendered so far, or automatically when a render finishes. One per render run; a requeued run gets a new one. A single frame arrives as a PNG. |
+| ETA probing | Renders a few chunks spread across the frame range first, so the ETA comes from a cost curve over the whole shot rather than from its first frames. |
+| Error alerts | Redshift licensing, scenes saved on a local `C:` drive, scenes the farm cannot open, and plugin sandbox failures, each with advice on the fix. |
 
-### 1. Clone and configure
+## Deploy with Docker
+
+Requires Git, Docker with Compose, a bot token from **@BotFather**, and a Deadline Web Service
+the bot can reach, for example the one the Remote Connection Server hosts. In Repository
+Options → Web Service Settings, turn **Require Authentication** on and **Allow Empty Passwords**
+off: the bot has no user list of its own, so the Web Service login is its only access check.
+
 ```bash
-git clone <repository-url>
+git clone https://github.com/dcip3/DCIP3.TasksBot.git
 cd DCIP3.TasksBot
 cp .env.example .env
 ```
 
-### 2. Run with Docker
+In `.env`, set `TELEGRAM_BOT_TOKEN`, `DEADLINE_API_URL`, and `ENCRYPTION_KEY`; the bot refuses to
+start without a valid key. Generate one with:
+
 ```bash
-docker compose up --build
-docker compose logs -f tasksbot
+python3 -c "import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())"
 ```
 
-## Automatic Deploy
-
-The repository includes a minimal GitHub Actions deploy workflow at `.github/workflows/deploy.yml`.
-
-### One-time VDS setup
-1. Create a dedicated deploy user if needed.
-2. Clone the repository to `/opt/docker/tasksbot`.
-3. Copy `.env.example` to `.env` and fill in real secrets.
-4. Make sure the deploy user can run Docker commands.
-5. Generate an SSH key that GitHub Actions will use to connect to the server.
-
-Example setup on the VDS:
+For previews, also set `PREVIEW_UPLOAD_ENABLED=True` and point `PREVIEW_UPLOAD_URL` at this host
+as the workers see it, for example `http://bot-host:8081`. The upload server speaks plain HTTP:
+let only the render network reach it, or put it behind a TLS reverse proxy and use an `https`
+URL. Then start the bot:
 
 ```bash
-ssh-keygen -t ed25519 -C "deploy" -f ~/.ssh/deploy_key
-cat ~/.ssh/deploy_key.pub >> ~/.ssh/authorized_keys
-chmod 600 ~/.ssh/authorized_keys
+docker compose up -d --build
+docker compose logs -f --tail=100
 ```
 
-### GitHub Actions secrets
-Add these repository secrets:
-- `VDS_HOST`
-- `VDS_USER`
-- `VDS_SSH_KEY`
+Open the bot in Telegram, send `/login`, and enter your Deadline user name and the Web Service
+password from your Deadline user settings.
 
-`VDS_SSH_KEY` must contain the private key from `~/.ssh/deploy_key`.
+`./data/` holds the SQLite database and temporary files and survives container recreation.
+Back up `data/app.db` while the bot is stopped, and keep `ENCRYPTION_KEY` with it: without
+the key, stored passwords cannot be decrypted and everyone has to `/login` again. Run only
+one bot instance per token.
 
-If the repository is private, make sure the clone in `/opt/docker/tasksbot` is already configured so `git fetch origin main` works on the server.
-
-### Deploy flow
-After setup, every `git push origin main` will:
-1. trigger GitHub Actions,
-2. SSH into the VDS,
-3. run:
+To update an existing installation:
 
 ```bash
-cd /opt/docker/tasksbot
-git fetch origin main
-git reset --hard origin/main
-docker compose build
-docker compose down --remove-orphans
-docker compose up -d --remove-orphans
+git pull --ff-only
+docker compose up -d --build
 ```
 
-### 3. Run locally
+<details>
+<summary>Optional: GitHub Actions deployment</summary>
+
+[deploy.yml](.github/workflows/deploy.yml) deploys the tip of `main` over SSH once the
+repository checks pass. Prepare a working installation on the server and add the repository
+secrets `VDS_HOST`, `VDS_USER`, `VDS_SSH_KEY`, and `DEPLOY_PATH` (the absolute path of that
+installation), plus `VDS_HOST_FINGERPRINT` to pin the server's host key. The SSH user needs
+access to that directory, Git, and Docker; `.env` and `data/` stay on the server. The deployment
+points the checkout at this repository over HTTPS and resets it to the commit that passed the
+checks, so keep local changes out of that directory. Compose output stays in `deploy.log` on the
+server. In a fork, change the repository name in the workflow's `if:` condition.
+
+</details>
+
+## Set up workers for previews
+
+A preview is a Deadline `CommandLine` job that runs [a Python script](scripts/deadline_preview_worker.py)
+on a worker. Any worker that may pick one up needs:
+
+| Requirement | Why |
+| --- | --- |
+| Python 3 with OpenColorIO 2, OpenEXR, NumPy, and Pillow | Reads the EXR frames and applies the color transform |
+| `ffmpeg` and `ffprobe` on `PATH` | Encodes the MP4, with NVENC when ffmpeg offers it |
+| Read access to the frames, write access to the folder one level above them | The preview is saved beside the render's output folder |
+| An OCIO config the workers can read, set in `PREVIEW_OCIO_REMOTE_CONFIG` | Without it, previews skip the ACES view transform |
+| HTTP access to `PREVIEW_UPLOAD_URL` | Sends the finished preview to the bot |
+
+On Windows workers, run [worker_setup.bat](scripts/worker_setup.bat): it installs Python 3.11
+when no 3.11 is found and the Python packages into every interpreter it finds. The bot also
+sends both setup scripts from **Settings → Worker Setup**. Install `ffmpeg` separately.
+
+When `PREVIEW_UPLOAD_ENABLED` is off, the bot reads the finished preview from the render folder
+itself, which works only when the bot sees the render storage at the same path as the workers.
+
+## Configuration
+
+Settings are read from environment variables or `.env`; environment variables take precedence.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `TELEGRAM_BOT_TOKEN` | Required | Telegram bot token from @BotFather |
+| `DEADLINE_API_URL` | Required | Deadline REST API without a trailing slash, e.g. `https://rcs.example:4434/api` |
+| `ENCRYPTION_KEY` | Required | Fernet key that encrypts stored Deadline passwords |
+| `DEADLINE_TLS_VERIFY` | `True` | Set `False` when the Deadline certificate is self-signed |
+| `PREVIEW_UPLOAD_ENABLED` | `False` | Start the HTTP server that receives previews from workers |
+| `PREVIEW_UPLOAD_URL` | Empty | URL the workers send previews to; `/preview-upload` is added when it has no path |
+| `PREVIEW_UPLOAD_PORT` | `8081` | Port of that server; the Compose file publishes the same port |
+| `PREVIEW_OCIO_REMOTE_CONFIG` | Empty | OCIO config path as the workers see it |
+| `PREVIEW_MAX_DIMENSION` | `1920` | Longest side of a preview in pixels; `0` keeps the render size |
+
+<details>
+<summary>All other settings</summary>
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PREVIEW_INPUT_SPACE` | `ACEScg` | OCIO color space of the frames |
+| `PREVIEW_DISPLAY` / `PREVIEW_VIEW` | `sRGB` / `ACES 1.0 SDR-video` | OCIO display and view |
+| `PREVIEW_APPLY_COLOR_TRANSFORM` | `True` | Turns the OCIO transform off for everyone when `False` |
+| `PREVIEW_ATTACH_OCIO_CONFIG` | `False` | Send `OCIO_CONFIG_PATH` with each preview job instead of using a shared path |
+| `OCIO_CONFIG_PATH` | `data/config.ocio` | OCIO config on the bot host |
+| `PREVIEW_PYTHON_EXECUTABLE` | `python` | Python on the workers; for Windows paths the `py` launcher is tried first |
+| `FFMPEG_PATH` | `ffmpeg` | ffmpeg on the workers and on the bot host; keep the default unless both share the path |
+| `PREVIEW_TEMP_DIR` | Worker temp folder | Scratch folder for previews on the workers |
+| `PREVIEW_PRESUBMIT_ENABLED` | `True` | Queue automatic previews as Pending dependencies of the running render |
+| `PREVIEW_PRESUBMIT_INPUT_WAIT` | `3600` | Seconds a preview waiting on its render gives the frames to appear |
+| `PREVIEW_UPLOAD_BIND_HOST` | `0.0.0.0` | Address the upload server listens on |
+| `PREVIEW_UPLOAD_INSECURE` | `False` | Workers skip certificate checks for an `https` upload URL |
+| `PREVIEW_UPLOAD_TOKEN_TTL` | `604800` | Lifetime of a one-time upload token, in seconds |
+| `PREVIEW_UPLOAD_MAX_MB` | `100` | Largest upload accepted |
+| `PREVIEW_UPLOAD_DELIVERY_MAX_ATTEMPTS` | `10` | Attempts to send a received preview to Telegram |
+| `PREVIEW_UPLOAD_RECOVERY_INTERVAL_SECONDS` | `120` | How often failed deliveries are retried |
+| `PREVIEW_UPLOAD_DELIVERY_WAIT_SECONDS` | `600` | Once an upload token has expired, seconds after the preview job completes to keep waiting for its upload |
+| `DEADLINE_EVENT_SECRET` | Empty | Enables `POST /deadline-event` on the upload server, which needs `PREVIEW_UPLOAD_ENABLED=True` (see below) |
+| `JOB_WATCHER_INTERVAL_NORMAL` | `60` | Seconds between farm polls; shorter while alerts or auto previews are on |
+| `JOB_WATCHER_INTERVAL_PREVIEW` | `5` | Seconds between polls while a preview job runs |
+| `SCHEDULER_TIMEZONE` | `UTC` | Time zone of the cleanup and housekeeping schedule |
+| `SQLITE_DB_PATH` | `data/app.db` | SQLite database |
+| `TEMP_DIR` | `data/temp` | Received uploads and scratch files |
+| `CONV_DIR` | `data/conv` | Legacy scratch folder; the bot only empties it |
+
+A Deadline event plugin can make the bot react to jobs at once instead of at the next poll: it
+posts `{"event": "...", "job_id": "...", "job_name": "..."}` with the header
+`X-Deadline-Event-Secret`. `job_finished` releases previews waiting on that render, `job_requeued`
+lets its next run get a new preview, and any other event just wakes the watcher. The plugin is not
+part of this repository; polling works without it.
+
+`data/config.ocio` is the default OCIO config that ships with Redshift, included for convenience.
+Point `OCIO_CONFIG_PATH` and `PREVIEW_OCIO_REMOTE_CONFIG` at your own config if you use another one.
+
+</details>
+
+## Using the bot
+
+| Command | Purpose |
+| --- | --- |
+| `/start` | Show the main menu: 📂 Jobs, 🖥️ Workers, ⚙️ Settings |
+| `/login` | Sign in with a Deadline user name and password, or replace the stored ones |
+| `/logout` | Delete the stored credentials and personal settings |
+| `/help` | List buttons and commands |
+
+Each user chooses in **Settings**:
+
+| Setting | Options | Default |
+| --- | --- | --- |
+| Error Alerts | On or off, and whether to scan all jobs or only your own | Off |
+| Preview → Auto Preview | On or off, for all jobs or only your own | Off |
+| Preview → Post Effects | ACES view transform, camera LUT, and color controls, each on or off | All on |
+| Preview → Default Worker | Auto (the render's machine list), a named worker, or ask every time | Ask |
+| ETA Probing | Off, your jobs only, or all jobs (needs the right to suspend other users' tasks) | Your jobs |
+
+An error alert goes to the job's owner and, for machine errors, to the user whose Deadline login
+matches the worker's name. ETA probing briefly holds back the queued tasks of a new render so that
+chunks spread across its frame range render first, and releases them within 90 minutes at most.
+
+## Run locally
+
+Requires **Python 3.13**; with `ffmpeg` on `PATH`, oversized previews are compressed before sending.
+Clone the repository and configure `.env` as above, then:
+
 ```bash
-python -m venv .venv
-source .venv/bin/activate    # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+python3.13 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 python main.py
 ```
 
-## Configuration (.env)
+<details>
+<summary>Windows (PowerShell)</summary>
 
-### Required
-| Variable | Description |
-|---|---|
-| `TELEGRAM_BOT_TOKEN` | Telegram token from BotFather |
-| `DEADLINE_API_URL` | Deadline REST endpoint (including scheme and `/api`) |
-| `ENCRYPTION_KEY` | Fernet key for encrypting stored credentials |
-
-Generate key:
-```bash
-python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```powershell
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe main.py
 ```
 
-### Common optional
-| Variable | Default | Purpose |
-|---|---|---|
-| `DEADLINE_TLS_VERIFY` | `True` | TLS verification for Deadline requests |
-| `SQLITE_DB_PATH` | `data/app.db` | SQLite path |
-| `TEMP_DIR` | `data/temp` | Temporary files |
-| `CONV_DIR` | `data/conv` | Converted media |
-| `OCIO_CONFIG_PATH` | `data/config.ocio` | OCIO config path |
-| `JOB_WATCHER_INTERVAL_NORMAL` | `60` | Polling interval (seconds) |
-| `JOB_WATCHER_INTERVAL_PREVIEW` | `5` | Faster polling when preview jobs are active |
-| `SCHEDULER_TIMEZONE` | `UTC` | IANA time zone for the scheduled cleanup jobs |
+</details>
 
-### Preview upload (worker -> bot)
-| Variable | Default | Purpose |
-|---|---|---|
-| `PREVIEW_UPLOAD_ENABLED` | `False` | Enable upload endpoint |
-| `PREVIEW_UPLOAD_URL` | - | Public URL workers should post to |
-| `PREVIEW_UPLOAD_BIND_HOST` | `0.0.0.0` | Bind host |
-| `PREVIEW_UPLOAD_PORT` | `8081` | Bind port |
-| `PREVIEW_UPLOAD_TOKEN_TTL` | `43200` | One-time token TTL (seconds) |
-| `PREVIEW_UPLOAD_MAX_MB` | `100` | Max upload size |
-| `PREVIEW_UPLOAD_INSECURE` | `False` | Allow insecure TLS |
-| `PREVIEW_UPLOAD_DELIVERY_WAIT_SECONDS` | `600` | Wait window for worker upload after preview completion |
-| `PREVIEW_UPLOAD_DELIVERY_MAX_ATTEMPTS` | `10` | Bot-side delivery retry limit for received uploads |
-| `PREVIEW_UPLOAD_RECOVERY_INTERVAL_SECONDS` | `120` | Retry/recovery scan interval |
+No license has been chosen yet; public visibility alone does not grant permission to reuse the code.
 
-Notes:
-- Expose `PREVIEW_UPLOAD_PORT` from Docker/network to workers.
-- Tokens are short-lived and persisted in SQLite.
-- Upload handling saves the worker file first, then delivers it to Telegram in the background with retries.
-
-## Telegram Usage
-
-### Commands
-| Command | Description |
-|---|---|
-| `/start` | Open main menu |
-| `/login` | Authorize with Deadline credentials |
-| `/logout` | Clear stored credentials |
-| `/help` | Show help |
-
-### Main menu
-- `📂 Jobs` - list jobs and perform actions.
-- `🖥️ Workers` - list worker states.
-- `⚙️ Settings` - notification scope, preview defaults, auto-preview settings.
-
-## Preview Flow
-- The bot submits a preview job through Deadline REST (auto previews are pre-submitted
-  while the render finishes its last tasks, so a freed worker picks them up first).
-- The worker runs `scripts/deadline_preview_worker.py` and uploads the result to the
-  bot over HTTP (`PREVIEW_UPLOAD_URL`) — the bot host needs no access to render storage.
-- The result is delivered to Telegram and the preview job is removed from the queue.
-- A copy of the video also stays next to the rendered frames on the farm storage.
-
-## Worker Setup Scripts
-- `scripts/worker_setup.ps1` - installs Python + preview dependencies on Windows workers.
-- `scripts/worker_setup.bat` - wrapper for PowerShell installer.
-- `scripts/deadline_preview_worker.py` - worker-side preview converter.
-
-## Project Structure
-```text
-.
-├── app
-│   ├── auth
-│   │   ├── __init__.py
-│   │   └── service.py
-│   ├── bot
-│   │   ├── handlers
-│   │   │   ├── __init__.py
-│   │   │   ├── auth.py
-│   │   │   ├── common.py
-│   │   │   ├── jobs.py
-│   │   │   ├── preview.py
-│   │   │   └── settings.py
-│   │   └── job_helpers.py
-│   ├── core
-│   │   ├── bot_core.py
-│   │   ├── config.py
-│   │   ├── lifecycle.py
-│   │   ├── maintenance.py
-│   │   ├── preview_upload.py
-│   │   └── ...
-│   ├── integrations
-│   │   └── video_helpers.py
-│   ├── services
-│   │   ├── deadline.py
-│   │   ├── job_watcher.py
-│   │   └── preview
-│   │       ├── render.py
-│   │       └── runtime.py
-│   └── storage
-│       ├── database.py
-│       └── user_settings.py
-├── data
-├── scripts
-├── Dockerfile
-├── docker-compose.yml
-├── main.py
-└── requirements.txt
-```
-
-## Development
-
-Quick checks:
-```bash
-python -m compileall -q app main.py
-```
-
-If tests are added:
-```bash
-pytest
-```
-
-## Troubleshooting
-- Bot does not start: verify `.env`, check `docker compose logs -f tasksbot`.
-- Auth fails: check `DEADLINE_API_URL`, TLS settings, and Deadline credentials.
-- Preview issues: check `OCIO_CONFIG_PATH`, `FFMPEG_PATH`, and worker Python packages (`scripts/worker_setup.ps1`).
-- Worker upload not reaching bot: validate `PREVIEW_UPLOAD_URL`, open port, and token TTL.
-
-## Notes
-- The project uses Deadline credentials as the auth model (no separate local users table).
-- Package imports are direct module imports (service-barrel exports were intentionally removed).
+[Contributing & checks](CONTRIBUTING.md) · [Security](SECURITY.md)
