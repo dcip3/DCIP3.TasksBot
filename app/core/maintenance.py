@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -41,49 +40,17 @@ def clear_folder(folder_path: str | Path, preserve_prefixes: tuple[str, ...] = (
         folder.mkdir(parents=True, exist_ok=True)
 
 
-def _cleanup_preview_temp_dir() -> None:
-    preview_dir = settings.preview_temp_dir
-    if not preview_dir:
-        return
-
-    sentinel_values = {"local", "auto", "default", "system"}
-    if preview_dir.strip().lower() in sentinel_values:
-        logger.debug("Skipping preview temp cleanup for sentinel value '%s'", preview_dir)
-        return
-
-    try:
-        expanded = os.path.expandvars(os.path.expanduser(preview_dir))
-        if any(symbol in expanded for symbol in ("%", "$")) and expanded == preview_dir:
-            logger.debug("Skipping preview temp cleanup; unresolved env vars in %s", preview_dir)
-            return
-
-        preview_path = Path(expanded)
-        if not preview_path.exists():
-            return
-
-        for item in preview_path.iterdir():
-            try:
-                if item.is_dir():
-                    shutil.rmtree(item, ignore_errors=True)
-                else:
-                    item.unlink(missing_ok=True)
-            except Exception:
-                pass
-    except Exception as preview_error:
-        logger.warning(
-            "Failed to clean preview temp directory %s: %s",
-            preview_dir,
-            preview_error,
-        )
-
-
 def cleanup_temp_and_conv() -> None:
-    """Clear temp/conv directories and optional preview temp directory."""
+    """Clear the temp and conv directories.
+
+    PREVIEW_TEMP_DIR is left alone: it names a folder on the render workers,
+    where the preview script cleans up after itself, and on the bot host the
+    same path can be a folder the bot has no business emptying.
+    """
     preserve_prefixes = ("upload_",) if settings.preview_upload_enabled else ()
     clear_folder(Path(settings.temp_dir), preserve_prefixes=preserve_prefixes)
     clear_folder(Path(settings.conv_dir))
-    _cleanup_preview_temp_dir()
-    logger.info("Cleaned up temp, conv, and preview directories (where accessible)")
+    logger.info("Cleaned up temp and conv directories")
 
 
 def force_cleanup_temp_and_conv() -> None:
@@ -91,8 +58,7 @@ def force_cleanup_temp_and_conv() -> None:
     preserve_prefixes = ("upload_",) if settings.preview_upload_enabled else ()
     clear_folder(Path(settings.temp_dir), preserve_prefixes=preserve_prefixes)
     clear_folder(Path(settings.conv_dir))
-    _cleanup_preview_temp_dir()
-    logger.info("Force cleaned up temp, conv, and preview directories (where accessible)")
+    logger.info("Force cleaned up temp and conv directories")
 
 
 def cleanup_old_files(max_age_hours: int = 24) -> None:
@@ -104,18 +70,9 @@ def cleanup_old_files(max_age_hours: int = 24) -> None:
 
     temp_dir = Path(settings.temp_dir)
     conv_dir = Path(settings.conv_dir)
-    preview_dir = None
-    if settings.preview_temp_dir:
-        sentinel_values = {"local", "auto", "default", "system"}
-        if settings.preview_temp_dir.strip().lower() not in sentinel_values:
-            expanded = os.path.expandvars(os.path.expanduser(settings.preview_temp_dir))
-            if not (any(symbol in expanded for symbol in ("%", "$")) and expanded == settings.preview_temp_dir):
-                preview_dir = Path(expanded)
 
     cleaned_count = 0
     directories_to_clean = [temp_dir, conv_dir]
-    if preview_dir:
-        directories_to_clean.append(preview_dir)
 
     # An upload that has landed but not yet reached the chat belongs to the
     # token that is waiting to deliver it, and that token lives for days. Aging
