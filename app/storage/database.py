@@ -35,7 +35,7 @@ async def _ensure_user_session_column(column_name: str, column_sql: str) -> None
 async def init_db():
     """
     Initialize the SQLite database and create all necessary tables.
-    
+
     Creates the following tables:
     - user_sessions: Stores Deadline credentials and user settings
     """
@@ -57,7 +57,7 @@ async def init_db():
         logger.info("Created new SQLite database file at %s", db_path)
 
     tasks_db_conn = await aiosqlite.connect(settings.sqlite_db_path)
-    
+
     # Create user_sessions table for storing session data
     await tasks_db_conn.execute("""
         CREATE TABLE IF NOT EXISTS user_sessions (
@@ -196,7 +196,7 @@ async def init_db():
 async def close_db():
     """
     Close the SQLite database connection.
-    
+
     Safely closes the database connection and resets the global connection
     variable to None.
     """
@@ -210,7 +210,7 @@ async def close_db():
 def get_db_connection() -> aiosqlite.Connection | None:
     """
     Get the current database connection.
-    
+
     Returns:
         The current aiosqlite connection or None if not initialized
     """

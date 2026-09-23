@@ -57,4 +57,4 @@ mini-app/node_modules/
 # Docker
 Dockerfile
 docker-compose.yml
-.dockerignore 
+.dockerignore

@@ -72,5 +72,3 @@ def normalize_dropbox_path(path: Optional[str]) -> Optional[str]:
     if not parts:
         return None
     return "/" + "/".join(parts)
-
-

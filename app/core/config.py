@@ -17,14 +17,14 @@ from pydantic_settings import SettingsConfigDict
 class Settings(BaseSettings):
     """
     Application settings configuration.
-    
+
     Manages all application settings including Telegram bot token,
     Deadline API configuration, and local configuration options.
     """
-    
+
     # Telegram Bot Configuration
     telegram_bot_token: str
-    
+
     # Deadline API Configuration
     deadline_api_url: str = Field(
         ...,
@@ -34,7 +34,7 @@ class Settings(BaseSettings):
         True,
         description="Verify TLS certificates for Deadline API requests",
     )
-    
+
     # Local Application Settings
     sqlite_db_path: str = Field("data/app.db", description="SQLite database file path")
     temp_dir: str = Field("data/temp", description="Temp directory for intermediate files")
@@ -164,17 +164,17 @@ class Settings(BaseSettings):
     # Worker and Job Status Mappings
     worker_status_map: Dict[int, str] = {
         0: "Unknown",
-        1: "Rendering", 
+        1: "Rendering",
         2: "Idle",
         3: "Offline",
         4: "Stalled",
         8: "StartingJob"
     }
-    
+
     job_status_map: Dict[int, str] = {
         0: "Unknown",
         1: "Active",
-        2: "Suspended", 
+        2: "Suspended",
         3: "Completed",
         4: "Failed",
         6: "Pending"

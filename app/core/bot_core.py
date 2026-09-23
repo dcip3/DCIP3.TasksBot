@@ -43,10 +43,10 @@ async def close_aiosession():
 async def get_aiosession() -> aiohttp.ClientSession:
     """
     Get or create global aiohttp session.
-    
+
     Returns:
         aiohttp.ClientSession: Global session instance
-        
+
     Raises:
         RuntimeError: If unable to create session
     """
@@ -54,4 +54,4 @@ async def get_aiosession() -> aiohttp.ClientSession:
     await init_aiosession()
     if aiosession is None:
         raise RuntimeError("Failed to initialize aiohttp session")
-    return aiosession 
+    return aiosession

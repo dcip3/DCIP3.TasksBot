@@ -485,10 +485,10 @@ async def _fetch_workers(
 async def get_workers_list(telegram_user_id: int) -> List[Dict[str, Any]]:
     """
     Get list of workers (slaves) from Deadline API.
-    
+
     Args:
         telegram_user_id: Telegram user ID
-        
+
     Returns:
         List of worker dictionaries
     """
@@ -937,11 +937,11 @@ async def get_job_info(login: str, password: str, job_id: str) -> Optional[Dict[
 async def get_job_info_by_user_id(telegram_user_id: int, job_id: str) -> Optional[Dict[str, Any]]:
     """
     Get detailed information about a specific job using telegram user ID.
-    
+
     Args:
         telegram_user_id: Telegram user ID
         job_id: Job ID
-        
+
     Returns:
         Job information dictionary or None if error
     """
@@ -991,11 +991,11 @@ async def get_job_tasks(login: str, password: str, job_id: str) -> List[Dict[str
 async def get_job_tasks_by_user_id(telegram_user_id: int, job_id: str) -> List[Dict[str, Any]]:
     """
     Get tasks for a specific job using telegram user ID.
-    
+
     Args:
         telegram_user_id: Telegram user ID
         job_id: Job ID
-        
+
     Returns:
         List of task dictionaries
     """
@@ -1358,11 +1358,11 @@ async def delete_job(login: str, password: str, job_id: str) -> bool:
 async def delete_job_by_user_id(telegram_user_id: int, job_id: str) -> bool:
     """
     Delete a job using telegram user ID.
-    
+
     Args:
         telegram_user_id: Telegram user ID
         job_id: Job ID
-        
+
     Returns:
         True if successful, False otherwise
     """

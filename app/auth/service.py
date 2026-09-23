@@ -57,12 +57,12 @@ async def authenticate_user(username: str, password: str, telegram_user_id: int)
     """
     Authenticate user with username/password via Deadline RCS API.
     If valid, returns True. No local DB check.
-    
+
     Args:
         username: User's Deadline login
         password: User's Deadline password
         telegram_user_id: Telegram user ID (not used for auth)
-    
+
     Returns:
         True if authentication successful, False otherwise
     """
@@ -96,7 +96,7 @@ async def is_authorized(telegram_user_id: int) -> bool:
     Returns True if credentials are found, False otherwise.
     """
     logger.info(f"Checking authorization for user {telegram_user_id}")
-    
+
     # Try user_sessions table
     conn = get_db_connection()
     if conn is not None:
@@ -115,7 +115,7 @@ async def is_authorized(telegram_user_id: int) -> bool:
             logger.error(f"Error checking user_sessions for {telegram_user_id}: {e}")
     else:
         logger.warning("Database connection not available")
-    
+
     logger.info(f"User {telegram_user_id} is not authorized")
     return False
 
@@ -123,15 +123,15 @@ async def is_authorized(telegram_user_id: int) -> bool:
 async def logout_user(telegram_user_id: int) -> bool:
     """
     Clear Deadline credentials for a user, effectively logging them out.
-    
+
     Args:
         telegram_user_id: Telegram user ID to logout
-        
+
     Returns:
         True if logout successful, False otherwise
     """
     success = True
-    
+
     # Remove from user_sessions table
     conn = get_db_connection()
     if conn is not None:
@@ -144,10 +144,10 @@ async def logout_user(telegram_user_id: int) -> bool:
         except Exception as e:
             logger.error(f"Failed to remove user_sessions for {telegram_user_id}: {e}")
             success = False
-    
+
     if success:
         logger.info(f"User with telegram_id {telegram_user_id} logged out")
-    
+
     return success
 
 
@@ -187,7 +187,7 @@ async def save_deadline_credentials(telegram_user_id: int, deadline_login: str, 
         """, (telegram_user_id, deadline_login, encrypted_password))
         await conn.commit()
         logger.info(f"Successfully saved Deadline credentials for user {telegram_user_id}")
-        
+
         # Verify the save by checking if the record exists
         async with conn.execute(
             "SELECT 1 FROM user_sessions WHERE telegram_user_id = ?",
@@ -200,7 +200,7 @@ async def save_deadline_credentials(telegram_user_id: int, deadline_login: str, 
             else:
                 logger.error(f"Failed to verify saved credentials for user {telegram_user_id}")
                 return False
-                
+
     except Exception as e:
         logger.error(f"Failed to save Deadline credentials for user {telegram_user_id}: {e}")
         return False

@@ -16,10 +16,10 @@ logger = logging.getLogger(__name__)
 def get_file_size_mb(file_path: Path) -> float:
     """
     Get file size in megabytes.
-    
+
     Args:
         file_path (Path): Path to the file
-        
+
     Returns:
         float: File size in MB
     """
@@ -28,18 +28,18 @@ def get_file_size_mb(file_path: Path) -> float:
 def compress_video_if_needed(video_path: Path, max_size_mb: float = 45.0) -> Path:
     """
     Compress video if it's larger than max_size_mb.
-    
+
     Args:
         video_path (Path): Path to the video file
         max_size_mb (float): Maximum allowed size in MB
-        
+
     Returns:
         Path: Path to the compressed video (or original if compression not needed)
     """
     current_size = get_file_size_mb(video_path)
     if current_size <= max_size_mb:
         return video_path
-        
+
     # Calculate target bitrate (in kbps) based on desired file size
     # Formula: bitrate = target_size_bytes * 8 / duration_seconds / 1000
     from app.core.maintenance import get_video_duration
@@ -324,14 +324,14 @@ def make_video_thumbnail(video_path: Path) -> Optional[Path]:
 def cleanup_job_files(job_id: str):
     """
     Clean up temporary files for a specific job.
-    
+
     Args:
         job_id (str): Job ID to clean up files for
     """
     try:
         temp_root = Path(settings.temp_dir)
         conv_root = Path(settings.conv_dir)
-        
+
         # Clean up temp directory
         if temp_root.exists():
             for item in temp_root.glob(f"*_{job_id}*"):
@@ -339,7 +339,7 @@ def cleanup_job_files(job_id: str):
                     shutil.rmtree(item)
                 else:
                     item.unlink()
-                    
+
         # Clean up conv directory
         if conv_root.exists():
             for item in conv_root.glob(f"*_{job_id}*"):
@@ -347,6 +347,6 @@ def cleanup_job_files(job_id: str):
                     shutil.rmtree(item)
                 else:
                     item.unlink()
-                    
+
     except Exception as e:
         logger.error(f"Error cleaning up files for job {job_id}: {e}")
