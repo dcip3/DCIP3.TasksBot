@@ -1,9 +1,10 @@
 """Alerting on a scene the farm cannot open.
 
-Taken from SHA_0110_v018: the render started while Dropbox was still syncing
-the .hip and Houdini could not load it. The first few of these are ordinary on
-this farm - the file lands and the render carries on - so the alert only fires
-once a job has collected enough of them to mean the file is not arriving at all.
+Taken from SHA_0110_v018: the render started while the .hip was still syncing
+to the farm storage and Houdini could not load it. The first few of these are
+ordinary on this farm - the file lands and the render carries on - so the alert
+only fires once a job has collected enough of them to mean the file is not
+arriving at all.
 
 Note what Deadline puts in the short report title: "Caught exception: The
 attempted operation failed." The line that names the file only exists in the
@@ -113,7 +114,7 @@ class SceneNotReadyMatcherTests(unittest.TestCase):
 
 class SceneNotReadyThresholdTests(unittest.TestCase):
     def test_a_few_failures_are_business_as_usual(self) -> None:
-        """Dropbox catching up mid-render must not page anybody."""
+        """The sync catching up mid-render must not page anybody."""
         rule = job_watcher._match_error_alert_rule(FULL_REPORT)
         self.assertGreaterEqual(rule.min_occurrences, 5)
 
@@ -155,7 +156,7 @@ class SceneNotReadyMessageTests(unittest.TestCase):
         self.assertIn("NodeA", text)  # the machine that could not read it
         self.assertIn("SHA_0110_v018", text)
         self.assertIn("normal", text)  # says a few of these are expected
-        self.assertIn("Dropbox", text)
+        self.assertIn("finished syncing to the farm storage", text)
 
     def test_reaches_the_submitter_and_the_machine_owner(self) -> None:
         identities = {"nodea": {100000001}, "nodeb": {100000002}}

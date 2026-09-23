@@ -1230,7 +1230,7 @@ def _hydrate_file(path: Path) -> bool:
 
 
 def _prefetch_input_files(files: List[Path], max_threads: int = 16) -> None:
-    """Hydrate cloud-backed (e.g. Dropbox online-only) input frames in parallel.
+    """Hydrate cloud-backed (online-only) input frames in parallel.
 
     Frames rendered by other machines arrive as online-only placeholders; without
     prefetch each frame download starts serially on its first read during
@@ -1387,7 +1387,7 @@ def _reusable_existing_output(
     Happens when a worker converted successfully but failed to upload and the
     task moved to another machine. Guards against stale files from earlier
     render versions by requiring the video to be newer than every input frame
-    (mtimes survive Dropbox sync) and to carry the same color-pipeline
+    (mtimes survive the file sync) and to carry the same color-pipeline
     signature - and against files built before the frame size was capped,
     which are the ones Telegram will not play.
     """

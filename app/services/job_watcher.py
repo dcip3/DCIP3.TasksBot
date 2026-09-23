@@ -280,9 +280,9 @@ def _extract_report_path(report: dict) -> Optional[str]:
     return None
 
 
-# A render that starts before Dropbox has finished syncing the scene fails a few
-# tasks and then picks up as the file lands. That is normal here and must not
-# raise an alarm - only a job that keeps failing has a real problem, which is
+# A render that starts before the scene has finished syncing to the farm storage
+# fails a few tasks and then picks up as the file lands. That is normal and must
+# not raise an alarm - only a job that keeps failing has a real problem, which is
 # either the rendering machine not syncing or the scene never finishing its
 # upload from the machine that submitted it.
 _SCENE_NOT_READY_MIN_OCCURRENCES = 10
@@ -504,10 +504,10 @@ def _build_error_alert_text(
                 "💡 <b>What To Do</b>:",
                 "• A few of these at the start of a render are normal - the file "
                 "is still syncing. This many means it is not arriving.",
-                "• On the machine that submitted it: check Dropbox finished "
-                "uploading the scene and everything it references.",
-                f"• On <code>{worker_name}</code>: check Dropbox is running and "
-                "the file is downloaded, not just a placeholder.",
+                "• On the machine that submitted it: check the scene and everything "
+                "it references have finished syncing to the farm storage.",
+                f"• On <code>{worker_name}</code>: check the file has finished syncing "
+                "there and is downloaded, not just a placeholder.",
             ]
         )
         return "\n".join(details)

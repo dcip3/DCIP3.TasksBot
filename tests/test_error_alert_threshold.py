@@ -95,7 +95,7 @@ class SceneNotReadyThresholdScanTests(unittest.IsolatedAsyncioTestCase):
         return self.sent
 
     async def test_a_handful_of_failures_says_nothing(self) -> None:
-        """Dropbox catching up: the render recovers on its own."""
+        """The scene still syncing: the render recovers on its own."""
         self.assertEqual(await self._scan(9), [])
 
     async def test_a_job_that_keeps_failing_sends_one_message(self) -> None:
