@@ -10,6 +10,7 @@ tick. Polling stays in place as a fallback for lost events.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 from typing import Any, Dict, Optional
 
@@ -50,7 +51,13 @@ async def handle_deadline_event(request: web.Request) -> web.Response:
         return web.Response(status=503, text="Farm events are not configured")
 
     provided = (request.headers.get("X-Deadline-Event-Secret") or "").strip()
-    if provided != secret:
+    # Constant time, so the response time does not tell a caller how much of a
+    # guess was right. Compared as bytes because compare_digest refuses str
+    # with non-ASCII characters, which a header can carry.
+    if not hmac.compare_digest(
+        provided.encode("utf-8", "surrogateescape"),
+        secret.encode("utf-8", "surrogateescape"),
+    ):
         return web.Response(status=403, text="Invalid secret")
 
     try:

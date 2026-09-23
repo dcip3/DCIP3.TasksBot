@@ -46,6 +46,26 @@ class FarmEventsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 403)
         self.assertFalse(farm_events._watcher_wake.is_set())
 
+    async def test_rejects_near_miss_and_missing_secret(self) -> None:
+        wrong_headers = [
+            {"X-Deadline-Event-Secret": "righ"},
+            {"X-Deadline-Event-Secret": "right-and-more"},
+            {"X-Deadline-Event-Secret": "r\u00efght"},
+            {"X-Deadline-Event-Secret": ""},
+            {},
+        ]
+        for headers in wrong_headers:
+            with self.subTest(headers=headers), mock.patch.object(
+                settings, "deadline_event_secret", "right"
+            ):
+                response = await self.client.post(
+                    farm_events.EVENT_PATH,
+                    json={"event": "job_finished"},
+                    headers=headers,
+                )
+                self.assertEqual(response.status, 403)
+                self.assertFalse(farm_events._watcher_wake.is_set())
+
     async def test_accepts_event_and_wakes_watcher(self) -> None:
         with mock.patch.object(settings, "deadline_event_secret", "right"), mock.patch(
             "app.services.deadline.invalidate_all_jobs_cache"
