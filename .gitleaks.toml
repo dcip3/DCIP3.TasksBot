@@ -3,6 +3,15 @@ title = "TasksBot secret scan"
 [extend]
 useDefault = true
 
+# The default telegram-bot-api-token rule needs "telegram" next to the value,
+# so it misses tokens in code, bot API URLs and other variable names.
+[[rules]]
+id = "telegram-bot-token"
+description = "Telegram bot token, whatever it is assigned to"
+regex = '''(?:^|[^0-9])([0-9]{5,16}:A[A-Za-z0-9_-]{34})(?:[^A-Za-z0-9_-]|$)'''
+secretGroup = 1
+keywords = [":a"]
+
 [[rules]]
 id = "dropbox-short-lived-token"
 description = "Dropbox short-lived access token"
