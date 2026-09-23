@@ -25,7 +25,11 @@ from app.services.preview.render import (
     PreviewSubmissionError,
     create_video_from_job,
 )
-from app.services.preview.runtime import pop_preview_message, register_preview_message
+from app.services.preview.runtime import (
+    pop_preview_message,
+    register_preview_message,
+    track_preview_job,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -376,18 +380,37 @@ async def create_new_video_process(
             else None
         )
 
+        waits_for_render = bool(result.get("waits_for_render"))
+        if preview_id and waits_for_render:
+            # Lets the bot release it the moment the render finishes, as it
+            # does for automatic previews, should the farm's plugin not.
+            track_preview_job(str(preview_id), callback_query.from_user.id, job_id)
+
         if progress_msg:
             progress_msg, rate_limited = await _set_progress_message(
                 callback_query,
                 progress_msg,
-                "✅ Preview job queued\n□ □ □",
+                (
+                    "⏳ Preview queued. The render has no finished frames yet, "
+                    "so the preview starts as soon as the render completes."
+                    if waits_for_render
+                    else "✅ Preview job queued\n□ □ □"
+                ),
                 reply_markup=cancel_keyboard,
             )
             if rate_limited:
                 return
             if preview_id and progress_msg:
-                register_preview_message(preview_id, progress_msg.chat.id, progress_msg.message_id)
-        await callback_query.answer("Preview job queued!", show_alert=False)
+                register_preview_message(
+                    preview_id,
+                    progress_msg.chat.id,
+                    progress_msg.message_id,
+                    animate=not waits_for_render,
+                )
+        await callback_query.answer(
+            "Preview waits for the render to finish." if waits_for_render else "Preview job queued!",
+            show_alert=False,
+        )
     except WorkerStatusError as worker_error:
         status_lines = []
         for item in worker_error.invalid_workers:

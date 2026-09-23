@@ -29,6 +29,14 @@ _SCRIPT_CACHE_PATH: Optional[Path] = None
 _SCRIPT_CACHE_MTIME_NS: Optional[int] = None
 _SCRIPT_CACHE_B64: Optional[str] = None
 
+# Task errors a preview may collect before Deadline itself fails it. This farm
+# never fails a task on its own (task failure detection is off and a job only
+# fails at 100 errors), so a preview that cannot finish runs, fails and runs
+# again on the machine it has just freed for as long as nobody looks. The
+# watcher steps in earlier (job_watcher._PREVIEW_ERROR_LIMIT); this is what
+# stops the loop when the bot cannot.
+PREVIEW_TASK_ERROR_LIMIT = 5
+
 
 class PreviewSubmissionError(RuntimeError):
     """Raised when a preview submission fails with a user-facing reason."""
@@ -36,6 +44,27 @@ class PreviewSubmissionError(RuntimeError):
     def __init__(self, user_message: str, log_message: Optional[str] = None):
         super().__init__(log_message or user_message)
         self.user_message = user_message
+
+
+def render_has_no_frames_yet(job: Dict[str, Any]) -> bool:
+    """True while a render has not finished a single task.
+
+    A preview of such a render has nothing to encode: it waits for frames,
+    finds none, fails, and Deadline hands it straight back to the queue - at a
+    higher priority than the render, so it takes the machine the render needs.
+    SHC_0260_ID_v011 and SHD_0270_ID_v009 were previewed from the chat while
+    they were still queued, and two of the three workers spent two hours on
+    that loop instead of rendering.
+    """
+    # Queued or rendering, suspended, failed, pending. A render whose state is
+    # not known is previewed as before rather than held on a guess.
+    if job.get("Stat") not in (1, 2, 4, 6):
+        return False
+    try:
+        completed = int(job.get("CompletedChunks") or 0)
+    except (TypeError, ValueError):
+        completed = 0
+    return completed <= 0
 
 
 def _resolve_preview_helper_script() -> Optional[Path]:
@@ -291,6 +320,26 @@ async def create_video_from_job(
         logger.error("No OutDir found for job %s", job_id)
         raise PreviewSubmissionError(
             "Render output path was not found for this job."
+        )
+
+    if depends_on is None and render_has_no_frames_yet(job_info):
+        if job_info.get("Stat") == 4:
+            raise PreviewSubmissionError(
+                "This render failed before finishing a single frame, "
+                "so there is nothing to preview."
+            )
+        # Hold the preview on the render, the way automatic ones are held:
+        # it costs nothing while it waits and starts the moment the render is
+        # done. A render already producing frames still gets a preview of
+        # what is there now, which is what asking for one mid-render means.
+        depends_on = job_id
+        presubmitted = True
+        if input_wait_seconds is None:
+            input_wait_seconds = settings.preview_presubmit_input_wait
+        logger.info(
+            "Preview for %s: the render has no finished frames yet; "
+            "holding the preview until it completes",
+            job_id,
         )
 
     output_path = outdirs[0]
@@ -550,11 +599,14 @@ async def create_video_from_job(
         "ExtraInfoKeyValue3": f"PreviewTelegram={telegram_user_id}",
         "ExtraInfoKeyValue4": f"PreviewSource={job_id}",
         "ExtraInfoKeyValue5": f"PreviewRenderPath={expected_render_path}",
+        "OverrideTaskFailureDetection": "true",
+        "FailureDetectionTaskErrors": PREVIEW_TASK_ERROR_LIMIT,
     }
     if presubmitted:
-        # Marks previews queued automatically while the render is still
-        # finishing; only these are reconciled against the source job.
-        # Manual previews always run as requested.
+        # Marks previews queued before their render finished - automatic ones,
+        # and requested ones held for a render with nothing on disk yet. Only
+        # these are reconciled against the source job; a preview of frames
+        # that already exist runs as requested.
         preview_job_info["ExtraInfoKeyValue6"] = "PreviewPresubmit=1"
     if depends_on:
         # Deadline holds the job in Pending until the render completes, so the
@@ -672,5 +724,6 @@ async def create_video_from_job(
         "expected_render_path": expected_render_path,
         "command_line": command_line,
         "preferred_slaves": preferred_slaves,
+        "waits_for_render": bool(depends_on),
         "submission": submission_response,
     }

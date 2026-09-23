@@ -38,15 +38,27 @@ class PreviewCompletionResult:
     user_id: Optional[int] = None
 
 
-def register_preview_message(preview_job_id: str, chat_id: int, message_id: int) -> None:
-    """Store the progress message info for a manually requested preview."""
+def register_preview_message(
+    preview_job_id: str,
+    chat_id: int,
+    message_id: int,
+    *,
+    animate: bool = True,
+) -> None:
+    """Store the progress message info for a manually requested preview.
+
+    A preview held until its render finishes may wait for hours; animating
+    its message all that time only runs into Telegram's rate limits, so such
+    a message is left as it was written.
+    """
     preview_message_registry[preview_job_id] = (chat_id, message_id)
-    existing = preview_animation_tasks.get(preview_job_id)
+    existing = preview_animation_tasks.pop(preview_job_id, None)
     if existing and not existing.done():
         existing.cancel()
-    preview_animation_tasks[preview_job_id] = asyncio.create_task(
-        _run_preview_animation(preview_job_id, chat_id, message_id)
-    )
+    if animate:
+        preview_animation_tasks[preview_job_id] = asyncio.create_task(
+            _run_preview_animation(preview_job_id, chat_id, message_id)
+        )
 
 
 def track_preview_job(
