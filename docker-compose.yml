@@ -10,3 +10,9 @@ services:
     ports:
       - "${PREVIEW_UPLOAD_PORT:-8081}:${PREVIEW_UPLOAD_PORT:-8081}"
     restart: unless-stopped
+    # The bot's log names jobs and users; keep it bounded.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

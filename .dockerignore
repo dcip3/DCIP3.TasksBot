@@ -16,6 +16,10 @@
 **/*.env
 **/*.pem
 **/*.key
+**/*.p12
+**/*.pfx
+**/credentials.json
+**/service-account*.json
 **/*.db
 **/*.db-*
 **/*.sqlite

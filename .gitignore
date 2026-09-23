@@ -21,6 +21,7 @@ ENV/
 id_rsa*
 id_ed25519*
 credentials.json
+service-account*.json
 
 # Runtime data: the SQLite database, uploads and scratch files.
 # data/config.ocio is the one tracked file in data/.
