@@ -1,6 +1,7 @@
 # Security
 
-Report suspected vulnerabilities privately to keypoints.motion@gmail.com. Include
+Report suspected vulnerabilities privately through the repository's Security tab
+(Report a vulnerability) or to keypoints.motion@gmail.com. Include
 the affected version, reproduction steps, and impact. Do not include live tokens,
 passwords, or data from a real farm in a public issue.
 
