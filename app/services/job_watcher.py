@@ -1456,10 +1456,12 @@ async def _run_auto_preview_presubmit(
 
 
 def _is_presubmitted_preview(props: dict) -> bool:
-    """True only for previews the watcher queued before the render finished.
+    """True only for previews queued before their render finished.
 
-    Manually requested previews must never be suspended or deleted by the
-    reconciler — the user asked for them and is waiting.
+    That is every automatic one, and a requested one held because its render
+    had no frames yet - both wait on the render, so both go when it does. A
+    requested preview of frames that already exist must never be suspended or
+    deleted by the reconciler: the user asked for it and is waiting.
     """
     extra_dict = props.get("ExDic") or {}
     if isinstance(extra_dict, dict) and str(extra_dict.get("PreviewPresubmit") or "").strip() == "1":
@@ -1597,8 +1599,15 @@ async def _rescue_failing_preview(
         preview_id,
         errors,
     )
+    deleted = False
     with contextlib.suppress(Exception):
-        await delete_job(user.login, user.password, preview_id)
+        deleted = await delete_job(user.login, user.password, preview_id)
+    if not deleted:
+        # Still on the farm, so the next pass lands here again; telling the
+        # user now would tell them every thirty seconds. Deadline fails the
+        # preview on its own a couple of errors later (PREVIEW_TASK_ERROR_LIMIT).
+        logger.warning("Watcher: could not delete failing preview %s; will retry", preview_id)
+        return
     name = str(props.get("Name") or "").split("/")[-1].removesuffix(" - Preview")
     with contextlib.suppress(Exception):
         await bot.send_message(
@@ -1636,7 +1645,18 @@ async def _rescue_stranded_preview(
 
     _stranded_preview_since.pop(preview_id, None)
     untrack_preview_job(preview_id)
-    pop_preview_message(preview_id)
+    stored_message = pop_preview_message(preview_id)
+    if stored_message:
+        # A preview asked for from the chat: its progress message would
+        # otherwise sit there for good. The replacement is delivered like an
+        # automatic one, without a message of its own.
+        with contextlib.suppress(Exception):
+            await bot.edit_message_text(
+                f"🔁 Preview queued again because {reason}; "
+                "the video will be sent here when it is ready.",
+                chat_id=stored_message[0],
+                message_id=stored_message[1],
+            )
     logger.warning(
         "Watcher: preview %s replaced (%s); resubmitting for %s",
         preview_id,
@@ -1645,9 +1665,12 @@ async def _rescue_stranded_preview(
     )
 
     job_name = str(props.get("Name") or "").split("/")[-1].removesuffix(" - Preview")
-    # The render has long finished by now, so this one starts straight away.
-    # Submission re-reads the machine list and drops workers that cannot take
-    # it, which is what keeps this from queueing another stranded preview.
+    # Not every preview is replaced after its render has finished any more:
+    # one asked for from the chat can fail while the render is still queued.
+    # Submission holds the replacement on the render when there are no frames
+    # yet, and otherwise starts it straight away. It also re-reads the machine
+    # list and drops workers that cannot take it, which is what keeps this
+    # from queueing another stranded preview.
     submitted = await _submit_auto_preview_deadline(
         user.telegram_user_id,
         source_job_id,
@@ -1766,7 +1789,7 @@ async def _reconcile_previews(user: "_WatcherUser", jobs: list) -> None:
             if stored_message:
                 with contextlib.suppress(Exception):
                     await bot.edit_message_text(
-                        f"⏹️ Auto preview cancelled: {reason}.",
+                        f"⏹️ Preview cancelled: {reason}.",
                         chat_id=stored_message[0],
                         message_id=stored_message[1],
                     )
@@ -1886,15 +1909,6 @@ async def _scan_auto_preview_candidates(users: list[_WatcherUser]) -> int:
                 )
                 scheduled += 1
 
-            try:
-                await _reconcile_previews(user, jobs)
-            except Exception as exc:
-                logger.warning(
-                    "Watcher: preview reconcile failed for user %s: %s",
-                    user.telegram_user_id,
-                    exc,
-                )
-
             return scheduled
 
     tasks = [asyncio.create_task(_scan_user(user)) for user in auto_users]
@@ -1912,6 +1926,28 @@ async def _scan_auto_preview_candidates(users: list[_WatcherUser]) -> int:
         total_scheduled += int(result)
 
     return total_scheduled
+
+
+async def _reconcile_previews_of_all_users(users: list[_WatcherUser]) -> None:
+    """Look after every account's previews, not only the auto-preview ones.
+
+    A preview asked for from the chat is as able to loop as an automatic one,
+    and this used to run only inside the auto-preview scan: nodeb previewed
+    SHC_0260_ID_v011 and SHD_0270_ID_v009 with auto previews off, both previews
+    failed about fifty times each, and nothing here ever looked at them.
+    """
+    from app.services.deadline import get_jobs_by_credentials
+
+    for user in users:
+        try:
+            jobs = await get_jobs_by_credentials(user.login, user.password, use_cache=True)
+            await _reconcile_previews(user, jobs)
+        except Exception as exc:
+            logger.warning(
+                "Watcher: preview reconcile failed for user %s: %s",
+                user.telegram_user_id,
+                exc,
+            )
 
 
 def _may_probe(job: dict, props: dict, user: "_WatcherUser") -> bool:
@@ -2044,6 +2080,7 @@ async def job_progress_watcher(bot) -> None:
 
     next_interval = settings.job_watcher_interval_normal
     next_auto_scan_at = 0.0
+    next_reconcile_at = 0.0
     next_error_scan_at = 0.0
     next_probe_scan_at = 0.0
     try:
@@ -2077,6 +2114,12 @@ async def job_progress_watcher(bot) -> None:
             elif not auto_enabled_users:
                 next_auto_scan_at = 0.0
 
+            if users and loop_started >= next_reconcile_at:
+                await _reconcile_previews_of_all_users(users)
+                next_reconcile_at = loop_started + auto_scan_interval
+            elif not users:
+                next_reconcile_at = 0.0
+
             if users and loop_started >= next_probe_scan_at:
                 await _scan_render_probes(users)
                 next_probe_scan_at = loop_started + _PROBE_SCAN_INTERVAL_SECONDS
@@ -2108,6 +2151,7 @@ async def job_progress_watcher(bot) -> None:
                 # of waiting for the per-scan schedule to come around.
                 logger.info("Watcher woken by farm event; scanning immediately")
                 next_auto_scan_at = 0.0
+                next_reconcile_at = 0.0
                 next_error_scan_at = 0.0
                 next_probe_scan_at = 0.0
     except asyncio.CancelledError:

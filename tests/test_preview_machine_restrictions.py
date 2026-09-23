@@ -324,9 +324,9 @@ class FailingPreviewTests(unittest.IsolatedAsyncioTestCase):
             },
         }
 
-    async def _handle(self, errors: int):
+    async def _handle(self, errors: int, *, deleted: bool = True):
         rescue = mock.AsyncMock()
-        delete = mock.AsyncMock(return_value=True)
+        delete = mock.AsyncMock(return_value=deleted)
         send = mock.AsyncMock()
         with mock.patch.object(job_watcher, "_rescue_stranded_preview", new=rescue),              mock.patch("app.services.deadline.delete_job", new=delete),              mock.patch.object(job_watcher.bot, "send_message", new=send):
             await job_watcher._rescue_failing_preview(
@@ -347,6 +347,15 @@ class FailingPreviewTests(unittest.IsolatedAsyncioTestCase):
         delete.assert_awaited_once()
         send.assert_awaited_once()
         self.assertIn("keeps failing", send.await_args.args[1])
+
+    async def test_a_preview_that_would_not_go_is_not_reported_every_pass(self) -> None:
+        """Still on the farm, it comes round again in thirty seconds; the user
+        hears about it once it is gone, not once per pass."""
+        await self._handle(3)
+        rescue, delete, send = await self._handle(3, deleted=False)
+
+        delete.assert_awaited_once()
+        send.assert_not_awaited()
 
     async def test_a_preview_belonging_to_someone_else_is_left_alone(self) -> None:
         props = self._props()
