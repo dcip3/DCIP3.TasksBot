@@ -162,10 +162,11 @@ class ReconcileScopeTests(unittest.IsolatedAsyncioTestCase):
 class FailingPreviewScopeTests(unittest.IsolatedAsyncioTestCase):
     """A preview that keeps failing is rescued however it was queued.
 
-    SHC_EDU_071_v01 rendered to a folder whose name no longer matched the path
-    in the job, so its preview found no frames and Deadline handed the task
-    back 97 times. That preview was queued at completion time, which this
-    reconciler used to skip.
+    A render can write its frames to a folder whose name no longer matches the
+    path in the job; its preview then finds no frames on every attempt, and
+    Deadline hands the task back again and again. Such a preview may have been
+    queued at completion time rather than pre-submitted, and this reconciler
+    used to skip those.
     """
 
     def _preview(self, presubmitted: bool, errors: int) -> list:

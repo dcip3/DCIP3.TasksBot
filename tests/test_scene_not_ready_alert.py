@@ -1,10 +1,9 @@
 """Alerting on a scene the farm cannot open.
 
-Taken from SHA_0110_v018: the render started while the .hip was still syncing
-to the farm storage and Houdini could not load it. The first few of these are
-ordinary on this farm - the file lands and the render carries on - so the alert
-only fires once a job has collected enough of them to mean the file is not
-arriving at all.
+A render can start while its .hip is still syncing to the farm storage, and
+then Houdini cannot load it. The first few of these are ordinary - the file
+lands and the render carries on - so the alert only fires once a job has
+collected enough of them to mean the file is not arriving at all.
 
 Note what Deadline puts in the short report title: "Caught exception: The
 attempted operation failed." The line that names the file only exists in the
@@ -87,8 +86,8 @@ class SceneNotReadyMatcherTests(unittest.TestCase):
     def test_the_other_wording_matches_too(self) -> None:
         """Deadline says "Error loading:" when it gives up outside hipFile.load.
 
-        On this farm 13 reports carried that wording for the very same problem -
-        matching only "Unable to open file:" would have missed all of them.
+        Reports of the very same problem can carry that wording instead, and
+        matching only "Unable to open file:" would miss every one of them.
         """
         other = "Y:/projects/proj_b/sandbox/SHB_city_main_v048.hip"
         report = dict(

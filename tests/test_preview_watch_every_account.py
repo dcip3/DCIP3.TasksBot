@@ -1,11 +1,9 @@
 """Every account's previews are watched for failure, not only auto-preview ones.
 
-22 Sep 2026: nodeb previewed SHC_0260_ID_v011 and SHD_0270_ID_v009 from the
-chat while both renders were still queued. The previews failed about fifty
-times each, alternating between NodeB and NodeC for two hours. The watcher saw
-them - nodea's pass read the farm-wide job list - but rightly left them to
-their owner, and their owner had no pass at all: the failure checks ran only
-inside the auto-preview scan, and nodeb has auto previews off.
+A preview asked for from the chat can fail over and over just like an automatic
+one. Another account's pass may see it in the farm-wide job list but rightly
+leaves it to its owner, so the owner needs a pass of their own even with auto
+previews off: the failure checks cannot run only inside the auto-preview scan.
 """
 
 import os
@@ -66,7 +64,7 @@ class EveryAccountIsWatchedTests(unittest.IsolatedAsyncioTestCase):
         return rescue_mock
 
     async def test_a_failing_preview_of_an_account_without_auto_previews_is_rescued(self) -> None:
-        """nodeb's previews: auto previews off, errors piling up, nobody looking."""
+        """Auto previews off and errors piling up: the preview is still watched."""
         nodeb = watcher_user(100000002, auto=False)
         rescue = await self._reconcile_all(
             [nodeb], [failing_preview(100000002, job_watcher._PREVIEW_ERROR_LIMIT)]
@@ -75,8 +73,8 @@ class EveryAccountIsWatchedTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(rescue.await_args.args[0], nodeb)
 
     async def test_each_account_looks_after_its_own_previews(self) -> None:
-        """nodea's pass saw nodeb's failing previews and rightly left them
-        to their owner - who then had no pass of their own."""
+        """nodea's pass sees nodeb's failing preview and leaves it to its
+        owner, whose own pass replaces it."""
         nodea = watcher_user(100000001, auto=True)
         nodeb = watcher_user(100000002, auto=False)
         jobs = [failing_preview(100000002, job_watcher._PREVIEW_ERROR_LIMIT)]

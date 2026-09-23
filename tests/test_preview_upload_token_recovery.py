@@ -1,12 +1,11 @@
 """An upload token must never become a refusal nobody can clear.
 
-From the farm: a preview was rendered, offered to the bot, and refused nine
-times with "Invalid, expired, or in-progress token". The token's record said a
-file had already arrived, but that file was no longer on disk - and in that
-state the record can never move again, so every worker that picks the task up
-collects the same 403. Worse, each one concludes the machine is at fault and
-strikes itself off the job's machine list; two workers in a row left a preview
-that no machine on the farm was allowed to run.
+A token's record can say a file has already arrived while that file is no
+longer on disk. In that state the record can never move again, so every worker
+that picks the task up collects the same 403, "Invalid, expired, or in-progress
+token". Worse, each one concludes the machine is at fault and strikes itself
+off the job's machine list, until no machine on the farm is allowed to run the
+preview.
 
 The record is not the video. When the file behind it is gone, the copy the
 worker is holding is the only one left, and it is taken.

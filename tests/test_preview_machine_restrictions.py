@@ -1,13 +1,11 @@
 """Where a preview is allowed to run, and what happens when it cannot.
 
-Taken from a farm incident: a render had nodeb on its *deny* list, because
-that machine was throwing errors. The preview inherited the list but was
-submitted under Deadline's "Whitelist" key with a made-up "WhitelistFlag=False"
-beside it. Deadline has no such key - the choice between an allow list and a
-deny list *is* which key you write - so the flag was ignored and the preview
-was pinned to the one machine the artist had excluded. By then nodeb had also
-been disabled, so the preview sat Queued with no worker and no error until
-somebody went looking.
+A preview inherits its render's machine list, which may be a *deny* list.
+Deadline has no "WhitelistFlag" key - the choice between an allow list and a
+deny list *is* which key you write - so a deny list submitted under "Whitelist"
+with a made-up "WhitelistFlag=False" beside it pins the preview to exactly the
+machines the render excluded. When none of them can take work - a disabled
+worker, say - the preview sits Queued with no worker and no error.
 """
 
 import os
@@ -43,7 +41,7 @@ FARM = [
 
 class ReadingTheSourceListTests(unittest.TestCase):
     def test_a_deny_list_is_read_as_a_deny_list(self) -> None:
-        """The render that started all this: White=False, ListedSlaves=[nodeb]."""
+        """A render keeping one machine off: White=False, ListedSlaves=[nodeb]."""
         self.assertEqual(
             render._resolve_machine_restrictions({"White": False, "ListedSlaves": ["nodeb"]}),
             (["nodeb"], False),
@@ -144,7 +142,7 @@ class StrandedPreviewTests(unittest.TestCase):
 
 
 class SubmittedJobTests(unittest.IsolatedAsyncioTestCase):
-    """What actually reaches Deadline, for the render from the incident."""
+    """What actually reaches Deadline for a render with a machine list."""
 
     async def _submit(self, source_props: dict, **kwargs) -> dict:
         job_info = {
@@ -172,7 +170,7 @@ class SubmittedJobTests(unittest.IsolatedAsyncioTestCase):
         return captured
 
     async def test_a_denied_worker_stays_denied(self) -> None:
-        """The whole incident in one assertion."""
+        """The machine the render keeps off stays off the preview too."""
         submitted = await self._submit({"White": False, "ListedSlaves": ["nodeb"]})
         self.assertEqual(submitted.get("Blacklist"), "nodeb")
         self.assertIsNone(submitted.get("Whitelist"))
@@ -190,7 +188,7 @@ class SubmittedJobTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(submitted.get("Whitelist"), "NodeC")
 
     async def test_an_allow_list_nobody_can_serve_is_dropped_entirely(self) -> None:
-        """Better anywhere than nowhere: this is what left the job queued."""
+        """Better anywhere than nowhere: a list nobody can serve strands it."""
         submitted = await self._submit(
             {"White": True, "ListedSlaves": ["NodeB"]}, skip_worker_validation=True
         )
@@ -292,10 +290,9 @@ class WatcherRescueTests(unittest.IsolatedAsyncioTestCase):
 class FailingPreviewTests(unittest.IsolatedAsyncioTestCase):
     """A preview that keeps failing is replaced once, then reported.
 
-    From the farm: one preview job collected 22 errors over nine hours, running
-    and failing every twenty minutes because the bot refused its upload token.
-    Deadline hands a failed task straight back to the queue, so nothing stopped
-    it and nobody was told.
+    A preview can fail on every run, for example when the bot refuses its
+    upload token. Deadline hands a failed task straight back to the queue, so
+    without this nothing stops it and nobody is told.
     """
 
     def setUp(self) -> None:

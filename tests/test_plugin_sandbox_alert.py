@@ -1,10 +1,10 @@
 """Alerting on a worker that cannot start its plugin sandbox.
 
-The reports below are the shape Deadline actually returned for
-SHA_0070_DS_v019: 100 failures inside 23 minutes, all from NodeC, while the rest
-of the farm rendered the same job without trouble. The list endpoint gives no
-log body at all - the title is everything the matcher gets - which is why this
-is tested against that shape rather than against the full error text.
+The reports below have the shape Deadline returns when that happens: every
+task that lands on the machine fails, while the rest of the farm renders the
+same job without trouble. The list endpoint gives no log body at all - the
+title is everything the matcher gets - which is why this is tested against that
+shape rather than against the full error text.
 """
 
 import os
@@ -24,7 +24,7 @@ from app.services import job_watcher
 
 JOB_ID = "000000000000000000000003"
 
-# 99 of the 100 reports; the log body arrives empty from the list endpoint.
+# The usual wording; the log body arrives empty from the list endpoint.
 SHORT_REPORT = {
     "_id": "000000000000000000000004",
     "Title": "Failed to load the plugin because: Could not initialize the plugin sandbox",
@@ -38,7 +38,7 @@ SHORT_REPORT = {
     "LogErr": "",
 }
 
-# The hundredth one: same machine, same cause, different wording.
+# Now and then: same machine, same cause, different wording.
 SANDBOX_EXIT_REPORT = dict(
     SHORT_REPORT,
     _id="000000000000000000000005",
@@ -108,7 +108,7 @@ class SandboxMatcherTests(unittest.TestCase):
 
 class SandboxAlertDeliveryTests(unittest.TestCase):
     def test_one_alert_per_machine_per_job(self) -> None:
-        """100 reports from one machine must not become 100 messages."""
+        """A machine failing every task must not send a message per report."""
         ids = {
             job_watcher._report_dedupe_id(
                 JOB_ID, dict(SHORT_REPORT, _id=f"report{i}", Task=str(i)), "plugin_sandbox_error"
@@ -130,7 +130,7 @@ class SandboxAlertDeliveryTests(unittest.TestCase):
         self.assertNotEqual(first, second)
 
     def test_reaches_both_the_machine_owner_and_the_job_owner(self) -> None:
-        """NodeC is a bot login, so the person who can fix it is reachable."""
+        """The machine is also a bot login here, so whoever can fix it hears."""
         identities = {"nodec": {100000003}, "nodeb": {100000002}}
         rule = job_watcher._match_error_alert_rule(SHORT_REPORT)
         recipients = job_watcher._resolve_error_alert_recipient_ids(

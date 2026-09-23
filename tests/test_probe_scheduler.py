@@ -46,12 +46,12 @@ class ProbePlanningTests(unittest.TestCase):
         self.assertEqual(probe_scheduler.plan_initial_probes(samples), [])
 
     def test_adaptive_probe_avoids_a_task_already_being_measured(self) -> None:
-        """The real slip on SHB_city_main_v004.
+        """A probe must not land beside a task that is already being measured.
 
-        Task 0 was done, 28 was rendering far enough along to count, and 14 was
-        rendering but below the confidence threshold, so it was not a curve
-        point. The gap 0..28 therefore looked unsampled and the probe landed on
-        task 15 - right next to a measurement already on its way.
+        Task 0 is done, 28 is rendering far enough along to count, and 14 is
+        rendering but below the confidence threshold, so it is not a curve
+        point. The gap 0..28 therefore looks unsampled, and the probe used to
+        land on task 15 - right next to a measurement already on its way.
         """
         tasks = job_tasks(58)
         tasks[0].update(
@@ -83,7 +83,7 @@ class ProbePlanningTests(unittest.TestCase):
         self.assertNotEqual(picked, 14)
 
     def test_a_batch_of_probes_spreads_out(self) -> None:
-        """Seen on SHB_city_main_v005: both refining probes went to 35 and 36.
+        """Refining probes picked together must not end up side by side.
 
         Excluding the first pick from the candidate list was not enough - the
         span it sat in stayed whole, so the second pick landed in the middle of
@@ -97,7 +97,7 @@ class ProbePlanningTests(unittest.TestCase):
             }
             for i in range(58)
         ]
-        # The real curve from that job: cheap ends, expensive middle.
+        # A real render's curve: cheap ends, expensive middle.
         for task_id, minutes in ((0, 4), (14, 4), (28, 15), (43, 16), (57, 4)):
             tasks[task_id].update(
                 {
@@ -382,15 +382,15 @@ class ProbeLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.resumed, [[1, 2, 3, 5, 6, 7, 8]])
 
     async def test_a_queued_probe_is_never_overtaken(self) -> None:
-        """The failure seen on SHB_city_main_v004.
+        """Held tasks are not released ahead of probes still waiting to run.
 
-        This is the exact state at 22:00 that day: both refining probes spent,
-        two workers busy (7 and 28), and exactly two dispatchable tasks left -
-        probes 43 and 57. The old rule compared dispatchable tasks against busy
-        workers, saw 2 against 2, found the refinement budget exhausted and
-        released all 51 held tasks. Deadline then handed the next free worker
-        task 1, because it dispatches the lowest available id, so probes 43 and
-        57 were left for hours and the far half of the range went unmeasured.
+        The state here: both refining probes spent, two workers busy (7 and 28),
+        and exactly two dispatchable tasks left - probes 43 and 57. The old rule
+        compared dispatchable tasks against busy workers, saw 2 against 2, found
+        the refinement budget exhausted and released all 51 held tasks. Deadline
+        then handed the next free worker task 1, because it dispatches the
+        lowest available id, so probes 43 and 57 waited behind the rest of the
+        range and its far half went unmeasured.
         """
         probes = [0, 14, 28, 43, 57, 15, 7]  # five spread, two refining
         tasks = job_tasks(58)

@@ -1,9 +1,9 @@
 """Alerting on a worker whose Redshift has no licence.
 
-The reports below are the two wordings NodeB produced for SHC_0170_ID_v022 on
-2026-09-15: one licence-server timeout, then the key prompt on every task after
-it. Each report used to be its own alert, so the job's owner got nine identical
-messages in half an hour for one machine that needed signing in once.
+The reports below are the two wordings such a worker produces: a licence-server
+timeout, then the key prompt on every task after it. One alert per report would
+send the job's owner the same message for every task, for one machine that
+needs signing in once.
 """
 
 import os
@@ -57,7 +57,7 @@ class RedshiftActivationDeliveryTests(unittest.TestCase):
             self.assertEqual(rule.key, "redshift_activation")
 
     def test_one_alert_per_machine_per_job(self) -> None:
-        """Nine reports from NodeB on one job must be one message, not nine."""
+        """Every report from one machine on one job adds up to one message."""
         reports = [TIMEOUT_REPORT] + [
             dict(KEY_PROMPT_REPORT, _id=f"report{i}", Task=str(i)) for i in range(8)
         ]

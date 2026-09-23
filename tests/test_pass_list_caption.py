@@ -2,9 +2,9 @@
 
 The plugin records the ROP's AOV list in the sidecar, and the names shown here
 are the artist's own AOV names, because that is what ends up as the EXR layer
-and what the AOV tab in Houdini shows. Verified against the live scene
-SHA_0100_ID_v029.hip: the ROP delegates its list via "Get AOVs Config. From"
-to /obj/ropnet1/Redshift_AOVs1, whose five AOVs (beauty_aux, N, P, Z,
+and what the AOV tab in Houdini shows. Verified against a production scene:
+the ROP delegates its list via "Get AOVs Config. From" to
+/obj/ropnet1/Redshift_AOVs1, whose five AOVs (beauty_aux, N, P, Z,
 cryptomatte) have only beauty_aux and cryptomatte switched on - matching the
 frames on disk, a beauty EXR plus a .cryptomatte.exr.
 """

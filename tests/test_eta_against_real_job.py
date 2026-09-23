@@ -1,13 +1,13 @@
-"""Regression test on real farm timings.
+"""Regression test on real render timings.
 
-SHB_city_main_v027 is the job that exposed the problem: 58 chunks of 5 frames,
-8 h 22 min on two workers, and per-chunk cost ranging from 72 s to 4851 s with
-the expensive stretch sitting in the middle of the range. The throughput
-estimator read "about 1.5 hours left" for most of the render.
+The numbers below are one production render's actual per-chunk render times,
+taken from Deadline: 58 chunks of 5 frames, 8 h 22 min on two workers, and
+per-chunk cost ranging from 72 s to 4851 s with the expensive stretch sitting
+in the middle of the range. On a render like this a throughput estimator reads
+"about 1.5 hours left" for most of the render.
 
-The numbers below are that job's actual per-chunk render times, taken from
-Deadline. The test replays the render and checks that the cost model tracks
-the truth where the old approach could not.
+The test replays the render and checks that the cost model tracks the truth
+where the old approach could not.
 """
 
 import os

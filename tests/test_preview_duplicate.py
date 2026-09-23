@@ -1,17 +1,14 @@
 """One preview per run, and a clock that counts rendering rather than waiting.
 
-Both taken from the same morning on the farm.
+Delivery deletes the preview job. If the watcher took the vanished job for a
+lost preview and cleared the run records, the next scan would see a recent
+completion with nothing on record and make another preview - which finds the
+video already rendered and uploads it again, so the same preview arrives twice
+with an identical caption.
 
-The preview for SHA_0100_main_bg_v04 arrived twice, an hour apart, with an
-identical caption. The second was a different Deadline job, submitted one
-minute after the first had been delivered: delivery deletes the preview job,
-the watcher noticed it vanish and cleared the run records to be helpful, and
-the next scan then saw a completion from three minutes ago with nothing on
-record - so it made another preview, which found the video already rendered and
-simply uploaded it again.
-
-The same job card read "13 h 33 min" while only 4 h 27 min of that had a task
-running; the farm had been busy with other work for nine hours in between.
+A job card's render time counts only the time a task was running. A job can
+wait while the farm is busy with other work, and counting the whole span can
+make it look three times longer than the time it spent rendering.
 """
 
 import os

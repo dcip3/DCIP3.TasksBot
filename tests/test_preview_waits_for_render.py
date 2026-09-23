@@ -1,12 +1,10 @@
 """A preview asked for before its render has a single frame.
 
-22 Sep 2026: nodeb previewed SHC_0260_ID_v011 and SHD_0270_ID_v009 from the
-chat while both renders were still queued. The previews went straight into the
-queue at a higher priority than the renders, waited two minutes for frames,
-found none, failed, and Deadline handed them back. NodeB and NodeC did nothing
-else for two hours - about fifty failures each - while the render they were
-keeping from the machines starved. The farm itself never stops such a loop:
-task failure detection is off there, and a job only fails at 100 errors.
+Such a preview has nothing to encode. Submitted at once, it goes into the queue
+at a higher priority than the render, waits for frames, finds none, fails, and
+Deadline hands it straight back - so it keeps the machines the render needs
+busy with that loop, and unless Deadline is set to fail the task on its own,
+nothing ends it.
 
 A preview from the chat is for checking a render while it runs, so it still
 starts at once whenever there is something to show. When there is nothing,
@@ -51,14 +49,14 @@ def render_job(stat: int, *, completed: int = 0, rendering: int = 0, queued: int
 
 class NoFramesYetTests(unittest.TestCase):
     def test_a_queued_render_has_nothing_to_preview(self) -> None:
-        """Both renders from the incident: queued, nothing started."""
+        """Queued, nothing started: there is nothing to preview."""
         self.assertTrue(render.render_has_no_frames_yet(render_job(1)))
 
     def test_a_render_on_its_first_task_has_nothing_yet(self) -> None:
         self.assertTrue(render.render_has_no_frames_yet(render_job(1, rendering=1, queued=7)))
 
     def test_a_render_with_finished_tasks_can_be_previewed_now(self) -> None:
-        """SHD_0010 at 29% got a useful preview of what was there."""
+        """Partway through, a preview shows what is already there."""
         self.assertFalse(render.render_has_no_frames_yet(render_job(1, completed=5, rendering=3)))
 
     def test_a_finished_render_can_be_previewed(self) -> None:
@@ -108,7 +106,7 @@ class ChatPreviewSubmissionTests(SubmissionTestCase):
     """What reaches Deadline when 🔍 Preview is pressed in the chat."""
 
     async def test_nothing_is_submitted_for_a_render_without_frames(self) -> None:
-        """The incident: this preview used to start at once and loop."""
+        """This preview used to start at once and loop; now nothing is submitted."""
         with self.assertRaises(render.NoFramesYetError) as caught:
             await self._submit(render_job(1), if_no_frames="refuse")
         self.assertIn("Nothing to preview yet", caught.exception.user_message)
@@ -185,7 +183,7 @@ class BotQueuedPreviewSubmissionTests(SubmissionTestCase):
         self.assertFalse(result["waits_for_render"])
 
     async def test_deadline_stops_a_preview_that_keeps_failing(self) -> None:
-        """This farm never fails a task by itself; every preview brings a limit."""
+        """Deadline may never fail a task by itself; every preview brings a limit."""
         for kwargs in ({}, {"if_no_frames": "refuse"}):
             submitted, _ = await self._submit(render_job(3, completed=8, queued=0), **kwargs)
             self.assertEqual(submitted.get("OverrideTaskFailureDetection"), "true")
