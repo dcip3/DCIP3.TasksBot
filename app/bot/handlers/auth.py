@@ -99,6 +99,14 @@ async def process_login_password(message: Message, state: FSMContext) -> None:
     username = data.get("username")
     password = message.text.strip()
 
+    # Otherwise the password stays readable in the chat history. Telegram can
+    # refuse the delete (message already gone, too old), and that must never
+    # cost the user the login.
+    try:
+        await message.delete()
+    except Exception as exc:
+        logger.warning("Could not delete the password message: %s", exc)
+
     if not isinstance(username, str) or not username:
         await message.answer("Error: Deadline login not received. Please use /login again.")
         await state.clear()
