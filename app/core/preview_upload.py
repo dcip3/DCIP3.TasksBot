@@ -47,6 +47,25 @@ _STATE_COLUMNS = """
 """
 
 
+def _token_hint(token: str) -> str:
+    """Enough of an upload token to tell uploads apart in the logs.
+
+    The full token lets anyone who reads the logs upload in its place, so it
+    never goes into a log line.
+    """
+    return f"{token[:8]}..."
+
+
+def _redact_token(text: object, token: str) -> str:
+    """`text` with the upload token cut down to its hint.
+
+    A received upload lives in a directory named after its full token, so an
+    error about the file carries the token in its path.
+    """
+    text = str(text)
+    return text.replace(token, _token_hint(token)) if token else text
+
+
 @dataclass
 class PreviewUploadPayload:
     telegram_user_id: int
@@ -201,7 +220,11 @@ class PreviewUploadTokenStore:
                 elif candidate.is_dir() and candidate.name.startswith("upload_"):
                     shutil.rmtree(candidate, ignore_errors=True)
             except Exception as exc:
-                logger.warning("Failed to remove stale preview upload %s: %s", candidate, exc)
+                logger.warning(
+                    "Failed to remove stale preview upload %s: %s",
+                    _redact_token(candidate, token),
+                    _redact_token(exc, token),
+                )
 
     async def _cleanup(self, conn: aiosqlite.Connection) -> None:
         now = int(time.time())
@@ -317,7 +340,7 @@ class PreviewUploadTokenStore:
                     logger.warning(
                         "Upload token %s is marked %s but its file is gone; "
                         "taking the upload again",
-                        token,
+                        _token_hint(token),
                         state.status,
                     )
                 if state.claimed_until > now:
@@ -815,7 +838,11 @@ def _start_delivery_task(token: str) -> bool:
         with contextlib.suppress(asyncio.CancelledError):
             exc = done_task.exception()
             if exc:
-                logger.error("Preview upload delivery task failed for %s: %s", token, exc)
+                logger.error(
+                    "Preview upload delivery task failed for %s: %s",
+                    _token_hint(token),
+                    _redact_token(exc, token),
+                )
 
     task.add_done_callback(_cleanup_task)
     return True
@@ -874,7 +901,7 @@ async def _handle_preview_upload(request: web.Request) -> web.Response:
                     await handle.write(chunk)
                 await handle.flush()
         except Exception as exc:
-            logger.error("Failed to write preview upload: %s", exc)
+            logger.error("Failed to write preview upload: %s", _redact_token(exc, token))
             part_path.unlink(missing_ok=True)
             return web.Response(status=500, text="Upload failed")
 
@@ -882,7 +909,7 @@ async def _handle_preview_upload(request: web.Request) -> web.Response:
         if expected_length is not None and bytes_written != expected_length:
             logger.warning(
                 "Incomplete preview upload for token %s: wrote %s of %s bytes",
-                token,
+                _token_hint(token),
                 bytes_written,
                 expected_length,
             )
@@ -892,7 +919,7 @@ async def _handle_preview_upload(request: web.Request) -> web.Response:
         try:
             part_path.replace(temp_path)
         except Exception as exc:
-            logger.error("Failed to finalize preview upload: %s", exc)
+            logger.error("Failed to finalize preview upload: %s", _redact_token(exc, token))
             part_path.unlink(missing_ok=True)
             temp_path.unlink(missing_ok=True)
             return web.Response(status=500, text="Upload finalize failed")
@@ -946,7 +973,11 @@ async def _deliver_received_upload(token: str) -> None:
     try:
         await _deliver_preview(state.payload, temp_path)
     except Exception as exc:
-        logger.error("Failed to deliver preview upload %s: %s", token, exc)
+        logger.error(
+            "Failed to deliver preview upload %s: %s",
+            _token_hint(token),
+            _redact_token(exc, token),
+        )
         await _token_store.mark_delivery_failed(token, str(exc))
         failed_state = await _token_store.get_state(token)
         if failed_state and failed_state.attempts_exhausted:
@@ -1001,7 +1032,9 @@ async def _notify_delivery_exhausted(state: PreviewUploadState) -> None:
             else:
                 await bot.send_message(target_chat_id, message_text)
         except Exception as exc:
-            logger.warning("Failed to notify exhausted upload %s: %s", state.token, exc)
+            logger.warning(
+                "Failed to notify exhausted upload %s: %s", _token_hint(state.token), exc
+            )
             await bot.send_message(target_chat_id, message_text)
     else:
         await bot.send_message(target_chat_id, message_text)
@@ -1063,7 +1096,9 @@ async def _deliver_preview(payload: PreviewUploadPayload, temp_path: Path) -> No
             if isinstance(loaded_meta, dict):
                 upload_meta = loaded_meta
     except Exception as meta_error:
-        logger.debug("Could not read upload metadata: %s", meta_error)
+        # Only the type: the error text carries the file's path, and the
+        # upload directory is named after the token.
+        logger.debug("Could not read upload metadata: %s", type(meta_error).__name__)
 
     display_name = payload.expected_filename or preparation.video_path.name
     caption = build_preview_caption(

@@ -136,7 +136,7 @@ def compress_video_if_needed(video_path: Path, max_size_mb: float = 45.0) -> Pat
                 )
         return video_path
     except Exception as e:
-        logger.error(f"Error compressing video: {e}")
+        logger.error(f"Error compressing video {video_path.name}: {type(e).__name__}")
         return video_path
     finally:
         for candidate in video_path.parent.glob(f"{video_path.stem}_compressed*.mp4"):
@@ -238,10 +238,11 @@ def probe_video_metadata(video_path: Path) -> Optional[VideoMetadata]:
             timeout=60,
         )
     except Exception as exc:
-        logger.warning("ffprobe unavailable for %s: %s", video_path, exc)
+        logger.warning("ffprobe unavailable for %s: %s", video_path.name, type(exc).__name__)
         return None
     if probe.returncode != 0:
-        logger.warning("ffprobe failed for %s: %s", video_path, (probe.stderr or "")[:200])
+        stderr = (probe.stderr or "").replace(str(video_path), video_path.name)
+        logger.warning("ffprobe failed for %s: %s", video_path.name, stderr[:200])
         return None
 
     values: dict[str, str] = {}
@@ -306,7 +307,9 @@ def make_video_thumbnail(video_path: Path) -> Optional[Path]:
             timeout=120,
         )
     except Exception as exc:
-        logger.warning("Could not build thumbnail for %s: %s", video_path, exc)
+        logger.warning(
+            "Could not build thumbnail for %s: %s", video_path.name, type(exc).__name__
+        )
         return None
 
     if not thumb_path.exists() or thumb_path.stat().st_size == 0:

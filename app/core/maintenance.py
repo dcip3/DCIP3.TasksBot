@@ -206,7 +206,9 @@ def get_video_duration(video_path: Path) -> Optional[float]:
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         return float(result.stdout.strip())
     except Exception as exc:
-        logger.error("Error getting video duration: %s", exc)
+        logger.error(
+            "Error getting video duration for %s: %s", video_path.name, type(exc).__name__
+        )
         return None
 
 

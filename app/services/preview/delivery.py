@@ -53,7 +53,7 @@ async def _send_video_with_shape(chat_id: int, video_path: Path, caption: str) -
         if metadata.duration:
             kwargs["duration"] = metadata.duration
     else:
-        logger.warning("No video metadata for %s; Telegram will guess", video_path)
+        logger.warning("No video metadata for %s; Telegram will guess", video_path.name)
     if thumb_path:
         kwargs["thumbnail"] = FSInputFile(str(thumb_path))
 
@@ -147,7 +147,7 @@ async def send_ready_preview_video(
         if preparation.size_mb:
             logger.warning(
                 "Preview video %s is %.1f MB; sending fallback message",
-                preparation.video_path,
+                preparation.video_path.name,
                 preparation.size_mb,
             )
         await bot.send_message(
