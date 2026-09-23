@@ -19,6 +19,9 @@ except ModuleNotFoundError as exc:  # pragma: no cover - local env guard
 
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123456:ABCDEFabcdef1234567890")
 os.environ.setdefault("DEADLINE_API_URL", "https://deadline.example/api")
+os.environ.setdefault(
+    "ENCRYPTION_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+)
 
 
 def _import_delivery_module():

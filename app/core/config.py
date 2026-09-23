@@ -7,6 +7,7 @@ for environment variable management and validation.
 """
 
 from typing import Dict, Optional
+from cryptography.fernet import Fernet
 from pydantic_settings import BaseSettings
 from pydantic import Field, field_validator
 from pydantic_settings import SettingsConfigDict
@@ -182,7 +183,10 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
-        extra="ignore"
+        extra="ignore",
+        # A rejected value is often a mistyped copy of a secret such as
+        # ENCRYPTION_KEY; the startup error must not print it into the logs.
+        hide_input_in_errors=True,
     )
 
     @field_validator("preview_ocio_remote_config", mode="before")
@@ -197,6 +201,18 @@ class Settings(BaseSettings):
             if raw.lower() in {"auto", "default", "system", "none", "local"}:
                 return None
             return raw
+        return v
+
+    @field_validator("encryption_key")
+    def validate_encryption_key(cls, v):
+        """Stop at startup, not at the first login that has a password to store."""
+        try:
+            Fernet(v.encode())
+        except Exception as exc:
+            raise ValueError(
+                "ENCRYPTION_KEY is not a valid Fernet key (32 url-safe base64-encoded "
+                "bytes); generate one with Fernet.generate_key()"
+            ) from exc
         return v
 
 # Global settings instance
