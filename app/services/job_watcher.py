@@ -66,6 +66,14 @@ _PREVIEW_ERROR_LIMIT = 3
 # render left paused releases it, and resuming re-queues a fresh one.
 _SUSPENDED_SOURCE_GRACE_SECONDS = 60 * 60
 _suspended_source_since: dict[str, float] = {}
+# How long after its render finished a preview may wait for the render's
+# frames before it is released without them. The slowest frame seen arriving
+# through Dropbox took 46 minutes; one missing after twice that is not coming
+# (a renamed output folder, deleted frames), and the preview should run and
+# say so rather than wait for ever.
+_FRAMES_OVERDUE_SECONDS = 90 * 60
+# How long the preview that replaces an overdue one waits for missing frames.
+_OVERDUE_INPUT_WAIT_SECONDS = 5 * 60
 # Consecutive failed lookups before a preview job is treated as deleted.
 _MISSING_PREVIEW_STRIKES = 3
 _AUTO_PREVIEW_HISTORY_RETENTION_SECONDS = 14 * 24 * 60 * 60
@@ -1618,9 +1626,20 @@ async def _rescue_failing_preview(
 
 
 async def _rescue_stranded_preview(
-    user: "_WatcherUser", preview_id: str, props: dict, *, reason: str = "it was stranded"
+    user: "_WatcherUser",
+    preview_id: str,
+    props: dict,
+    *,
+    reason: str = "it was stranded",
+    wait_for_frames: Optional[bool] = None,
+    input_wait_seconds: Optional[int] = None,
 ) -> None:
-    """Replace a preview that cannot finish where it is with a fresh one."""
+    """Replace a preview that cannot finish where it is with a fresh one.
+
+    The replacement waits for the render's frames as the preview it replaces
+    did - an automatic one, or one sent when the render finished, waited for
+    them; one of the frames rendered so far did not - unless told otherwise.
+    """
     from app.services.deadline import delete_job
     from app.services.preview.runtime import (
         _extract_preview_context,
@@ -1670,12 +1689,16 @@ async def _rescue_stranded_preview(
     # yet, and otherwise starts it straight away. It also re-reads the machine
     # list and drops workers that cannot take it, which is what keeps this
     # from queueing another stranded preview.
+    if wait_for_frames is None:
+        wait_for_frames = bool(props.get("ReqAss")) or _is_presubmitted_preview(props)
     submitted = await _submit_auto_preview_deadline(
         user.telegram_user_id,
         source_job_id,
         job_name or source_job_id,
         user.preview_worker,
         notify_on_failure=False,
+        wait_for_frames=wait_for_frames,
+        input_wait_seconds=input_wait_seconds,
     )
     if not submitted:
         logger.error(
@@ -1684,6 +1707,47 @@ async def _rescue_stranded_preview(
         )
         auto_preview_jobs.remove((source_job_id, user.telegram_user_id))
         await _unregister_auto_preview_history(user.telegram_user_id, source_job_id)
+
+
+def _frames_overdue(preview: dict, source: Optional[dict], *, presubmitted: bool) -> bool:
+    """A preview still waiting for frames that should have arrived long ago.
+
+    Such a preview is held Pending until every frame of its render exists on
+    the farm. A frame still missing _FRAMES_OVERDUE_SECONDS after the render
+    finished is not coming, and nothing else would ever release the preview.
+    """
+    stat = source.get("Stat") if source is not None else None
+    if stat == 3:
+        waiting_since = _parse_datetime_utc(source.get("DateComp"))
+    elif stat in (1, 6):
+        return False  # still rendering: its frames are not all due yet
+    elif presubmitted:
+        return False  # render gone, failed or paused: the checks below handle it
+    else:
+        waiting_since = _parse_datetime_utc(preview.get("Date"))
+    if waiting_since is None:
+        return False
+    waited = (datetime.now(timezone.utc) - waiting_since).total_seconds()
+    return waited >= _FRAMES_OVERDUE_SECONDS
+
+
+async def _replace_without_frames(user: "_WatcherUser", preview_id: str, props: dict) -> None:
+    """Swap an overdue preview for one that runs now with the frames there are.
+
+    Releasing the waiting job itself would not do: it was submitted to wait up
+    to an hour on its worker for missing frames. The replacement waits only a
+    few minutes, then builds what it can or fails and says why - either way
+    the user hears about it.
+    """
+    await _rescue_stranded_preview(
+        user,
+        preview_id,
+        props,
+        reason=f"some frames had still not arrived {_FRAMES_OVERDUE_SECONDS // 60} minutes "
+        "after the render finished",
+        wait_for_frames=False,
+        input_wait_seconds=_OVERDUE_INPUT_WAIT_SECONDS,
+    )
 
 
 async def _reconcile_previews(user: "_WatcherUser", jobs: list) -> None:
@@ -1736,6 +1800,18 @@ async def _reconcile_previews(user: "_WatcherUser", jobs: list) -> None:
             await _rescue_failing_preview(user, preview_id, preview, props)
             continue
 
+        if preview.get("Stat") == 6 and props.get("ReqAss"):
+            _, _, _, owner_id, _, waited_on = _extract_preview_context(
+                props, user.telegram_user_id
+            )
+            if owner_id == user.telegram_user_id and _frames_overdue(
+                preview,
+                jobs_by_id.get(waited_on or ""),
+                presubmitted=preview_id in presubmitted,
+            ):
+                await _replace_without_frames(user, preview_id, props)
+                continue
+
         if preview_id not in presubmitted:
             # Queued after its render finished: there is no dependency left to
             # reconcile, and a manual preview is the user's to keep.
@@ -1768,8 +1844,10 @@ async def _reconcile_previews(user: "_WatcherUser", jobs: list) -> None:
             _suspended_source_since.pop(source_job_id, None)
 
         if reason is None:
-            # Deadline holds the preview Pending until the render completes and
-            # the farm event plugin releases it immediately.
+            # Deadline holds the preview Pending until the render completes -
+            # and, for one that waits for frames, until they are all on the
+            # farm. The farm's event plugin releases it once both hold, on
+            # a worker (_frames_overdue covers frames that never come).
             continue
 
         try:

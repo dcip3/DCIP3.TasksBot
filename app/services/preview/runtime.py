@@ -675,8 +675,14 @@ async def _submit_auto_preview_deadline(
     notify_on_failure: bool = True,
     waiting_for_render: bool = False,
     depends_on: Optional[str] = None,
+    wait_for_frames: bool = True,
 ) -> bool:
-    """Submit a Deadline preview job and register progress tracking."""
+    """Submit a Deadline preview job and register progress tracking.
+
+    These previews cover the whole render, so by default they wait Pending
+    until its frames are on the farm; a replacement for a preview of the
+    frames rendered so far passes wait_for_frames=False.
+    """
     from app.services.deadline import WorkerStatusError
     from app.services.preview.render import PreviewSubmissionError, create_video_from_job
     from app.storage.user_settings import PREVIEW_DEFAULT_WORKER_AUTO
@@ -695,6 +701,7 @@ async def _submit_auto_preview_deadline(
             input_wait_seconds=input_wait_seconds,
             presubmitted=waiting_for_render,
             depends_on=depends_on,
+            wait_for_frames=wait_for_frames,
         )
     except PreviewSubmissionError as exc:
         if not notify_on_failure:
@@ -721,6 +728,7 @@ async def _submit_auto_preview_deadline(
                 input_wait_seconds=input_wait_seconds,
                 presubmitted=waiting_for_render,
                 depends_on=depends_on,
+                wait_for_frames=wait_for_frames,
             )
         except Exception as exc:
             logger.error("Auto preview fallback submission failed for job %s: %s", job_id, exc)

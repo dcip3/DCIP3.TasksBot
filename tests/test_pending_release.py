@@ -29,6 +29,9 @@ class PendingReleaseTests(unittest.IsolatedAsyncioTestCase):
         runtime.track_preview_job("prevB", 42, "renderY")
 
         with mock.patch(
+            "app.services.deadline.get_job_info_by_user_id",
+            new=mock.AsyncMock(return_value={"_id": "prevA", "Stat": 6, "Props": {}}),
+        ), mock.patch(
             "app.services.deadline.release_pending_job_by_user_id",
             new=mock.AsyncMock(return_value=True),
         ) as release_mock:

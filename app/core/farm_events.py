@@ -130,7 +130,7 @@ async def release_previews_waiting_on(source_job_id: str) -> int:
     event plugin does this locally too; doing it here as well keeps the timing
     right even if the plugin on the farm is outdated or was not reloaded.
     """
-    from app.services.deadline import release_pending_job_by_user_id
+    from app.services.deadline import get_job_info_by_user_id, release_pending_job_by_user_id
     from app.services.preview.runtime import preview_tracked_jobs
 
     waiting = [
@@ -141,6 +141,26 @@ async def release_previews_waiting_on(source_job_id: str) -> int:
     released = 0
     for preview_id, owner_id in waiting:
         try:
+            preview = await get_job_info_by_user_id(owner_id, preview_id)
+            if preview is None:
+                # Whether it waits for frames is unknown, and releasing it
+                # would skip that check; the farm releases it either way.
+                logger.warning(
+                    "Could not look up preview %s; leaving its release to the farm",
+                    preview_id,
+                )
+                continue
+            if (preview.get("Props") or {}).get("ReqAss"):
+                # It waits for the render's frames, and a release from here
+                # would skip Deadline's check for them. The farm's event plugin
+                # releases it now if they are all there; otherwise it does on
+                # a later worker event, once they arrive.
+                logger.info(
+                    "Preview %s waits for the frames of %s; leaving its release to the farm",
+                    preview_id,
+                    source_job_id,
+                )
+                continue
             if await release_pending_job_by_user_id(owner_id, preview_id):
                 released += 1
                 logger.info(

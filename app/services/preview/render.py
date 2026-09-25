@@ -37,6 +37,18 @@ _SCRIPT_CACHE_B64: Optional[str] = None
 # this is what stops the loop when the bot cannot.
 PREVIEW_TASK_ERROR_LIMIT = 5
 
+# A preview that waits for its render also waits, Pending, for the render's
+# frames: they are listed as its required assets. Frames rendered on other
+# machines reach each other through Dropbox, and heavy EXRs (45-110 MB) take
+# 20-45 minutes to; a preview released before then sat on a machine for that
+# long, waiting for them. Deadline checks such files on the Linux repository
+# server, which has no Y: drive, so it never releases these previews itself:
+# the farm's TasksBot event plugin does, on a worker, once they are there.
+# That worker sees its own frames before anyone else does, so a released
+# preview keeps the long wait for frames on its worker too - it costs nothing
+# when they are there.
+MAX_FRAME_ASSETS = 400
+
 
 class PreviewSubmissionError(RuntimeError):
     """Raised when a preview submission fails with a user-facing reason."""
@@ -129,6 +141,65 @@ def _count_expected_frames(frames_str: str) -> int:
         if re.match(r"^-?\d+$", chunk):
             total += 1
     return total
+
+
+def _expand_frames(frames_str: str) -> List[int]:
+    """The frame numbers of a Deadline Frames spec, as _count_expected_frames counts them."""
+    frames: List[int] = []
+    for chunk in str(frames_str or "").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        range_match = re.match(r"^(-?\d+)\s*-\s*(-?\d+)(?:\s*[xX:]\s*(\d+))?$", chunk)
+        if range_match:
+            start = int(range_match.group(1))
+            end = int(range_match.group(2))
+            step_raw = range_match.group(3)
+            step = int(step_raw) if step_raw and int(step_raw) > 0 else 1
+            if start <= end:
+                frames.extend(range(start, end + 1, step))
+            else:
+                # Deadline walks a reversed range from its first frame:
+                # 100-1x2 is 100, 98, ... 2.
+                frames.extend(range(start, end - 1, -step))
+        elif re.match(r"^-?\d+$", chunk):
+            frames.append(int(chunk))
+    return frames
+
+
+def expected_frame_paths(sequence_path: str, frames_str: str) -> List[str]:
+    """The files a render writes, which a preview waits on before it starts.
+
+    `sequence_path` is the preview's input: the render's output file with a
+    %0Nd placeholder for the frame number, or a single file for a still. An
+    empty list means the files cannot be listed - the job names no output file,
+    or its path has a comma, which would split Deadline's comma-separated list
+    into files that never exist - and the preview waits for its frames the old
+    way, on a worker.
+
+    Past MAX_FRAME_ASSETS frames only some are listed, since the farm's event
+    plugin checks every listed file each time a worker picks up a task: the
+    last ones in full - they are
+    written, and uploaded, last - and an even spread over the rest. The worker
+    still waits for any that are missing.
+    """
+    if "," in sequence_path:
+        return []
+    placeholder = re.search(r"%0(\d+)d", sequence_path)
+    if placeholder is None:
+        return [] if "*" in sequence_path else [sequence_path]
+
+    frames = _expand_frames(frames_str)
+    if len(frames) > MAX_FRAME_ASSETS:
+        tail = MAX_FRAME_ASSETS // 2
+        spread = MAX_FRAME_ASSETS - tail
+        earlier = frames[:-tail]
+        last = len(earlier) - 1
+        picks = sorted({round(i * last / (spread - 1)) for i in range(spread)})
+        frames = [earlier[i] for i in picks] + frames[-tail:]
+    width = int(placeholder.group(1))
+    head, tail = sequence_path[: placeholder.start()], sequence_path[placeholder.end() :]
+    return [f"{head}{frame:0{width}d}{tail}" for frame in frames]
 
 
 def _normalize_listed_workers(raw_value: Any) -> List[str]:
@@ -287,6 +358,7 @@ async def create_video_from_job(
     presubmitted: bool = False,
     depends_on: Optional[str] = None,
     if_no_frames: str = "hold",
+    wait_for_frames: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """
     Submit a Deadline CommandLine job that generates a preview video using ffmpeg.
@@ -303,6 +375,11 @@ async def create_video_from_job(
             render completes (the bot's own previews), or "refuse" with
             NoFramesYetError (a preview asked for from the chat is meant to
             show what is there now).
+        wait_for_frames: With depends_on, keep the preview Pending until every
+            frame of the render is on the farm as well (Deadline asset
+            dependencies, released by the farm's event plugin), instead of
+            letting it wait for them on a worker. For previews of the whole
+            render; one asked for from the chat shows what is there now.
 
     Returns:
         Dict with submission details and expected paths, or None if unable to submit.
@@ -407,6 +484,16 @@ async def create_video_from_job(
     # Forward-slash form of the video path, used for user-facing captions and
     # carried in job metadata under the historical PreviewDropbox key.
     expected_display_video = video_output_path.replace("\\", "/")
+
+    frame_assets: List[str] = []
+    # Only a preview queued before its render finished: one queued after it
+    # would find no worker event left to release it on a quiet farm.
+    if wait_for_frames and depends_on:
+        frame_assets = expected_frame_paths(input_sequence_path, frames_str)
+        if frame_assets:
+            input_wait_seconds = max(
+                input_wait_seconds or 0, settings.preview_presubmit_input_wait
+            )
 
     upload_token: Optional[str] = None
     upload_url: Optional[str] = None
@@ -639,6 +726,11 @@ async def create_video_from_job(
         preview_job_info["ResumeOnCompleteDependencies"] = "true"
         preview_job_info["ResumeOnDeletedDependencies"] = "false"
         preview_job_info["ResumeOnFailedDependencies"] = "false"
+    if frame_assets:
+        # A forced release (REST releasepending, ReleasePendingJob) skips the
+        # check for these files, so the bot leaves such a preview to the
+        # farm's event plugin, which releases it once they are all there.
+        preview_job_info["RequiredAssets"] = ",".join(frame_assets)
     if props.get("Pool"):
         preview_job_info["Pool"] = props["Pool"]
     if props.get("SecPool"):
@@ -747,5 +839,6 @@ async def create_video_from_job(
         "command_line": command_line,
         "preferred_slaves": preferred_slaves,
         "waits_for_render": bool(depends_on),
+        "waits_for_frames": bool(frame_assets),
         "submission": submission_response,
     }

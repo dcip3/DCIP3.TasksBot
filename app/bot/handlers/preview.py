@@ -397,6 +397,7 @@ async def create_new_video_process(
                 settings.preview_presubmit_input_wait if wait_for_render else None
             ),
             if_no_frames="refuse",
+            wait_for_frames=wait_for_render,
         )
         if not result:
             if progress_msg:
