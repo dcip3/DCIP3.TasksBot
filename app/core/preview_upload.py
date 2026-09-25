@@ -36,6 +36,9 @@ STATUS_CLAIMED = "claimed"
 STATUS_RECEIVED = "received"
 STATUS_DELIVERING = "delivering"
 STATUS_FAILED = "failed"
+# The video is in the chat; the row stays until the preview's job is deleted,
+# so a restart in between neither sends it again nor reports it missing.
+STATUS_DELIVERED = "delivered"
 _DELIVERY_LEASE_SECONDS = 5 * 60
 _UPLOAD_STATUSES_WITH_FILE = {STATUS_RECEIVED, STATUS_DELIVERING, STATUS_FAILED}
 _UPLOAD_META_FILENAME = "upload_meta.json"
@@ -326,6 +329,9 @@ class PreviewUploadTokenStore:
                     await conn.execute("DELETE FROM preview_upload_tokens WHERE token = ?", (token,))
                     await conn.commit()
                     return None
+                if state.status == STATUS_DELIVERED:
+                    await conn.rollback()
+                    return None
                 if state.status in _UPLOAD_STATUSES_WITH_FILE:
                     # The record says a file arrived. If it is still on disk,
                     # this upload is a duplicate and the caller is told so.
@@ -582,6 +588,31 @@ class PreviewUploadTokenStore:
     async def consume_claimed(self, token: str) -> None:
         await self.drop(token)
 
+    async def mark_delivered(self, token: str) -> None:
+        """Record that the video is in the chat and let go of its file."""
+        async with self._open_db() as conn:
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await self._ensure_schema(conn)
+            async with conn.execute(
+                "SELECT temp_path FROM preview_upload_tokens WHERE token = ?",
+                (token,),
+            ) as cur:
+                row = await cur.fetchone()
+            temp_path = row[0] if row else None
+            await conn.execute(
+                """
+                UPDATE preview_upload_tokens
+                SET status = ?,
+                    temp_path = NULL,
+                    claimed_until = 0,
+                    next_retry_at = 0
+                WHERE token = ?
+                """,
+                (STATUS_DELIVERED, token),
+            )
+            await conn.commit()
+        self._cleanup_upload_artifacts(token, temp_path)
+
     async def drop(self, token: str) -> None:
         async with self._open_db() as conn:
             await conn.execute("PRAGMA journal_mode=WAL")
@@ -613,7 +644,7 @@ class PreviewUploadTokenStore:
                 SELECT {_STATE_COLUMNS}
                 FROM preview_upload_tokens
                 WHERE expires_at > ?
-                  AND status IN (?, ?, ?, ?, ?)
+                  AND status IN (?, ?, ?, ?, ?, ?)
                 ORDER BY created_at ASC
                 """,
                 (
@@ -623,6 +654,7 @@ class PreviewUploadTokenStore:
                     STATUS_RECEIVED,
                     STATUS_DELIVERING,
                     STATUS_FAILED,
+                    STATUS_DELIVERED,
                 ),
             ) as cur:
                 rows = await cur.fetchall()
@@ -642,6 +674,48 @@ _token_store = PreviewUploadTokenStore(
 _upload_runner: Optional[web.AppRunner] = None
 _upload_site: Optional[web.BaseSite] = None
 _delivery_tasks: dict[str, asyncio.Task[None]] = {}
+# Delivered previews whose jobs are waiting to be deleted, by token.
+_cleanup_tasks: dict[str, asyncio.Task[None]] = {}
+
+
+def finish_delivered_preview(token: str, telegram_user_id: int, preview_job_id: str) -> None:
+    """Delete a delivered preview's job once its worker is done with it.
+
+    The video arrives just before the worker's process exits, so its task is
+    still rendering when delivery ends; deleting the job then left the worker
+    reporting a task of a job that was gone, and waiting twenty seconds for it.
+    This waits in the background, and the token's row, marked delivered, is
+    dropped only once the job is gone - a restart picks it up again.
+    """
+    existing = _cleanup_tasks.get(token)
+    if existing and not existing.done():
+        return
+    task = asyncio.create_task(
+        _delete_delivered_preview_job(token, telegram_user_id, preview_job_id)
+    )
+    _cleanup_tasks[token] = task
+    task.add_done_callback(lambda _done: _cleanup_tasks.pop(token, None))
+
+
+async def _delete_delivered_preview_job(
+    token: str, telegram_user_id: int, preview_job_id: str
+) -> None:
+    from app.services.deadline import delete_job_once_finished_by_user_id
+
+    try:
+        if await delete_job_once_finished_by_user_id(telegram_user_id, preview_job_id):
+            await _token_store.drop(token)
+        else:
+            logger.warning(
+                "Could not delete delivered preview job %s yet; will try again",
+                preview_job_id,
+            )
+    except Exception as exc:
+        logger.warning(
+            "Cleanup of delivered preview job %s failed: %s",
+            preview_job_id,
+            _redact_token(exc, token),
+        )
 
 
 def get_preview_upload_url() -> Optional[str]:
@@ -690,6 +764,12 @@ async def recover_preview_uploads() -> int:
     now = int(time.time())
     scheduled = 0
     for state in await _token_store.list_recoverable():
+        if state.status == STATUS_DELIVERED:
+            if state.preview_job_id:
+                finish_delivered_preview(
+                    state.token, state.payload.telegram_user_id, state.preview_job_id
+                )
+            continue
         if state.delivery_attempts >= settings.preview_upload_delivery_max_attempts:
             continue
 
@@ -856,6 +936,8 @@ async def _handle_preview_upload(request: web.Request) -> web.Response:
     payload = await _token_store.claim(token)
     if payload is None:
         state = await _token_store.get_state(token)
+        if state and state.status == STATUS_DELIVERED:
+            return web.Response(status=200, text="Preview already delivered")
         if state and state.status in _UPLOAD_STATUSES_WITH_FILE and _resolve_upload_temp_path(state):
             _start_delivery_task(token)
             return web.Response(status=202, text="Preview already received")
@@ -984,7 +1066,12 @@ async def _deliver_received_upload(token: str) -> None:
             await _notify_delivery_exhausted(failed_state)
         return
 
-    await _token_store.consume_claimed(token)
+    preview_job_id = state.payload.preview_job_id
+    if preview_job_id:
+        await _token_store.mark_delivered(token)
+        finish_delivered_preview(token, state.payload.telegram_user_id, preview_job_id)
+    else:
+        await _token_store.consume_claimed(token)
 
 
 async def _notify_delivery_exhausted(state: PreviewUploadState) -> None:
@@ -1085,7 +1172,6 @@ async def _deliver_preview(payload: PreviewUploadPayload, temp_path: Path) -> No
         )
 
     from app.core.preview_text import build_preview_caption
-    from app.services.deadline import delete_job_by_user_id
     from app.services.preview.delivery import send_ready_preview_video
 
     upload_meta: dict = {}
@@ -1112,9 +1198,8 @@ async def _deliver_preview(payload: PreviewUploadPayload, temp_path: Path) -> No
     )
 
     async def _delete() -> bool:
-        if not payload.preview_job_id:
-            return False
-        return await delete_job_by_user_id(payload.telegram_user_id, payload.preview_job_id)
+        # _deliver_received_upload deletes the job once its worker is done.
+        return bool(payload.preview_job_id)
 
     await send_ready_preview_video(
         target_user_id=payload.telegram_user_id,

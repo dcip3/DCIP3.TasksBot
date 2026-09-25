@@ -333,6 +333,13 @@ async def _notify_preview_job_completion(
                     upload_state_error,
                 )
 
+            from app.core.preview_upload import STATUS_DELIVERED, finish_delivered_preview
+
+            if upload_state is not None and upload_state.status == STATUS_DELIVERED:
+                # Its video went out before a restart; only the job is left.
+                finish_delivered_preview(upload_state.token, target_user_id, job_id)
+                return PreviewCompletionResult("notified", target_user_id)
+
             if upload_state is not None:
                 wait_expired = _preview_upload_wait_expired(
                     job,

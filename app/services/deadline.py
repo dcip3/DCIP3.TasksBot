@@ -1373,4 +1373,79 @@ async def delete_job_by_user_id(telegram_user_id: int, job_id: str) -> bool:
         call=lambda login, password: delete_job(login, password, job_id),
     )
 
+
+async def delete_job_once_finished(
+    login: str,
+    password: str,
+    job_id: str,
+    *,
+    wait_seconds: float = 120.0,
+    poll_seconds: float = 3.0,
+) -> bool:
+    """Delete a job once no worker is still rendering it.
+
+    A worker reports its task only after its process has exited. A job deleted
+    before that leaves the worker reporting a task of a job that is gone: it
+    logs a NullReferenceException and waits twenty seconds before taking other
+    work. A preview uploads its video just before it exits, so deleting it on
+    delivery did that on every preview. After `wait_seconds` the job is deleted
+    anyway, so a worker that died cannot keep it on the farm.
+    """
+    give_up_at = time.monotonic() + wait_seconds
+    while time.monotonic() < give_up_at:
+        found, job = await _lookup_job(login, password, job_id)
+        if found is False:
+            return True
+        # found is None: the lookup failed, which says nothing about the job.
+        if found and (job.get("Stat") != 1 or not job.get("RenderingChunks")):
+            break
+        await asyncio.sleep(poll_seconds)
+    for attempt in range(3):
+        if await delete_job(login, password, job_id):
+            return True
+        await asyncio.sleep(poll_seconds * (attempt + 1))
+    return False
+
+
+async def _lookup_job(
+    login: str, password: str, job_id: str
+) -> Tuple[Optional[bool], Optional[Dict[str, Any]]]:
+    """(True, job) if it exists, (False, None) if it is gone, (None, None) if unsure.
+
+    Deadline answers a JobID it does not know with 200 and an empty body, so
+    only that means the job is gone; any other failure is only a failure.
+    """
+    try:
+        session = await get_aiosession()
+        async with session.get(
+            f"{settings.deadline_api_url}/jobs",
+            params={"JobID": job_id},
+            headers=auth_headers(login, password),
+            ssl=settings.deadline_tls_verify,
+        ) as resp:
+            if resp.status != 200:
+                return None, None
+            body = (await resp.text()).strip()
+    except Exception:
+        return None, None
+    if not body:
+        return False, None
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return None, None
+    jobs = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+    match = next((job for job in jobs if isinstance(job, dict) and job.get("_id") == job_id), None)
+    return (True, match) if match is not None else (False, None)
+
+
+async def delete_job_once_finished_by_user_id(telegram_user_id: int, job_id: str) -> bool:
+    """delete_job_once_finished with the Telegram user's stored credentials."""
+    return await _with_user_credentials(
+        telegram_user_id,
+        default=False,
+        operation_name=f"delete finished job ({job_id})",
+        call=lambda login, password: delete_job_once_finished(login, password, job_id),
+    )
+
 # ============================================================================
