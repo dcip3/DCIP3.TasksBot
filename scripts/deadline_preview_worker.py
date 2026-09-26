@@ -13,6 +13,10 @@ in the Python environment available on the worker. When the launched interpreter
 script self-heals: it delegates to another local interpreter that has the modules, then tries an
 unattended `pip install`, and as a last resort excludes this worker from the job's machine list and
 requeues the current task so another worker picks it up.
+
+EXR previews also need FFmpeg 4.4 or newer, the first to read DWA-compressed EXRs. When the
+configured ffmpeg is older, the script uses a newer one found on the machine, or installs one
+with winget unattended.
 """
 
 from __future__ import annotations
@@ -523,6 +527,204 @@ def _ensure_color_runtime(args) -> Optional[int]:
         ", ".join(missing),
     )
     return None
+
+
+# FFmpeg 4.4 (libavcodec 58.134) is the first release that decodes DWAA/DWAB
+# EXRs. An older one still reads their header - ffprobe answers "0x0" - and
+# then fails on every frame.
+_MIN_LIBAVCODEC = (58, 134)
+_FFMPEG_WINGET_ID = "Gyan.FFmpeg.Essentials"
+# One install attempt per machine in this window, whatever came of it: a
+# failing winget must not add minutes to every preview.
+_FFMPEG_INSTALL_RETRY_SECONDS = 6 * 3600
+
+
+def _libavcodec_version(ffmpeg_path: str) -> Optional[Tuple[int, int]]:
+    """The libavcodec an ffmpeg was built with, e.g. (61, 19); None if it does not run.
+
+    Read instead of the release number, which builds from git replace with a date.
+    """
+    try:
+        result = subprocess.run(
+            [ffmpeg_path, "-version"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    match = re.search(r"libavcodec\s+(\d+)\.\s*(\d+)\.", result.stdout or "")
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _decodes_dwa_exr(ffmpeg_path: str) -> bool:
+    version = _libavcodec_version(ffmpeg_path)
+    return version is not None and version >= _MIN_LIBAVCODEC
+
+
+def _ffmpeg_candidates(configured: str) -> List[str]:
+    """Every ffmpeg found on this machine, the configured one first."""
+    candidates: List[str] = []
+    seen: Set[str] = set()
+
+    def _add(raw) -> None:
+        if not raw:
+            return
+        path = Path(str(raw).strip().strip('"'))
+        if not path.is_file():
+            return
+        try:
+            key = os.path.normcase(str(path.resolve()))
+        except OSError:
+            key = os.path.normcase(str(path))
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(str(path))
+
+    if configured:
+        _add(shutil.which(configured))
+
+    exe_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    for folder in os.environ.get("PATH", "").split(os.pathsep):
+        if folder.strip():
+            _add(Path(folder.strip().strip('"')) / exe_name)
+
+    if os.name == "nt":
+        program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+        program_data = Path(os.environ.get("ProgramData", r"C:\ProgramData"))
+        winget_roots: List[Path] = []
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            winget_roots.append(Path(local_appdata) / "Microsoft" / "WinGet")
+        winget_roots.append(program_files / "WinGet")
+        for root in winget_roots:
+            _add(root / "Links" / exe_name)
+            try:
+                for exe in sorted(root.glob("Packages/Gyan.FFmpeg*/*/bin/ffmpeg.exe"), reverse=True):
+                    _add(exe)
+            except OSError:
+                continue
+        for folder in (program_data / "ffmpeg", program_files / "ffmpeg", Path("C:/ffmpeg")):
+            _add(folder / "bin" / exe_name)
+        _add(program_data / "chocolatey" / "bin" / exe_name)
+    else:
+        for folder in ("/usr/local/bin", "/usr/bin", "/opt/homebrew/bin"):
+            _add(Path(folder) / exe_name)
+
+    return candidates
+
+
+def _first_capable_ffmpeg(configured: str) -> Optional[str]:
+    for candidate in _ffmpeg_candidates(configured):
+        if _decodes_dwa_exr(candidate):
+            if candidate != shutil.which(configured or "ffmpeg"):
+                logging.warning(
+                    "The configured ffmpeg (%s) is missing or older than FFmpeg 4.4, "
+                    "which cannot read DWA-compressed EXRs; using %s",
+                    configured,
+                    candidate,
+                )
+            return candidate
+    return None
+
+
+def _find_winget() -> Optional[str]:
+    if os.name != "nt":
+        return None
+    located = shutil.which("winget")
+    if located:
+        return located
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        alias = Path(local_appdata) / "Microsoft" / "WindowsApps" / "winget.exe"
+        if alias.exists():
+            return str(alias)
+    return None
+
+
+def _install_ffmpeg() -> bool:
+    """Install a current ffmpeg with winget, unattended; True when winget succeeded."""
+    winget = _find_winget()
+    if not winget:
+        logging.warning("winget is not available here, so no newer ffmpeg can be installed")
+        return False
+
+    stamp = Path(tempfile.gettempdir()) / "tasksbot_ffmpeg_install.stamp"
+    try:
+        tried_ago = time.time() - stamp.stat().st_mtime
+    except OSError:
+        tried_ago = None
+    if tried_ago is not None and tried_ago < _FFMPEG_INSTALL_RETRY_SECONDS:
+        logging.warning(
+            "ffmpeg was already installed or tried here %s min ago; not trying again yet",
+            int(tried_ago // 60),
+        )
+        return False
+    with contextlib.suppress(OSError):
+        stamp.touch()
+
+    command = [
+        winget,
+        "install",
+        "--id",
+        _FFMPEG_WINGET_ID,
+        "--exact",
+        "--source",
+        "winget",
+        "--silent",
+        "--accept-package-agreements",
+        "--accept-source-agreements",
+    ]
+    logging.warning("Attempting automatic ffmpeg installation: %s", " ".join(command))
+    try:
+        result = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=900,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logging.error("winget could not be launched: %s", exc)
+        return False
+    if result.returncode != 0:
+        logging.error(
+            "winget install failed (exit %s): %s",
+            result.returncode,
+            (result.stdout or result.stderr or "").strip()[-2000:],
+        )
+        return False
+    logging.warning("Automatic ffmpeg installation succeeded")
+    return True
+
+
+def _capable_ffmpeg(configured: str) -> str:
+    """An ffmpeg on this machine that reads DWA-compressed EXRs, installed if need be.
+
+    The configured ffmpeg ("ffmpeg" from PATH by default) may be a copy unpacked
+    years ago. A newer one already on the machine wins; failing that, winget
+    installs one. The full path is returned: a Deadline Worker keeps the PATH
+    it started with, so a fresh install is not on it. With nothing better to
+    hand the configured one stays - the color path only has it encode PNGs,
+    which any version does.
+    """
+    found = _first_capable_ffmpeg(configured)
+    if found is None and _install_ffmpeg():
+        found = _first_capable_ffmpeg(configured)
+    if found is None:
+        logging.error(
+            "No ffmpeg on this machine reads DWA-compressed EXRs (FFmpeg 4.4 or newer "
+            "is needed). Run scripts/worker_setup.ps1 on this worker to install one."
+        )
+        return configured
+    return found
 
 
 def _wait_for_color_sidecar(
@@ -1838,11 +2040,14 @@ def run_ffmpeg(command: list[str]) -> None:
         raise RuntimeError(f"ffmpeg exited with status {completed.returncode}")
 
 def _resolve_ffprobe_path(ffmpeg_path: str) -> str:
+    """The ffprobe shipped beside ffmpeg, so both come from one build."""
     if not ffmpeg_path or ffmpeg_path == "ffmpeg":
         return "ffprobe"
     ffmpeg_path_obj = Path(ffmpeg_path)
-    if ffmpeg_path_obj.name.lower().endswith("ffmpeg"):
-        return str(ffmpeg_path_obj.with_name("ffprobe"))
+    if ffmpeg_path_obj.stem.lower().endswith("ffmpeg"):
+        sibling = ffmpeg_path_obj.with_name("ffprobe" + ffmpeg_path_obj.suffix)
+        if sibling.is_file() or not ffmpeg_path_obj.is_file():
+            return str(sibling)
     return "ffprobe"
 
 def _get_video_duration_seconds(video_path: Path, ffprobe_path: str) -> Optional[float]:
@@ -2494,6 +2699,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     delegated_exit = _ensure_color_runtime(args)
     if delegated_exit is not None:
         return delegated_exit
+
+    if Path(args.input_pattern).suffix.lower() == ".exr":
+        args.ffmpeg_path = _capable_ffmpeg(args.ffmpeg_path)
 
     _install_signal_handlers()
 

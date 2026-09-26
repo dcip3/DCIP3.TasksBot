@@ -2,13 +2,17 @@
 <#
 .SYNOPSIS
     Installs (or upgrades) Python on Windows Deadline workers and pulls in the packages needed
-    for deadline_preview_worker.py (PyOpenColorIO, OpenEXR, NumPy, ffmpeg already expected).
+    for deadline_preview_worker.py (PyOpenColorIO, OpenEXR, NumPy, Pillow), plus an ffmpeg that
+    reads DWA-compressed EXRs.
 
 .DESCRIPTION
     - Downloads and installs Python 3.11 from python.org when not already present (falls back to winget).
     - Upgrades pip and installs the required Python packages into EVERY Python 3 interpreter found on
       the machine (py launcher registrations, PATH pythons including Microsoft Store, common install dirs),
       so preview jobs keep working no matter which interpreter `py`/`python` resolves to.
+    - Installs ffmpeg with winget (Gyan.FFmpeg.Essentials) when no ffmpeg on the machine is FFmpeg 4.4
+      or newer, the first release that reads DWAA/DWAB EXRs. An older ffmpeg left on PATH is fine: the
+      preview script picks the newer one itself.
     - Can be executed with administrative privileges to install for all users.
     - Safe to re-run; existing installations will be reused.
 
@@ -18,7 +22,7 @@
 
 .NOTES
     - Ensure winget is available (Windows 10 2004+ or 11).
-    - ffmpeg must already be reachable via PATH or configured in .env (FFMPEG_PATH).
+    - Pass -SkipFFmpeg to leave ffmpeg alone.
 #>
 
 param (
@@ -28,8 +32,13 @@ param (
     [switch]$InstallPythonForAllUsers,
     [string]$PythonId = "Python.Python.3.11",
     [string]$PythonExecutable = $(Join-Path $env:LocalAppData "Programs\Python\Python311\python.exe"),
-    [string[]]$Packages = @("OpenColorIO", "OpenEXR", "numpy", "Pillow")
+    [string[]]$Packages = @("OpenColorIO", "OpenEXR", "numpy", "Pillow"),
+    [string]$FFmpegId = "Gyan.FFmpeg.Essentials",
+    [switch]$SkipFFmpeg
 )
+
+# FFmpeg 4.4 (libavcodec 58.134) is the first release that reads DWA-compressed EXRs.
+$MinLibavcodec = [version]"58.134"
 
 function Write-Section {
     param([string]$Message)
@@ -227,9 +236,9 @@ function Install-PythonViaWinget {
 
     Ensure-Winget
     Write-Host "Attempting winget installation for package '$PackageId'..."
-    $exitCode = winget install --id $PackageId --silent --accept-package-agreements --accept-source-agreements
-    if ($exitCode -ne 0) {
-        throw "winget failed to install package '$PackageId' (exit code $exitCode)."
+    winget install --id $PackageId --silent --accept-package-agreements --accept-source-agreements | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw "winget failed to install package '$PackageId' (exit code $LASTEXITCODE)."
     }
 }
 
@@ -448,6 +457,119 @@ function Install-Packages {
     Write-Host "Package installation complete." -ForegroundColor Green
 }
 
+function Get-LibavcodecVersion {
+    param([string]$FFmpegPath)
+
+    # Read instead of the release number, which builds from git replace with a date.
+    try {
+        $output = & $FFmpegPath -version 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            return $null
+        }
+        $match = [regex]::Match(($output -join "`n"), 'libavcodec\s+(\d+)\.\s*(\d+)\.')
+        if ($match.Success) {
+            return [version]"$($match.Groups[1].Value).$($match.Groups[2].Value)"
+        }
+    } catch {}
+    return $null
+}
+
+function Get-FFmpegCandidates {
+    $candidates = @()
+    foreach ($commandInfo in @(Get-Command ffmpeg -All -CommandType Application -ErrorAction SilentlyContinue)) {
+        if ($commandInfo -and $commandInfo.Source) {
+            $candidates += $commandInfo.Source
+        }
+    }
+
+    $wingetRoots = @(
+        (Join-Path $env:LocalAppData "Microsoft\WinGet"),
+        (Join-Path $env:ProgramFiles "WinGet")
+    )
+    foreach ($root in $wingetRoots) {
+        $candidates += (Join-Path $root "Links\ffmpeg.exe")
+        $packagesRoot = Join-Path $root "Packages"
+        if (-not (Test-Path $packagesRoot)) { continue }
+        $packageDirs = Get-ChildItem -Path $packagesRoot -Directory -Filter "Gyan.FFmpeg*" -ErrorAction SilentlyContinue
+        foreach ($packageDir in @($packageDirs)) {
+            if (-not $packageDir) { continue }
+            $exes = Get-ChildItem -Path $packageDir.FullName -Filter "ffmpeg.exe" -Recurse -ErrorAction SilentlyContinue
+            foreach ($exe in @($exes)) {
+                if ($exe) { $candidates += $exe.FullName }
+            }
+        }
+    }
+
+    $candidates += @(
+        (Join-Path $env:ProgramData "ffmpeg\bin\ffmpeg.exe"),
+        (Join-Path $env:ProgramFiles "ffmpeg\bin\ffmpeg.exe"),
+        "C:\ffmpeg\bin\ffmpeg.exe",
+        (Join-Path $env:ProgramData "chocolatey\bin\ffmpeg.exe")
+    )
+
+    $seen = @{}
+    $existing = @()
+    foreach ($candidate in $candidates) {
+        if ([string]::IsNullOrWhiteSpace($candidate) -or -not (Test-Path $candidate -PathType Leaf)) { continue }
+        $key = $candidate.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        $existing += $candidate
+    }
+    return $existing
+}
+
+function Find-CapableFFmpeg {
+    param([switch]$Report)
+
+    $capable = $null
+    foreach ($candidate in Get-FFmpegCandidates) {
+        $version = Get-LibavcodecVersion -FFmpegPath $candidate
+        if ($Report) {
+            $label = if ($version) { "libavcodec $version" } else { "does not run" }
+            Write-Host "  $candidate ($label)"
+        }
+        if (-not $capable -and $version -and $version -ge $MinLibavcodec) {
+            $capable = $candidate
+        }
+    }
+    return $capable
+}
+
+function Install-FFmpeg {
+    Write-Section "Checking ffmpeg"
+
+    $capable = Find-CapableFFmpeg -Report
+    if (-not $capable) {
+        Write-Host "No ffmpeg here reads DWA-compressed EXRs (FFmpeg 4.4 or newer is needed)."
+        Ensure-Winget
+        Write-Host "Installing '$FFmpegId' with winget..."
+        $arguments = @("install", "--id", $FFmpegId, "--exact", "--source", "winget", "--silent",
+            "--accept-package-agreements", "--accept-source-agreements")
+        $installed = $false
+        if (Test-IsAdministrator) {
+            winget @arguments --scope machine | Out-Host
+            $installed = ($LASTEXITCODE -eq 0)
+        }
+        if (-not $installed) {
+            winget @arguments | Out-Host
+            if ($LASTEXITCODE -ne 0) {
+                throw "winget failed to install '$FFmpegId' (exit code $LASTEXITCODE)."
+            }
+        }
+        $capable = Find-CapableFFmpeg
+        if (-not $capable) {
+            throw "winget installed '$FFmpegId' but no FFmpeg 4.4 or newer was found afterwards."
+        }
+    }
+
+    Write-Host "Previews will use $capable" -ForegroundColor Green
+    $onPath = Get-Command ffmpeg -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $onPath -or $onPath.Source -ne $capable) {
+        Write-Host "It is not the first ffmpeg on PATH; the preview script finds it anyway."
+    }
+}
+
 try {
     $pythonPath = Install-Python
     if (-not (Test-Path $pythonPath) -and (Test-Path $PythonExecutable)) {
@@ -481,8 +603,15 @@ try {
         throw "Package installation failed for every detected Python interpreter."
     }
 
+    if (-not $SkipFFmpeg) {
+        try {
+            Install-FFmpeg
+        } catch {
+            Write-Warning "ffmpeg: $($_.Exception.Message) Install FFmpeg 4.4 or newer on this worker by hand."
+        }
+    }
+
     Write-Section "Final steps"
-    Write-Host "Ensure ffmpeg is installed and reachable on this worker (or set FFMPEG_PATH in .env)."
     Write-Host "Done." -ForegroundColor Green
 } catch {
     Write-Error $_.Exception.Message

@@ -103,14 +103,19 @@ on a worker. Any worker that may pick one up needs:
 | Requirement | Why |
 | --- | --- |
 | Python 3 with OpenColorIO 2, OpenEXR, NumPy, and Pillow | Reads the EXR frames and applies the color transform |
-| `ffmpeg` and `ffprobe` on `PATH` | Encodes the MP4, with NVENC when ffmpeg offers it |
+| `ffmpeg` and `ffprobe`, FFmpeg 4.4 or newer | Encodes the MP4, with NVENC when ffmpeg offers it; older releases cannot read DWA-compressed EXRs |
 | Read access to the frames, write access to the folder one level above them | The preview is saved beside the render's output folder |
 | An OCIO config the workers can read, set in `PREVIEW_OCIO_REMOTE_CONFIG` | Without it, previews skip the ACES view transform |
 | HTTP access to `PREVIEW_UPLOAD_URL` | Sends the finished preview to the bot |
 
 On Windows workers, run [worker_setup.bat](scripts/worker_setup.bat): it installs Python 3.11
-when no 3.11 is found and the Python packages into every interpreter it finds. The bot also
-sends both setup scripts from **Settings → Worker Setup**. Install `ffmpeg` separately.
+when no 3.11 is found, the Python packages into every interpreter it finds, and ffmpeg with
+winget when no ffmpeg on the machine is 4.4 or newer. The bot also sends both setup scripts
+from **Settings → Worker Setup**.
+
+A preview checks for itself as well. When the configured ffmpeg (`FFMPEG_PATH`, `ffmpeg` from
+`PATH` by default) is older than 4.4, it uses a newer one found on the machine, or installs
+one with winget unattended, at most once every six hours per machine.
 
 When `PREVIEW_UPLOAD_ENABLED` is off, the bot reads the finished preview from the render folder
 itself, which works only when the bot sees the render storage at the same path as the workers.
