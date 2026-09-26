@@ -207,6 +207,88 @@ class ReportedResolutionTests(unittest.TestCase):
         )
         self.assertEqual(headers["X-Preview-Resolution"], "2560x1440")
 
+    def test_a_frame_ffprobe_cannot_read_is_measured_from_its_header(self) -> None:
+        """SHC_0250: a DWAA-compressed EXR, an old ffprobe, and a caption of 0 x 0."""
+        with mock.patch.object(worker, "_header_resolution", return_value="2560x2560"):
+            headers = self._headers({".mp4": "1920x1920"})
+        self.assertEqual(headers["X-Preview-Resolution"], "2560x2560")
+
+    def test_with_no_frame_readable_the_render_setup_beats_the_video(self) -> None:
+        """The video is fitted into a box; the render was set up at its own size."""
+        with mock.patch.object(worker, "_header_resolution", return_value=None):
+            headers = self._headers(
+                {".mp4": "1920x1920"}, sidecar={"resolution": {"camera": [2560, 2560]}}
+            )
+        self.assertEqual(headers["X-Preview-Resolution"], "2560x2560")
+
+
+class ProbeAnswerTests(unittest.TestCase):
+    """An ffprobe that cannot decode a file still answers - with 0x0."""
+
+    def _probe(self, stdout: str, returncode: int = 0):
+        answer = mock.Mock(returncode=returncode, stdout=stdout)
+        with mock.patch.object(worker.subprocess, "run", return_value=answer):
+            return worker._probe_output_resolution(Path("f.exr"), "ffmpeg")
+
+    def test_a_zero_size_is_no_size(self) -> None:
+        self.assertIsNone(self._probe("0x0\n"))
+        self.assertIsNone(self._probe("2560x0\n"))
+
+    def test_a_real_size_is_passed_on(self) -> None:
+        self.assertEqual(self._probe("2560x2560\n"), "2560x2560")
+
+    def test_a_failed_probe_is_no_size(self) -> None:
+        self.assertIsNone(self._probe("", returncode=1))
+
+
+def _module_available(name: str) -> bool:
+    try:
+        __import__(name)
+    except ImportError:
+        return False
+    return True
+
+
+class HeaderResolutionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    @unittest.skipUnless(
+        _module_available("OpenEXR") and _module_available("numpy"), "needs OpenEXR"
+    )
+    def test_an_exr_reports_its_display_window_whatever_the_compression(self) -> None:
+        """As ffprobe does: an overscan margin in the data window is not counted."""
+        import Imath
+        import numpy as np
+        import OpenEXR
+
+        path = self.root / "f.exr"
+        header = OpenEXR.Header(300, 200)
+        header["dataWindow"] = Imath.Box2i(Imath.V2i(-50, -50), Imath.V2i(249, 149))
+        header["displayWindow"] = Imath.Box2i(Imath.V2i(0, 0), Imath.V2i(199, 99))
+        header["compression"] = Imath.Compression(Imath.Compression.DWAA_COMPRESSION)
+        header["channels"] = {c: Imath.Channel(Imath.PixelType(Imath.PixelType.HALF)) for c in "RGB"}
+        out = OpenEXR.OutputFile(str(path), header)
+        pixels = np.full((200, 300), 0.5, dtype=np.float16).tobytes()
+        out.writePixels({c: pixels for c in "RGB"})
+        out.close()
+        self.assertEqual(worker._header_resolution(path), "200x100")
+
+    @unittest.skipUnless(_module_available("PIL"), "needs Pillow")
+    def test_other_images_report_their_size(self) -> None:
+        from PIL import Image
+
+        path = self.root / "f.png"
+        Image.new("RGB", (64, 32)).save(path)
+        self.assertEqual(worker._header_resolution(path), "64x32")
+
+    def test_an_unreadable_file_has_no_size(self) -> None:
+        path = self.root / "broken.exr"
+        path.write_bytes(b"not an exr")
+        self.assertIsNone(worker._header_resolution(path))
+
 
 if __name__ == "__main__":
     unittest.main()

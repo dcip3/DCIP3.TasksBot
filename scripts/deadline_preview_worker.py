@@ -2105,8 +2105,48 @@ def _probe_output_resolution(output_path: Path, ffmpeg_path: str) -> Optional[st
     for line in (probe.stdout or "").strip().splitlines():
         value = line.strip().strip("x")
         if value:
-            return value
+            # An ffprobe that cannot decode the file still answers, with a size
+            # of 0x0 and exit code 0 - an FFmpeg older than 4.4 does that for
+            # DWAA-compressed EXRs. That is no size at all, not a size of zero.
+            return value if _positive_size(value) else None
     return None
+
+
+def _positive_size(value: str) -> bool:
+    try:
+        width, height = (int(part) for part in str(value).split("x", 1))
+    except (TypeError, ValueError):
+        return False
+    return width > 0 and height > 0
+
+
+def _header_resolution(frame: Path) -> Optional[str]:
+    """A frame's size as its own header states it, whatever its compression.
+
+    For an EXR that is the display window, which is what ffprobe reports too,
+    so the two agree wherever both can read the file.
+    """
+    try:
+        if frame.suffix.lower() == ".exr":
+            import OpenEXR
+
+            exr = OpenEXR.InputFile(str(frame))
+            try:
+                window = exr.header()["displayWindow"]
+            finally:
+                exr.close()
+            width = window.max.x - window.min.x + 1
+            height = window.max.y - window.min.y + 1
+        else:
+            from PIL import Image
+
+            with Image.open(frame) as image:
+                width, height = image.size
+    except Exception as exc:
+        logging.debug("Could not read the size from %s: %s", frame.name, exc)
+        return None
+    size = "%dx%d" % (width, height)
+    return size if _positive_size(size) else None
 
 
 def _describe_color_controls(controls: Optional[dict]) -> str:
@@ -2223,7 +2263,14 @@ def _rendered_resolution(input_pattern: Optional[str], ffmpeg_path: str) -> Opti
             frames = [Path(input_pattern)]
         for frame in frames:
             if frame.exists():
-                return _probe_output_resolution(frame, ffmpeg_path)
+                size = _probe_output_resolution(frame, ffmpeg_path)
+                if size is None:
+                    logging.warning(
+                        "ffprobe could not read the size of %s; reading its header instead",
+                        frame.name,
+                    )
+                    size = _header_resolution(frame)
+                return size
     except Exception as exc:
         logging.debug("Could not read the rendered frame size: %s", exc)
     return None
@@ -2250,10 +2297,14 @@ def _upload_metadata_headers(
         headers["X-Preview-Color-Controls"] = urllib.parse.quote(
             controls_summary, safe=""
         )
-    # Falls back to the encoded file only when no frame can be read - better a
-    # figure than none, and without a cap the two agree anyway.
-    resolution = _rendered_resolution(input_pattern, ffmpeg_path) or _probe_output_resolution(
-        output_path, ffmpeg_path
+    # Falls back to the size the render was set up for, then to the encoded
+    # file, only when no frame can be read - better a figure than none. The
+    # encoded file comes last because it is fitted into a box: 2560x2560
+    # renders become 1920x1920 previews.
+    resolution = (
+        _rendered_resolution(input_pattern, ffmpeg_path)
+        or _frame_resolution(sidecar)
+        or _probe_output_resolution(output_path, ffmpeg_path)
     )
     overscan_summary = _describe_overscan(sidecar)
     if overscan_summary:
