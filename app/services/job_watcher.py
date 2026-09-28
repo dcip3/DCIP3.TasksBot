@@ -16,7 +16,7 @@ from app.auth import _decrypt_password
 from app.core.bot_core import bot
 from app.core.config import settings
 from app.core.ttl_cache import TTLCache
-from app.storage import probe_state
+from app.storage import preview_pause, probe_state
 from app.storage.database import get_db_connection
 from app.services.job_state import auto_preview_jobs, notified_jobs
 from app.services.preview.runtime import (
@@ -61,11 +61,16 @@ _STRANDED_PREVIEW_GRACE_SECONDS = 180
 # task, so without this a preview whose upload the bot refuses runs, fails and
 # runs again for as long as the render sits on the farm.
 _PREVIEW_ERROR_LIMIT = 3
-# How long a suspended render may hold its pending preview before the preview is
+# How long a paused render may keep its waiting preview before the preview is
 # dropped. Short pauses (fixing something and resuming) keep their preview; a
-# render left paused releases it, and resuming re-queues a fresh one.
+# render left paused releases it, and resuming re-queues a fresh one with a
+# fresh upload link. The preview itself stays Pending all along: suspending it
+# too would look tidier, but Resume on a suspended preview - on the render's
+# batch in Monitor, say - queues it at once, past its unfinished render
+# (checked on the farm), while Resume leaves a Pending job alone.
+# When the pause was first seen is kept in the database (preview_pause), so a
+# restart or deploy does not start the hour over.
 _SUSPENDED_SOURCE_GRACE_SECONDS = 60 * 60
-_suspended_source_since: dict[str, float] = {}
 # How long after its render finished a preview may wait for the render's
 # frames before it is released without them. The slowest frame seen arriving
 # through Dropbox took 46 minutes; one missing after twice that is not coming
@@ -1750,6 +1755,35 @@ async def _replace_without_frames(user: "_WatcherUser", preview_id: str, props: 
     )
 
 
+async def _pause_seen_at(
+    pauses: dict, preview_id: str, source_job_id: str, user: "_WatcherUser"
+) -> Optional[float]:
+    """When the bot first saw this preview's render paused; recorded on first sight."""
+    known = pauses.get(preview_id)
+    if known is not None:
+        return float(known.paused_at)
+    try:
+        await preview_pause.record_pause(preview_id, source_job_id, user.telegram_user_id)
+    except Exception as exc:
+        logger.warning("Watcher: could not record the pause of %s: %s", source_job_id, exc)
+        return None
+    logger.info(
+        "Watcher: render %s is paused; its preview %s goes if it stays paused %s min",
+        source_job_id,
+        preview_id,
+        _SUSPENDED_SOURCE_GRACE_SECONDS // 60,
+    )
+    return time.time()
+
+
+async def _forget_pause(preview_id: str) -> None:
+    try:
+        await preview_pause.drop_pause(preview_id)
+    except Exception as exc:
+        # Harmless: a leftover row is dropped on a later pass.
+        logger.warning("Watcher: could not drop the pause record of %s: %s", preview_id, exc)
+
+
 async def _reconcile_previews(user: "_WatcherUser", jobs: list) -> None:
     """Deal with previews that cannot finish, whenever they were queued.
 
@@ -1784,6 +1818,15 @@ async def _reconcile_previews(user: "_WatcherUser", jobs: list) -> None:
                 presubmitted.add(entry_id)
 
     stranded = await _strand_check(user, previews)
+    try:
+        pauses = await preview_pause.list_pauses(user.telegram_user_id)
+    except Exception as exc:
+        logger.warning("Watcher: could not read paused renders' previews: %s", exc)
+        pauses = None
+    if pauses and jobs_by_id:
+        # An empty listing is a failed read, not an empty farm.
+        for gone in set(pauses) - set(jobs_by_id):
+            await _forget_pause(gone)
 
     for preview_id, preview, props in previews:
         # 1=queued/rendering, 2=suspended, 6=pending on a dependency
@@ -1825,6 +1868,7 @@ async def _reconcile_previews(user: "_WatcherUser", jobs: list) -> None:
 
         source = jobs_by_id.get(source_job_id)
         source_stat = source.get("Stat", 0) if source is not None else None
+        preview_stat = preview.get("Stat", 0)
 
         reason: Optional[str] = None
         if source is None:
@@ -1833,21 +1877,26 @@ async def _reconcile_previews(user: "_WatcherUser", jobs: list) -> None:
             reason = "source render failed"
         elif source_stat == 2:
             # Paused render: keep the preview for a while (the user may just be
-            # fixing something), then release it so it does not sit in the queue
-            # forever holding its upload token.
-            paused_since = _suspended_source_since.setdefault(
-                source_job_id, time.monotonic()
-            )
-            if (time.monotonic() - paused_since) >= _SUSPENDED_SOURCE_GRACE_SECONDS:
-                reason = "source render stayed paused"
+            # fixing something), then drop it so it does not wait for ever on
+            # an upload link that runs out.
+            if pauses is None:
+                continue
+            paused_at = await _pause_seen_at(pauses, preview_id, source_job_id, user)
+            if paused_at is None or time.time() - paused_at < _SUSPENDED_SOURCE_GRACE_SECONDS:
+                continue
+            reason = "source render stayed paused"
         else:
-            _suspended_source_since.pop(source_job_id, None)
-
-        if reason is None:
             # Deadline holds the preview Pending until the render completes -
             # and, for one that waits for frames, until they are all on the
             # farm. The farm's event plugin releases it once both hold, on
             # a worker (_frames_overdue covers frames that never come).
+            if pauses and preview_id in pauses:
+                await _forget_pause(preview_id)
+            continue
+
+        if preview_stat not in (2, 6):
+            # Already released: it is building the preview from frames that
+            # exist, whatever became of the render since.
             continue
 
         try:
@@ -1857,7 +1906,7 @@ async def _reconcile_previews(user: "_WatcherUser", jobs: list) -> None:
             continue
         if deleted:
             logger.info("Watcher: removed preview %s because its %s", preview_id, reason)
-            _suspended_source_since.pop(source_job_id, None)
+            await _forget_pause(preview_id)
             # Forget the dedupe records so resuming the render queues a new
             # preview instead of silently skipping it.
             auto_preview_jobs.remove((source_job_id, target_user_id))

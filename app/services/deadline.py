@@ -1154,13 +1154,28 @@ _PUT_JOB_COMMANDS = (
     "requeue",
     "resume",
     "suspend",
+    "pend",
     "releasepending",
     "resumefailed",
 )
 
 
+async def _refused(resp) -> Optional[str]:
+    """Why Deadline turned a command down, or None when it went through.
+
+    Deadline answers some refusals with 200 and a body starting "Error".
+    """
+    try:
+        body = (await resp.text()).strip()
+    except Exception:
+        body = ""
+    if resp.status != 200 or body.lower().startswith("error"):
+        return f"{resp.status} {body[:120]}".strip()
+    return None
+
+
 async def _put_job_command(login: str, password: str, command: str, job_id: str) -> bool:
-    """Send a PUT /jobs command (requeue/resume/suspend) under given credentials."""
+    """Send a PUT /jobs command (requeue/resume/suspend/pend) under given credentials."""
     if command not in _PUT_JOB_COMMANDS:
         raise ValueError(f"Unsupported job command: {command}")
     try:
@@ -1173,13 +1188,14 @@ async def _put_job_command(login: str, password: str, command: str, job_id: str)
             headers=auth,
             ssl=settings.deadline_tls_verify,
         ) as resp:
-            if resp.status != 200:
-                logger.error("Failed to %s job: %s", command, resp.status)
+            refusal = await _refused(resp)
+            if refusal:
+                logger.error("Failed to %s job %s: %s", command, job_id, refusal)
                 return False
             _invalidate_jobs_cache(login)
             return True
     except Exception as exc:
-        logger.error("Error during %s job: %s", command, exc)
+        logger.error("Error during %s job %s: %s", command, job_id, exc)
         return False
 
 
@@ -1323,6 +1339,21 @@ async def suspend_job_by_user_id(telegram_user_id: int, job_id: str) -> bool:
     return await _job_command_by_user_id(telegram_user_id, "suspend", job_id)
 
 
+async def pend_job(login: str, password: str, job_id: str) -> bool:
+    """Put a suspended job back to Pending, where its dependencies hold it again.
+
+    Resume queues a suspended job at once, even one whose dependency has not
+    finished (checked on the farm), so a preview put back that way would start
+    before its render's frames exist. Pending keeps it waiting on the render.
+    """
+    return await _put_job_command(login, password, "pend", job_id)
+
+
+async def pend_job_by_user_id(telegram_user_id: int, job_id: str) -> bool:
+    """Put a suspended job back to Pending using telegram user ID."""
+    return await _job_command_by_user_id(telegram_user_id, "pend", job_id)
+
+
 async def delete_job(login: str, password: str, job_id: str) -> bool:
     """
     Delete a job.
@@ -1344,14 +1375,14 @@ async def delete_job(login: str, password: str, job_id: str) -> bool:
             headers=headers,
             ssl=settings.deadline_tls_verify,
         ) as resp:
-            success = resp.status == 200
-            if not success:
-                logger.error(f"Failed to delete job: {resp.status}")
-            else:
-                _invalidate_jobs_cache(login)
-            return success
+            refusal = await _refused(resp)
+            if refusal:
+                logger.error("Failed to delete job %s: %s", job_id, refusal)
+                return False
+            _invalidate_jobs_cache(login)
+            return True
     except Exception as e:
-        logger.error(f"Error deleting job: {e}")
+        logger.error("Error deleting job %s: %s", job_id, e)
         return False
 
 

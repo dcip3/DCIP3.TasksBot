@@ -25,6 +25,7 @@ from app.core.ui_helpers import (
     close_menu,
     inline_button,
 )
+from app.core.farm_events import request_watcher_wakeup
 from app.services import render_cost
 from app.services.deadline import (
     delete_job_by_user_id,
@@ -33,6 +34,7 @@ from app.services.deadline import (
     get_jobs_list,
     get_worker_infosettings_by_user_id,
     get_workers_list,
+    pend_job_by_user_id,
     requeue_job_by_user_id,
     resume_failed_job_by_user_id,
     resume_job_by_user_id,
@@ -2080,6 +2082,41 @@ async def resume_failed_job_callback(callback_query: CallbackQuery) -> None:
         await callback_query.answer("Error occurred while resuming job.", show_alert=True)
 
 
+async def _resume_job(telegram_user_id: int, job_id: str) -> tuple[bool, str] | None:
+    """Resume a job - but hand a preview still waiting on its render back to it.
+
+    Resume queues a suspended job at once, dependency or not (checked on the
+    farm), so a preview resumed while its render is unfinished would start
+    before the frames exist and hold a machine waiting for them. Pending leaves
+    it waiting on the render instead. Once the render has completed, resume is
+    right: the frames are there.
+
+    Returns (succeeded, answer), or None when the job could not be checked -
+    resuming blind is exactly the case this guards against.
+    """
+    from app.services.job_watcher import _is_presubmitted_preview
+    from app.services.preview.runtime import _extract_preview_context
+
+    job = await get_job_info_by_user_id(telegram_user_id, job_id)
+    if not isinstance(job, dict):
+        return None
+    props = job.get("Props")
+    if job.get("Stat") == 2 and isinstance(props, dict) and _is_presubmitted_preview(props):
+        *_, source_job_id = _extract_preview_context(props, telegram_user_id)
+        source = (
+            await get_job_info_by_user_id(telegram_user_id, source_job_id)
+            if source_job_id
+            else None
+        )
+        if isinstance(source, dict) and source.get("Stat") != 3:
+            if await pend_job_by_user_id(telegram_user_id, job_id):
+                return True, "Preview waits for its render again."
+            return False, "Failed to resume job."
+    if await resume_job_by_user_id(telegram_user_id, job_id):
+        return True, "Job resumed successfully!"
+    return False, "Failed to resume job."
+
+
 @router.callback_query(lambda c: c.data and c.data.startswith("resume_job:"))
 async def resume_job_callback(callback_query: CallbackQuery) -> None:
     """Handle resume job button press."""
@@ -2090,11 +2127,18 @@ async def resume_job_callback(callback_query: CallbackQuery) -> None:
     job_id = callback_query.data.split(":", 1)[1]
 
     try:
-        success = await resume_job_by_user_id(callback_query.from_user.id, job_id)
+        outcome = await _resume_job(callback_query.from_user.id, job_id)
+        if outcome is None:
+            await callback_query.answer(
+                "Could not check the job right now. Try again.", show_alert=True
+            )
+            return
+        success, answer = outcome
         if success:
-            await callback_query.answer("Job resumed successfully!")
+            request_watcher_wakeup("job resumed from the chat")
+            await callback_query.answer(answer)
         else:
-            await callback_query.answer("Failed to resume job.", show_alert=True)
+            await callback_query.answer(answer, show_alert=True)
     except Exception:
         logger.exception(
             "Error resuming job for user %s", callback_query.from_user.id
@@ -2114,6 +2158,7 @@ async def suspend_job_callback(callback_query: CallbackQuery) -> None:
     try:
         success = await suspend_job_by_user_id(callback_query.from_user.id, job_id)
         if success:
+            request_watcher_wakeup("job suspended from the chat")
             await callback_query.answer("Job suspended successfully!")
         else:
             await callback_query.answer("Failed to suspend job.", show_alert=True)

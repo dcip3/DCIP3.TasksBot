@@ -142,6 +142,19 @@ async def init_db():
         """
     )
 
+    # When the bot first saw a waiting preview's render paused, so the grace
+    # period survives restarts (see preview_pause.py).
+    await tasks_db_conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS preview_pauses (
+            preview_job_id TEXT PRIMARY KEY,
+            source_job_id TEXT NOT NULL,
+            telegram_user_id INTEGER NOT NULL,
+            paused_at INTEGER NOT NULL
+        )
+        """
+    )
+
     # Create indexes for better performance
     await tasks_db_conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_user_sessions_telegram_id
