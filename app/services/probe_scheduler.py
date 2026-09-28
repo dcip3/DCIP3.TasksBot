@@ -211,6 +211,47 @@ async def start_probing(telegram_user_id: int, job_id: str, tasks: list[dict]) -
     return True
 
 
+def _paused_by_someone_else(state: probe_state.ProbeState, tasks: list[dict]) -> bool:
+    """Whether a task we never held back is suspended - someone paused the job.
+
+    Probing only ever suspends the held tasks, so any other suspended task was
+    stopped by a person or another tool. Resuming the held tasks then would undo
+    that pause: Deadline makes a Suspended job Active again as soon as any of its
+    tasks is resumed, and the render starts again behind the back of whoever
+    stopped it.
+    """
+    held = set(state.held_task_ids)
+    for task in tasks:
+        try:
+            task_id = int(task.get("TaskID", task.get("_id")))
+            stat = int(task.get("Stat", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if stat == TASK_SUSPENDED and task_id not in held:
+            return True
+    return False
+
+
+async def _read_tasks(state: probe_state.ProbeState) -> list[dict]:
+    """The job's tasks, read with any account that can; [] when none can."""
+    tasks = await deadline.get_job_tasks_by_user_id(state.telegram_user_id, state.job_id)
+    if tasks:
+        return tasks
+
+    from app.storage.user_settings import list_probe_release_candidates
+
+    try:
+        candidates = await list_probe_release_candidates(state.telegram_user_id)
+    except Exception:
+        logger.exception("Could not list fallback accounts for reading %s", state.job_id)
+        return []
+    for user_id in candidates:
+        tasks = await deadline.get_job_tasks_by_user_id(user_id, state.job_id)
+        if tasks:
+            return tasks
+    return []
+
+
 async def _resume_held(state: probe_state.ProbeState) -> bool:
     """Resume the held tasks, falling back to any other account that can.
 
@@ -360,6 +401,17 @@ async def release_stale_probes() -> int:
         if state.age_seconds <= MAX_PROBE_SECONDS:
             continue
         try:
+            if state.held_task_ids and _paused_by_someone_else(state, await _read_tasks(state)):
+                # Resuming the job resumes every task, held ones included, so
+                # there is nothing left for the probe phase to hand back.
+                await probe_state.mark_probe_released(state.job_id)
+                logger.info(
+                    "Left %s paused: it was suspended during its probe phase, "
+                    "so its %d held tasks come back when the job is resumed",
+                    state.job_id,
+                    len(state.held_task_ids),
+                )
+                continue
             if await _release(state, "probe phase overran"):
                 released += 1
             elif state.age_seconds > 2 * MAX_PROBE_SECONDS:

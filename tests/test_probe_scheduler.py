@@ -572,6 +572,8 @@ class StaleProbeRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "list_unreleased_probes",
             new=mock.AsyncMock(return_value=[stale, fresh]),
         ), mock.patch.object(
+            deadline, "get_job_tasks_by_user_id", new=mock.AsyncMock(return_value=[])
+        ), mock.patch.object(
             probe_state, "mark_probe_released", new=mock.AsyncMock()
         ), mock.patch.object(
             deadline, "resume_tasks_by_user_id", new=mock.AsyncMock(side_effect=resume)
@@ -596,6 +598,8 @@ class StaleProbeRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "list_unreleased_probes",
             new=mock.AsyncMock(return_value=[ancient]),
         ), mock.patch.object(
+            deadline, "get_job_tasks_by_user_id", new=mock.AsyncMock(return_value=[])
+        ), mock.patch.object(
             probe_state, "mark_probe_released", new=mock.AsyncMock()
         ) as mark_mock, mock.patch.object(
             deadline, "resume_tasks_by_user_id", new=mock.AsyncMock(return_value=False)
@@ -603,6 +607,75 @@ class StaleProbeRecoveryTests(unittest.IsolatedAsyncioTestCase):
             await probe_scheduler.release_stale_probes()
 
         mark_mock.assert_awaited_once_with("gone")
+
+
+class PausedDuringProbingTests(unittest.IsolatedAsyncioTestCase):
+    """The backstop must not undo a pause.
+
+    Checked on the farm: resuming any task of a Suspended job makes the whole
+    job Active again. Two renders were paused by hand during their probe phase
+    on 2026-09-28; ninety minutes later the backstop would have resumed their
+    held tasks and set an outdated version rendering next to its resubmission.
+    """
+
+    def setUp(self) -> None:
+        self.state = probe_state.ProbeState(
+            job_id="job1",
+            telegram_user_id=42,
+            probe_task_ids=[0, 4],
+            held_task_ids=[1, 2, 3],
+            started_at=int(time.time()) - probe_scheduler.MAX_PROBE_SECONDS - 60,
+            released_at=None,
+        )
+
+    async def _sweep(self, tasks_by_user: dict) -> tuple[int, mock.AsyncMock, mock.AsyncMock]:
+        async def read(user_id, job_id):
+            return tasks_by_user.get(user_id, [])
+
+        resume = mock.AsyncMock(return_value=True)
+        mark = mock.AsyncMock()
+        with mock.patch.object(
+            probe_state, "list_unreleased_probes", new=mock.AsyncMock(return_value=[self.state])
+        ), mock.patch.object(probe_state, "mark_probe_released", new=mark), mock.patch.object(
+            deadline, "get_job_tasks_by_user_id", new=mock.AsyncMock(side_effect=read)
+        ), mock.patch.object(deadline, "resume_tasks_by_user_id", new=resume), mock.patch(
+            "app.storage.user_settings.list_probe_release_candidates",
+            new=mock.AsyncMock(return_value=[7]),
+        ):
+            released = await probe_scheduler.release_stale_probes()
+        return released, resume, mark
+
+    def _tasks(self, *stats: int) -> list[dict]:
+        return [task(i, 1 + i * 5, stat) for i, stat in enumerate(stats)]
+
+    async def test_a_job_paused_by_hand_stays_paused(self) -> None:
+        paused = self._tasks(*[render_cost.TASK_SUSPENDED] * 5)
+        released, resume, mark = await self._sweep({42: paused})
+        resume.assert_not_awaited()
+        mark.assert_awaited_once_with("job1")
+        self.assertEqual(released, 0)
+
+    async def test_one_task_stopped_by_hand_is_enough(self) -> None:
+        S, R = render_cost.TASK_SUSPENDED, render_cost.TASK_RENDERING
+        released, resume, _ = await self._sweep({42: self._tasks(R, S, S, S, S)})
+        resume.assert_not_awaited()
+
+    async def test_a_job_held_back_only_by_us_is_released(self) -> None:
+        S, C = render_cost.TASK_SUSPENDED, render_cost.TASK_COMPLETED
+        released, resume, _ = await self._sweep({42: self._tasks(C, S, S, S, C)})
+        resume.assert_awaited_once_with(42, "job1", [1, 2, 3])
+        self.assertEqual(released, 1)
+
+    async def test_another_account_reads_the_tasks_when_the_owner_cannot(self) -> None:
+        paused = self._tasks(*[render_cost.TASK_SUSPENDED] * 5)
+        _, resume, _ = await self._sweep({7: paused})
+        resume.assert_not_awaited()
+
+    async def test_with_the_tasks_unreadable_the_backstop_still_releases(self) -> None:
+        """A job nobody can read is most likely gone; the old path handles that."""
+        released, resume, _ = await self._sweep({})
+        resume.assert_awaited()
+        self.assertEqual(released, 1)
 
 
 class ReleaseFallbackTests(unittest.IsolatedAsyncioTestCase):
@@ -638,6 +711,9 @@ class ReleaseFallbackTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(probe_state, "mark_probe_released", new=mock.AsyncMock()),
             mock.patch.object(
                 deadline, "resume_tasks_by_user_id", new=mock.AsyncMock(side_effect=resume)
+            ),
+            mock.patch.object(
+                deadline, "get_job_tasks_by_user_id", new=mock.AsyncMock(return_value=[])
             ),
             mock.patch(
                 "app.storage.user_settings.list_probe_release_candidates",
